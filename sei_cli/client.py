@@ -273,3 +273,193 @@ class SEIClient:
         """Return only processes marked as 'novo' (unread)."""
         procs = self.list_processes()
         return [p for p in procs.recebidos if p.novo]
+
+    # --- Signing ---
+
+    def sign_block(self, block_numero: str) -> dict:
+        """Sign all pending documents in a bloco de assinatura.
+
+        Returns dict with 'signed', 'already_signed', 'errors' lists.
+        """
+        return self._sign_from_blocos(block_numero)
+
+    def sign_document(self, id_documento: str, id_procedimento: str) -> dict:
+        """Sign a single document by ID (from process tree).
+
+        Uses the linkAssinarDocumento URL from arvore_visualizar.
+        """
+        html = self._ensure_control()
+
+        # Navigate to process
+        proc_url = (
+            self._sei_url("controlador.php")
+            + f"?acao=procedimento_trabalhar&id_procedimento={id_procedimento}"
+        )
+        # Find with valid hash
+        soup = BeautifulSoup(html, "lxml")
+        proc_link = None
+        for a in soup.find_all("a"):
+            href = a.get("href", "")
+            if "procedimento_trabalhar" in href and id_procedimento in href:
+                proc_link = urljoin(self._sei_url(""), href)
+                break
+
+        if not proc_link:
+            return {"error": f"Processo {id_procedimento} não encontrado na tela atual"}
+
+        rp = self._get(proc_link)
+        psoup = BeautifulSoup(rp.text, "lxml")
+        iframe = psoup.find("iframe", {"name": "ifrArvore"})
+        if not iframe:
+            return {"error": "Árvore de documentos não encontrada"}
+
+        arvore_url = urljoin(self._sei_url(""), iframe["src"])
+        ra = self._get(arvore_url)
+
+        # Find the specific document's arvore_visualizar URL
+        doc_pattern = re.compile(
+            rf'controlador\.php\?acao=arvore_visualizar[^"]*id_documento={id_documento}[^"]*'
+        )
+        doc_match = doc_pattern.search(ra.text)
+        if not doc_match:
+            return {"error": f"Documento {id_documento} não encontrado na árvore"}
+
+        doc_url = urljoin(self._sei_url(""), doc_match.group())
+        rd = self._get(doc_url)
+
+        # Extract linkAssinarDocumento
+        sign_match = re.search(r"var\s+linkAssinarDocumento\s*=\s*'([^']+)'", rd.text)
+        if not sign_match:
+            return {"error": "Link de assinatura não encontrado para este documento"}
+
+        sign_url = urljoin(self._sei_url(""), sign_match.group(1))
+        self._control_html = None
+
+        return self._execute_sign(sign_url, id_documento)
+
+    def _sign_from_blocos(self, block_numero: str) -> dict:
+        """Navigate to blocos, find the block, and sign its documents."""
+        html = self._ensure_control()
+        blocos_url = self._menu_links.get("blocos_assinatura")
+        if not blocos_url:
+            return {"error": "Link de blocos não encontrado"}
+
+        rb = self._get(blocos_url)
+
+        # Extract sign URL from acaoAssinar JS
+        urls = re.findall(
+            r"controlador\.php\?acao=documento_assinar[^'\"]+",
+            rb.text,
+        )
+        if not urls:
+            return {"error": "URL de assinatura não encontrada na página de blocos"}
+
+        sign_url = urljoin(self._sei_url(""), urls[0])
+
+        # POST the blocos form with the target block ID
+        bsoup = BeautifulSoup(rb.text, "lxml")
+        form = bsoup.find("form", {"id": "frmBlocoLista"})
+        if not form:
+            return {"error": "Formulário de blocos não encontrado"}
+
+        fdata = {}
+        for inp in form.find_all("input"):
+            n = inp.get("name", "")
+            if n:
+                fdata[n] = inp.get("value", "")
+        fdata["hdnInfraItemId"] = block_numero
+
+        rs = self._post(sign_url, fdata)
+        ssoup = BeautifulSoup(rs.text, "lxml")
+        form2 = ssoup.find("form", {"id": "frmAssinaturas"})
+        if not form2:
+            return {"error": "Formulário de assinatura não encontrado"}
+
+        doc_id = form2.find("input", {"name": "hdnIdDocumentos"})
+        doc_id_val = doc_id.get("value", "") if doc_id else ""
+
+        self._control_html = None
+        return self._execute_sign_form(form2, rs.text)
+
+    def _execute_sign(self, sign_url: str, doc_id: str) -> dict:
+        """GET the sign page and submit it."""
+        rs = self._get(sign_url)
+        ssoup = BeautifulSoup(rs.text, "lxml")
+        form = ssoup.find("form", {"id": "frmAssinaturas"})
+        if not form:
+            return {"error": "Formulário de assinatura não encontrado"}
+        return self._execute_sign_form(form, rs.text)
+
+    def _execute_sign_form(self, form: Any, page_html: str) -> dict:
+        """Submit a sign form with credentials.
+
+        The SEI sign form uses ISO-8859-1 encoding (º → \\xba).
+        """
+        from urllib.parse import urlencode as _urlencode
+
+        creds = load_credentials()
+        form_action = urljoin(self._sei_url(""), form.get("action", ""))
+
+        # Collect hidden fields
+        sign_data = {}
+        for inp in form.find_all("input"):
+            n = inp.get("name", "")
+            if n:
+                sign_data[n] = inp.get("value", "")
+
+        # The cargo is "2º Tenente QOEM BM" — must use latin1 º (\xba)
+        cargo = "2\xba Tenente QOEM BM"
+
+        sign_data.update({
+            "txtUsuario": "LEO ZENON TASSI",
+            "hdnIdUsuario": sign_data.get("hdnIdUsuario", "100066959"),
+            "pwdSenha": creds.senha,
+            "selOrgao": "28",
+            "selCargoFuncao": cargo,
+            "hdnFormaAutenticacao": "S",
+        })
+
+        doc_ids = sign_data.get("hdnIdDocumentos", "")
+
+        # Encode as ISO-8859-1
+        body = _urlencode(
+            list(sign_data.items()),
+            encoding="iso-8859-1",
+        )
+
+        r = self.client.post(
+            form_action,
+            content=body.encode("iso-8859-1"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        r = auth._follow(self.client, r, self.base_url)
+
+        # Parse response for messages
+        result: dict = {"doc_ids": doc_ids, "signed": [], "already_signed": [], "errors": []}
+
+        # Check for server messages
+        for msg in re.findall(
+            r'<div[^>]*class="alert[^"]*"[^>]*>.*?</div>',
+            r.text,
+            re.DOTALL,
+        ):
+            text = BeautifulSoup(msg, "lxml").text.strip()
+            if "já foi assinado" in text:
+                result["already_signed"].append(text)
+            elif "assinado com sucesso" in text.lower() or "Blocos de Assinatura" in r.text:
+                result["signed"].append(doc_ids)
+            elif "erro" in text.lower() or "não" in text.lower():
+                result["errors"].append(text)
+
+        # Check if redirected to blocos list (success — signed and returned)
+        if "Blocos de Assinatura" in r.text and not result["signed"] and not result["already_signed"]:
+            result["signed"].append(doc_ids)
+
+        # If still on sign page with no messages, docs were likely all already signed
+        if not result["signed"] and not result["already_signed"] and not result["errors"]:
+            if "Assinatura de Documento" in r.text:
+                # The form re-rendered but no error → all docs already signed
+                result["already_signed"].append(f"Documentos {doc_ids} já assinados")
+
+        self._control_html = None
+        return result
