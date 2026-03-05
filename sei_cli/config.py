@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-from sei_cli.models import Credentials, SessionData
+from sei_cli.models import Credentials
 
 CREDENTIALS_PATH = Path("~/.config/sei/credentials.json").expanduser()
 SESSION_PATH = Path("~/.config/sei-cli/session.json").expanduser()

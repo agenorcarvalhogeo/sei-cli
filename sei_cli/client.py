@@ -1,7 +1,18 @@
+"""SEI HTTP Client — read-only operations.
+
+Handles the full login flow with manual redirect following to preserve
+the PHPSESSID cookie that changes at inicializar.php.
+
+Key insight: After login, the initial page load is the ONLY guaranteed
+request that works. Subsequent requests to controlador.php fail because
+SEI validates infra_hash per-session. So we cache the control page HTML
+and extract all navigation URLs from it.
+"""
+
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import re
 from typing import Any
 from urllib.parse import urljoin
 
@@ -11,13 +22,18 @@ from bs4 import BeautifulSoup
 from sei_cli import auth
 from sei_cli.config import load_credentials, SESSION_PATH
 from sei_cli.models import (
-    Block, Credentials, Process, ProcessList, SessionData,
+    Block, BlockDocument, Document, Process, ProcessList,
     SystemStatus, Unit,
 )
 from sei_cli.parsers import (
+    parse_block_documents,
     parse_blocks,
+    parse_document_tree,
+    parse_menu_links,
     parse_processes,
     parse_system_status,
+    parse_unit_switch_form,
+    parse_unit_switch_link,
     parse_units_switch_page,
 )
 
@@ -28,8 +44,8 @@ class SEIClient:
     def __init__(self, base_url: str | None = None) -> None:
         self.base_url = (base_url or self.BASE).rstrip("/")
         self.client = auth.create_http_client()
-        self._page_cache: str | None = None  # Cache the last control page
-        self._load_persisted_session()
+        self._control_html: str | None = None
+        self._menu_links: dict[str, str] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -40,21 +56,18 @@ class SEIClient:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    # --- Session persistence ---
+    # --- Internal HTTP helpers ---
 
-    def _load_persisted_session(self) -> None:
-        if SESSION_PATH.exists():
-            try:
-                data = json.loads(SESSION_PATH.read_text())
-                for name, value in data.get("cookies", {}).items():
-                    self.client.cookies.set(name, value)
-            except Exception:
-                pass
+    def _get(self, url: str) -> httpx.Response:
+        r = self.client.get(url)
+        return auth._follow(self.client, r, self.base_url)
 
-    def _save_session(self) -> None:
-        SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
-        cookies = {name: value for name, value in self.client.cookies.items()}
-        SESSION_PATH.write_text(json.dumps({"cookies": cookies}))
+    def _post(self, url: str, data: dict) -> httpx.Response:
+        r = self.client.post(url, data=data)
+        return auth._follow(self.client, r, self.base_url)
+
+    def _sei_url(self, path: str) -> str:
+        return f"{self.base_url}/sei/{path}"
 
     # --- Auth ---
 
@@ -63,130 +76,200 @@ class SEIClient:
         status, html = auth.login(self.client, creds)
         if not status.success:
             raise RuntimeError(status.message)
-        self._page_cache = html
-        self._save_session()
-        return self._parse_status(html)
-
-    def is_valid(self) -> bool:
-        ok, html = auth.check_session(self.client, self._control_url())
-        if ok:
-            self._page_cache = html
-        return ok
-
-    def ensure_auth(self) -> str:
-        """Ensure authenticated, return control page HTML."""
-        if self._page_cache:
-            html = self._page_cache
-            self._page_cache = None
-            return html
-        ok, html = auth.check_session(self.client, self._control_url())
-        if ok:
-            return html
-        # Re-login
-        self.login()
-        html = self._page_cache or ""
-        self._page_cache = None
-        return html
-
-    # --- URLs ---
-
-    def _control_url(self) -> str:
-        return f"{self.base_url}/sei/controlador.php?acao=procedimento_controlar"
-
-    # --- Core operations ---
-
-    def status(self) -> SystemStatus:
-        html = self.ensure_auth()
-        return self._parse_status(html)
-
-    def _parse_status(self, html: str) -> SystemStatus:
+        self._control_html = html
+        self._menu_links = parse_menu_links(html, self._sei_url(""))
         return parse_system_status(html)
 
-    def list_processes(self, unit: str | None = None) -> ProcessList:
-        if unit:
-            self.switch_unit(unit)
-        html = self.ensure_auth()
-        return parse_processes(html, base_url=self.base_url)
+    def _ensure_control(self) -> str:
+        """Return cached control page HTML, re-logging in if needed."""
+        if self._control_html:
+            return self._control_html
+        self.login()
+        return self._control_html or ""
 
-    def search(self, query: str) -> str:
-        """Search via pesquisa rápida. Returns result page HTML."""
-        html = self.ensure_auth()
-        soup = BeautifulSoup(html, "lxml")
-        pesq = soup.find(id="txtPesquisaRapida")
-        if not pesq:
-            raise RuntimeError("Campo de pesquisa rápida não encontrado")
-        form = pesq.find_parent("form")
-        action = form.get("action", "") if form else ""
-        search_url = urljoin(self._control_url(), action)
+    def _fresh_control(self) -> str:
+        """Force re-login to get fresh control page."""
+        self._control_html = None
+        self.login()
+        return self._control_html or ""
+
+    # --- Status ---
+
+    def status(self) -> SystemStatus:
+        html = self._ensure_control()
+        return parse_system_status(html)
+
+    # --- Processes ---
+
+    def list_processes(self) -> ProcessList:
+        html = self._ensure_control()
+        return parse_processes(html, base_url=self._sei_url(""))
+
+    def get_process_documents(self, id_procedimento: str) -> list[Document]:
+        """Get document tree for a process by navigating to it and parsing the JS tree."""
+        html = self._ensure_control()
         
-        r = self.client.post(search_url, data={"txtPesquisaRapida": query})
-        r = auth._follow(self.client, r, search_url)
-        return r.text
-
-    def list_blocks(self) -> list[Block]:
-        """List signature blocks."""
-        html = self.ensure_auth()
+        # Find the process link
         soup = BeautifulSoup(html, "lxml")
-        # Find blocos link from the page
-        links = soup.find_all("a")
-        blocos_url = None
-        for link in links:
-            href = link.get("href", "")
-            if "bloco_assinatura_listar" in href or "bloco" in href.lower():
-                blocos_url = urljoin(self._control_url(), href)
+        proc_link = None
+        for a in soup.find_all("a"):
+            href = a.get("href", "")
+            if "procedimento_trabalhar" in href and id_procedimento in href:
+                proc_link = urljoin(self._sei_url(""), href)
                 break
         
-        if not blocos_url:
-            # Try constructing the URL with infra_hash from the page
-            import re
+        if not proc_link:
+            # Try constructing URL from infra_hash
             hashes = re.findall(r'infra_hash=([a-f0-9]{64})', html)
             if hashes:
-                blocos_url = (
-                    f"{self.base_url}/sei/controlador.php?"
-                    f"acao=bloco_assinatura_listar&"
-                    f"infra_sistema=100000100&"
-                    f"infra_hash={hashes[0]}"
+                proc_link = (
+                    self._sei_url("controlador.php")
+                    + f"?acao=procedimento_trabalhar&id_procedimento={id_procedimento}"
+                    + f"&infra_sistema=100000100&infra_hash={hashes[0]}"
                 )
         
+        if not proc_link:
+            return []
+        
+        # Navigate to process page
+        r = self._get(proc_link)
+        psoup = BeautifulSoup(r.text, "lxml")
+        
+        # Find ifrArvore iframe
+        iframe = psoup.find("iframe", {"name": "ifrArvore"})
+        if not iframe or not iframe.get("src"):
+            return []
+        
+        arvore_url = urljoin(self._sei_url(""), iframe["src"])
+        ra = self._get(arvore_url)
+        
+        # Need to re-login after navigating away from control page
+        self._control_html = None
+        
+        return parse_document_tree(ra.text, base_url=self._sei_url(""))
+
+    # --- Blocks ---
+
+    def list_blocks(self) -> list[Block]:
+        """List blocos de assinatura."""
+        html = self._ensure_control()
+        
+        blocos_url = self._menu_links.get("blocos_assinatura")
         if not blocos_url:
             return []
         
-        r = self.client.get(blocos_url)
-        r = auth._follow(self.client, r, blocos_url)
-        return parse_blocks(r.text, base_url=self.base_url)
+        r = self._get(blocos_url)
+        # Invalidate control cache since we navigated away
+        self._control_html = None
+        
+        return parse_blocks(r.text, base_url=self._sei_url(""))
+
+    def get_block_documents(self, block_numero: str) -> list[BlockDocument]:
+        """List documents inside a specific bloco de assinatura."""
+        html = self._ensure_control()
+        blocos_url = self._menu_links.get("blocos_assinatura")
+        if not blocos_url:
+            return []
+        
+        r = self._get(blocos_url)
+        soup = BeautifulSoup(r.text, "lxml")
+        
+        # Find the link to the specific block
+        detail_url = None
+        for a in soup.find_all("a"):
+            href = a.get("href", "")
+            if "rel_bloco_protocolo_listar" in href and a.text.strip() == block_numero:
+                detail_url = urljoin(self._sei_url(""), href)
+                break
+        
+        self._control_html = None
+        
+        if not detail_url:
+            return []
+        
+        rd = self._get(detail_url)
+        return parse_block_documents(rd.text, base_url=self._sei_url(""))
+
+    # --- Units ---
 
     def list_units(self) -> list[Unit]:
-        """List available units."""
-        html = self.ensure_auth()
-        soup = BeautifulSoup(html, "lxml")
-        # Find unit switch link
-        unit_link = soup.find(id="lnkInfraUnidade")
-        if not unit_link:
+        """List available units for switching."""
+        html = self._ensure_control()
+        switch_url = parse_unit_switch_link(html, self._sei_url(""))
+        if not switch_url:
             return []
-        onclick = unit_link.get("onclick", "")
-        # Extract URL from onclick: window.location.href='...'
-        import re
-        match = re.search(r"href='([^']+)'", onclick)
-        if not match:
-            return []
-        switch_url = urljoin(self._control_url(), match.group(1))
-        r = self.client.get(switch_url)
-        r = auth._follow(self.client, r, switch_url)
-        return parse_units_switch_page(r.text, base_url=self.base_url)
+        
+        r = self._get(switch_url)
+        self._control_html = None
+        
+        return parse_units_switch_page(r.text, base_url=self._sei_url(""))
 
-    def switch_unit(self, sigla: str) -> bool:
-        """Switch active unit by sigla keyword."""
-        units = self.list_units()
+    def switch_unit(self, keyword: str) -> SystemStatus:
+        """Switch active unit. Keyword matches against sigla or descricao.
+        
+        The unit.link stores the unit ID (not a URL). We POST the switch form
+        with selInfraUnidades=<unit_id> to replicate the JS selecionarUnidade().
+        
+        After switching, we need a fresh login because the infra_hash changes.
+        """
+        # Always get a fresh control page for valid switch URL
+        html = self._fresh_control()
+        switch_url = parse_unit_switch_link(html, self._sei_url(""))
+        if not switch_url:
+            raise RuntimeError("Link de troca de unidade não encontrado")
+        
+        r = self._get(switch_url)
+        units = parse_units_switch_page(r.text, self._sei_url(""))
+        form_action, hiddens = parse_unit_switch_form(r.text)
+        
+        kw = keyword.lower()
         target = None
         for u in units:
-            if sigla.lower() in u.sigla.lower() or sigla.lower() in u.descricao.lower():
+            if kw in u.sigla.lower() or kw in u.descricao.lower():
                 target = u
                 break
-        if not target or not target.link:
-            raise RuntimeError(f"Unidade '{sigla}' não encontrada")
         
-        r = self.client.get(urljoin(self.base_url, target.link))
-        r = auth._follow(self.client, r, self.base_url)
-        self._page_cache = r.text
-        self._save_session()
-        return "Controle de Processos" in r.text
+        if not target or not target.link:
+            available = ", ".join(u.sigla for u in units)
+            raise RuntimeError(f"Unidade '{keyword}' não encontrada. Disponíveis: {available}")
+        
+        # POST form with selInfraUnidades (the key JS creates dynamically)
+        post_url = urljoin(str(r.url), form_action) if form_action else switch_url
+        data = {**hiddens, "selInfraUnidades": target.link}
+        
+        r2 = self._post(post_url, data)
+        self._control_html = r2.text
+        self._menu_links = parse_menu_links(r2.text, self._sei_url(""))
+        return parse_system_status(r2.text)
+
+    # --- Search ---
+
+    def search(self, query: str) -> str:
+        """Quick search (pesquisa rápida). Returns raw HTML."""
+        html = self._ensure_control()
+        soup = BeautifulSoup(html, "lxml")
+        
+        pesq_form = soup.find("form", {"id": "frmProtocoloPesquisaRapida"})
+        if not pesq_form:
+            # Fallback: find any form with txtPesquisaRapida
+            pesq_input = soup.find("input", {"id": "txtPesquisaRapida"})
+            if pesq_input:
+                pesq_form = pesq_input.find_parent("form")
+        
+        if not pesq_form:
+            raise RuntimeError("Formulário de pesquisa não encontrado")
+        
+        action = pesq_form.get("action", "")
+        search_url = urljoin(self._sei_url(""), action)
+        
+        r = self._post(search_url, data={"txtPesquisaRapida": query})
+        self._control_html = None
+        
+        return r.text
+
+    # --- New processes check ---
+
+    def check_new_processes(self) -> list[Process]:
+        """Return only processes marked as 'novo' (unread)."""
+        procs = self.list_processes()
+        return [p for p in procs.recebidos if p.novo]

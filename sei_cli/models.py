@@ -13,13 +13,6 @@ class Credentials:
 
 
 @dataclass(slots=True)
-class SessionData:
-    base_url: str
-    last_url: str | None = None
-    cookies: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
 class LoginForm:
     action: str
 
@@ -70,34 +63,39 @@ class Unit:
 class Document:
     numero: str
     nome: str
-    link: str
+    tipo: str  # "interno", "externo", "processo"
+    id_documento: str | None = None
+    link: str | None = None
+    assinado: bool = False
+
+
+@dataclass(slots=True)
+class BlockDocument:
+    seq: str
+    processo: str
+    documento_id: str
+    tipo_documento: str
+    assinante: str
+    assinado: bool = False
+    link_processo: str | None = None
+    link_documento: str | None = None
 
 
 @dataclass(slots=True)
 class Block:
-    id: str
-    tipo: str
+    numero: str
+    estado: str
+    unidade_origem: str
+    unidade_destino: str
     descricao: str
-    estado: str | None = None
     link: str | None = None
+    documentos: list[BlockDocument] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class ProcessDetails:
     processo_numero: str
     processo_link: str
-    documentos: list[Document] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class SearchResult:
-    query: str
-    processos: list[Process] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class BlockDetails:
-    block_id: str
     documentos: list[Document] = field(default_factory=list)
 
 
