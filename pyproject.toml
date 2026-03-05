@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sei-cli"
+version = "0.1.0"
+description = "CLI read-only para o SEI (RN) via HTTP"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{name = "sei-cli contributors"}]
+dependencies = [
+  "scrapling>=0.2.0",
+  "click>=8.1",
+  "rich>=13.0",
+  "lxml>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+sei = "sei_cli.cli:cli"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sei_cli"]
