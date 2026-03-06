@@ -5,6 +5,7 @@ from pathlib import Path
 
 from sei_cli.relatorio_parser import (
     parse_relatorio,
+    summarize_batch,
     summarize,
     to_dict,
     _parse_rank_name,
@@ -194,3 +195,10 @@ class TestOutput:
         assert isinstance(d, dict)
         assert d["fiscal"] == "Vilson"
         assert len(d["militares"]) == 8
+
+
+def test_summarize_batch_markdown(parsed):
+    md = summarize_batch([parsed, parsed])
+    assert md.startswith("# Resumo Semanal")
+    assert "## Viaturas" in md
+    assert "## Ocorrências por Dia" in md

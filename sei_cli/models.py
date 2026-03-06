@@ -123,6 +123,41 @@ class DocumentCreated:
     editor_url: str | None = None
 
 
+@dataclass(slots=True)
+class TramitarDestino:
+    id_unidade: str
+    nome: str
+
+
+@dataclass(slots=True)
+class TramitarForm:
+    action: str
+    hidden_fields: dict[str, str]
+    select_fields: dict[str, str]
+    destino_field: str
+    manter_aberto_field: str | None
+    destinos: list[TramitarDestino] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class Marcador:
+    marcador_id: str
+    nome: str
+    descricao: str = ""
+    cor: str | None = None
+    link: str | None = None
+
+
+@dataclass(slots=True)
+class MarcadorForm:
+    action: str
+    hidden_fields: dict[str, str]
+    select_fields: dict[str, str]
+    marcador_field: str
+    texto_field: str | None
+    marcadores: list[Marcador] = field(default_factory=list)
+
+
 def as_json(data: Any) -> Any:
     if hasattr(data, "__dataclass_fields__"):
         return asdict(data)

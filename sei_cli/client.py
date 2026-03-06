@@ -27,20 +27,25 @@ from sei_cli import auth
 from sei_cli.config import load_credentials, SESSION_PATH
 from sei_cli.models import (
     Block, BlockDocument, Document, DocumentCreated, DocumentType,
-    EditorSection, Process, ProcessList, SystemStatus, Unit,
+    EditorSection, Marcador, Process, ProcessList, SystemStatus, TramitarForm,
+    Unit,
 )
 from sei_cli.relatorio_parser import (
     RelatorioServico,
     parse_relatorio,
+    summarize_batch,
     summarize as summarize_relatorio,
 )
 from sei_cli.parsers import (
     parse_block_documents,
     parse_blocks,
     parse_document_tree,
+    parse_marcador_form,
+    parse_marcadores_list,
     parse_menu_links,
     parse_processes,
     parse_system_status,
+    parse_tramitar_form,
     parse_unit_switch_form,
     parse_unit_switch_link,
     parse_units_switch_page,
@@ -55,6 +60,7 @@ class SEIClient:
         self.client = auth.create_http_client()
         self._control_html: str | None = None
         self._menu_links: dict[str, str] = {}
+        self._editor_hiddens: dict[str, str] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -77,6 +83,41 @@ class SEIClient:
 
     def _sei_url(self, path: str) -> str:
         return f"{self.base_url}/sei/{path}"
+
+    def _extract_action_url(self, html: str, token: str) -> str | None:
+        """Extract action URL from href or JS onclick snippets."""
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.find_all("a"):
+            href = a.get("href", "")
+            onclick = a.get("onclick", "")
+            if token in href:
+                return urljoin(self._sei_url(""), href)
+            if token in onclick:
+                m = re.search(r"'([^']*" + re.escape(token) + r"[^']*)'", onclick)
+                if m:
+                    return urljoin(self._sei_url(""), m.group(1))
+                m = re.search(r'"([^"]*' + re.escape(token) + r'[^"]*)"', onclick)
+                if m:
+                    return urljoin(self._sei_url(""), m.group(1))
+        return None
+
+    def _find_process_link(self, control_html: str, id_procedimento: str) -> str | None:
+        soup = BeautifulSoup(control_html, "lxml")
+        for a in soup.find_all("a"):
+            href = a.get("href", "")
+            if "procedimento_trabalhar" in href and f"id_procedimento={id_procedimento}" in href:
+                return urljoin(self._sei_url(""), href)
+        return None
+
+    def _navigate_process_page(self, id_procedimento: str) -> httpx.Response:
+        html = self._ensure_control()
+        proc_link = self._find_process_link(html, id_procedimento)
+        if not proc_link:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado na unidade ativa. "
+                "Verifique se o processo está visível nessa unidade."
+            )
+        return self._get(proc_link)
 
     # --- Auth ---
 
@@ -292,6 +333,144 @@ class SEIClient:
         procs = self.list_processes()
         return [p for p in procs.recebidos if p.novo]
 
+    # --- Tramitação ---
+
+    def get_tramitar_form(self, id_procedimento: str) -> TramitarForm:
+        """Open 'Enviar Processo' form and parse destination units/fields."""
+        rp = self._navigate_process_page(id_procedimento)
+        send_url = self._extract_action_url(rp.text, "procedimento_enviar")
+        if not send_url:
+            raise RuntimeError("Ação 'Enviar Processo' não encontrada na página do processo")
+
+        rsend = self._get(send_url)
+        tramitar = parse_tramitar_form(rsend.text, self._sei_url(""), str(rsend.url))
+        return tramitar
+
+    def list_unidades_destino_tramitacao(self, id_procedimento: str) -> list[Unit]:
+        """List units available in the process send form."""
+        form = self.get_tramitar_form(id_procedimento)
+        return [Unit(sigla=d.nome, descricao=d.nome, link=d.id_unidade) for d in form.destinos]
+
+    def enviar_processo(
+        self,
+        id_procedimento: str,
+        unidade_destino: str,
+        manter_aberto: bool = True,
+    ) -> bool:
+        """Send process to another unit."""
+        form = self.get_tramitar_form(id_procedimento)
+        target = None
+        kw = unidade_destino.lower().strip()
+        for dest in form.destinos:
+            if kw == dest.id_unidade or kw in dest.nome.lower():
+                target = dest
+                break
+        if not target:
+            opts = ", ".join(d.nome for d in form.destinos[:15])
+            raise RuntimeError(
+                f"Unidade destino '{unidade_destino}' não encontrada. "
+                f"Algumas opções: {opts}"
+            )
+
+        data: dict[str, str] = {}
+        data.update(form.hidden_fields)
+        data.update(form.select_fields)
+        data[form.destino_field] = target.id_unidade
+        if form.manter_aberto_field and manter_aberto:
+            data[form.manter_aberto_field] = "S"
+
+        r = self._post(form.action, data)
+        self._control_html = None
+        lower = r.text.lower()
+        if "erro" in lower or "falha" in lower:
+            return False
+        return True
+
+    def tramitar_processo(
+        self,
+        id_procedimento: str,
+        unidade_destino: str,
+        manter_aberto: bool = True,
+    ) -> bool:
+        """Alias de enviar_processo para API mais explícita."""
+        return self.enviar_processo(
+            id_procedimento=id_procedimento,
+            unidade_destino=unidade_destino,
+            manter_aberto=manter_aberto,
+        )
+
+    # --- Marcadores ---
+
+    def list_marcadores(self) -> list[Marcador]:
+        """List marker catalog available to current unit."""
+        html = self._ensure_control()
+        marcadores_url = self._menu_links.get("marcadores")
+        if not marcadores_url:
+            marcadores_url = self._extract_action_url(html, "marcador_listar")
+        if not marcadores_url:
+            return []
+
+        r = self._get(marcadores_url)
+        self._control_html = None
+        return parse_marcadores_list(r.text, self._sei_url(""))
+
+    def set_marcador(self, id_procedimento: str, marcador_id: str, texto: str = "") -> bool:
+        """Apply marker to a process."""
+        rp = self._navigate_process_page(id_procedimento)
+        marc_url = (
+            self._extract_action_url(rp.text, "andamento_marcador_gerenciar")
+            or self._extract_action_url(rp.text, "andamento_marcador_cadastrar")
+        )
+        if not marc_url:
+            control_html = self._ensure_control()
+            marc_url = self._extract_action_url(control_html, "andamento_marcador_cadastrar")
+        if not marc_url:
+            raise RuntimeError("Ação de marcador não encontrada")
+
+        rm = self._get(marc_url)
+        form = parse_marcador_form(rm.text, self._sei_url(""), str(rm.url))
+        data: dict[str, str] = {}
+        data.update(form.hidden_fields)
+        data.update(form.select_fields)
+        data[form.marcador_field] = marcador_id
+        if form.texto_field:
+            data[form.texto_field] = texto
+
+        rset = self._post(form.action, data)
+        self._control_html = None
+        lower = rset.text.lower()
+        if "erro" in lower or "falha" in lower:
+            return False
+        return True
+
+    def remove_marcador(self, id_procedimento: str) -> bool:
+        """Remove marker from a process."""
+        rp = self._navigate_process_page(id_procedimento)
+        rm_url = self._extract_action_url(rp.text, "andamento_marcador_remover")
+        if not rm_url:
+            control_html = self._ensure_control()
+            rm_url = self._extract_action_url(control_html, "andamento_marcador_remover")
+        if not rm_url:
+            raise RuntimeError("Ação de remoção de marcador não encontrada")
+
+        rr = self._get(rm_url)
+        rsoup = BeautifulSoup(rr.text, "lxml")
+        form = rsoup.find("form")
+        if form:
+            action = urljoin(str(rr.url), form.get("action", ""))
+            data: dict[str, str] = {}
+            for inp in form.find_all("input"):
+                n = inp.get("name", "")
+                if n:
+                    data[n] = inp.get("value", "")
+            rr = self._post(action, data)
+
+        self._control_html = None
+        lower = rr.text.lower()
+        if "erro" in lower or "falha" in lower:
+            return False
+        return True
+
     # --- Document creation & editing ---
 
     # Maps friendly name → SEI id_serie (from frmDocumentoEscolherTipo)
@@ -433,6 +612,9 @@ class SEIClient:
                 cdata[n] = selected["value"] if selected else ""
 
         # Set our values
+        # CRITICAL: submeter() JS sets hdnFlagDocumentoCadastro='2' before submit.
+        # Without this, SEI just re-renders the form instead of creating the doc.
+        cdata["hdnFlagDocumentoCadastro"] = "2"
         cdata["rdoTextoInicial"] = texto_inicial
         cdata["rdoNivelAcesso"] = nivel_acesso
         cdata["rdoFormato"] = "N"  # Nato-digital
@@ -626,6 +808,52 @@ class SEIClient:
             body_sec = max(body_candidates, key=lambda s: len(s.content))
 
         return parse_relatorio(body_sec.content)
+
+    def batch_read_relatorios(
+        self,
+        id_procedimento: str,
+        unit: str = "OP 3",
+    ) -> dict[str, Any]:
+        """Read and summarize all relatório-like documents from a process."""
+        if unit:
+            self.switch_unit(unit)
+
+        docs = self.get_process_documents(id_procedimento)
+        rel_docs = [
+            d for d in docs
+            if any(
+                k in (d.nome or "").upper()
+                for k in ("RELAT", "LIVRO", "FISCAL")
+            )
+        ]
+
+        parsed: list[RelatorioServico] = []
+        failures: list[dict[str, str]] = []
+        for doc in rel_docs:
+            if not doc.id_documento:
+                continue
+            try:
+                parsed.append(self.read_relatorio(doc.id_documento, id_procedimento))
+            except Exception as exc:
+                failures.append(
+                    {
+                        "id_documento": doc.id_documento,
+                        "nome": doc.nome,
+                        "erro": str(exc),
+                    }
+                )
+
+        md = summarize_batch(parsed)
+        return {
+            "id_procedimento": id_procedimento,
+            "unit": unit,
+            "total_documentos": len(docs),
+            "relatorios_encontrados": len(rel_docs),
+            "relatorios_lidos": len(parsed),
+            "falhas": failures,
+            "resumo_markdown": md,
+            "relatorios": [r.__dict__ for r in parsed],
+        }
 
     def _navigate_to_arvore(self, id_procedimento: str) -> str | None:
         """Navigate to a process and return the arvore HTML."""

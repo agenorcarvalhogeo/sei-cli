@@ -17,7 +17,8 @@ from lxml import html
 
 from sei_cli.models import (
     Block, BlockDocument, Document, LoginForm, Process,
-    ProcessDetails, ProcessList, SystemStatus, Unit,
+    Marcador, MarcadorForm, ProcessDetails, ProcessList, SystemStatus,
+    TramitarDestino, TramitarForm, Unit,
 )
 
 
@@ -338,4 +339,206 @@ def parse_menu_links(content: str, base_url: str) -> dict[str, str]:
             links["blocos_internos"] = urljoin(base_url, href)
         elif "protocolo_pesquisa_rapida" in href:
             links["pesquisa_rapida"] = urljoin(base_url, href)
+        elif "marcador_listar" in href:
+            links["marcadores"] = urljoin(base_url, href)
     return links
+
+
+# --- Tramitação ---
+
+def parse_tramitar_form(content: str, base_url: str, current_url: str) -> TramitarForm:
+    """Parse the Enviar Processo page form."""
+    page = _tree(content)
+    form_nodes = page.xpath("//form[@id='frmProcedimentoEnviar'] | //form")
+    if not form_nodes:
+        raise ValueError("Formulário de tramitação não encontrado")
+    form = form_nodes[0]
+
+    action = urljoin(current_url, form.attrib.get("action", ""))
+    if not action:
+        action = current_url
+
+    hidden_fields: dict[str, str] = {}
+    for inp in form.xpath(".//input[@type='hidden']"):
+        name = inp.attrib.get("name", "")
+        if name:
+            hidden_fields[name] = inp.attrib.get("value", "")
+
+    select_fields: dict[str, str] = {}
+    destino_field = ""
+    destinos: list[TramitarDestino] = []
+    for sel in form.xpath(".//select"):
+        name = sel.attrib.get("name", "")
+        if not name:
+            continue
+        selected = sel.xpath(".//option[@selected]")
+        if selected:
+            select_fields[name] = selected[0].attrib.get("value", "")
+        else:
+            first = sel.xpath(".//option")
+            if first:
+                select_fields[name] = first[0].attrib.get("value", "")
+
+        opts = []
+        for opt in sel.xpath(".//option[@value]"):
+            value = _norm(opt.attrib.get("value"))
+            label = _norm(opt.text_content())
+            if not value or not label:
+                continue
+            opts.append(TramitarDestino(id_unidade=value, nome=label))
+
+        if opts:
+            lname = name.lower()
+            if (
+                "unidade" in lname
+                or "destino" in lname
+                or "infraitem" in lname
+                or not destino_field
+            ):
+                destino_field = name
+                destinos = opts
+
+    manter_aberto_field = None
+    for chk in form.xpath(".//input[@type='checkbox']"):
+        name = chk.attrib.get("name", "")
+        lname = name.lower()
+        if "manter" in lname or "aberto" in lname:
+            manter_aberto_field = name
+            break
+
+    if not destino_field or not destinos:
+        raise ValueError("Campo de unidade destino não encontrado na tramitação")
+
+    return TramitarForm(
+        action=urljoin(base_url, action),
+        hidden_fields=hidden_fields,
+        select_fields=select_fields,
+        destino_field=destino_field,
+        manter_aberto_field=manter_aberto_field,
+        destinos=destinos,
+    )
+
+
+# --- Marcadores ---
+
+def parse_marcadores_list(content: str, base_url: str) -> list[Marcador]:
+    """Parse marcador list page."""
+    page = _tree(content)
+    marcadores: list[Marcador] = []
+    seen: set[str] = set()
+
+    rows = page.xpath("//tr[contains(@class,'infraTrClara') or contains(@class,'infraTrEscura')]")
+    for row in rows:
+        tds = row.xpath("./td")
+        if len(tds) < 2:
+            continue
+
+        marcador_id = ""
+        for inp in row.xpath(".//input[@type='checkbox' or @type='radio']"):
+            value = _norm(inp.attrib.get("value"))
+            if value:
+                marcador_id = value
+                break
+
+        link = None
+        hrefs = row.xpath(".//a[@href]/@href")
+        if hrefs:
+            link = urljoin(base_url, hrefs[0])
+            mid = _extract_id(link, "id_marcador")
+            if mid:
+                marcador_id = marcador_id or mid
+
+        nome = _norm(tds[1].text_content())
+        descricao = _norm(tds[2].text_content()) if len(tds) > 2 else ""
+        cor = None
+        img = row.xpath(".//img[@src]/@src")
+        if img:
+            cor = img[0].split("/")[-1].replace(".svg", "").split("?")[0]
+
+        if not marcador_id or not nome or marcador_id in seen:
+            continue
+        seen.add(marcador_id)
+        marcadores.append(
+            Marcador(
+                marcador_id=marcador_id,
+                nome=nome,
+                descricao=descricao,
+                cor=cor,
+                link=link,
+            )
+        )
+
+    return marcadores
+
+
+def parse_marcador_form(content: str, base_url: str, current_url: str) -> MarcadorForm:
+    """Parse marcador management form for a process."""
+    page = _tree(content)
+    form_nodes = (
+        page.xpath("//form[@id='frmAndamentoMarcadorCadastro']")
+        or page.xpath("//form[@id='frmAndamentoMarcador']")
+        or page.xpath("//form")
+    )
+    if not form_nodes:
+        raise ValueError("Formulário de marcador não encontrado")
+    form = form_nodes[0]
+
+    action = urljoin(current_url, form.attrib.get("action", ""))
+    if not action:
+        action = current_url
+
+    hidden_fields: dict[str, str] = {}
+    for inp in form.xpath(".//input[@type='hidden']"):
+        name = inp.attrib.get("name", "")
+        if name:
+            hidden_fields[name] = inp.attrib.get("value", "")
+
+    select_fields: dict[str, str] = {}
+    marcador_field = ""
+    marcadores: list[Marcador] = []
+    for sel in form.xpath(".//select"):
+        name = sel.attrib.get("name", "")
+        if not name:
+            continue
+        selected = sel.xpath(".//option[@selected]")
+        if selected:
+            select_fields[name] = selected[0].attrib.get("value", "")
+        else:
+            first = sel.xpath(".//option")
+            if first:
+                select_fields[name] = first[0].attrib.get("value", "")
+
+        opts: list[Marcador] = []
+        for opt in sel.xpath(".//option[@value]"):
+            value = _norm(opt.attrib.get("value"))
+            nome = _norm(opt.text_content())
+            if value and nome:
+                opts.append(Marcador(marcador_id=value, nome=nome))
+        if opts:
+            marcador_field = name
+            marcadores = opts
+            break
+
+    texto_field = None
+    for txt in form.xpath(".//textarea[@name]"):
+        texto_field = txt.attrib.get("name")
+        if texto_field:
+            break
+    if not texto_field:
+        for inp in form.xpath(".//input[@type='text' and @name]"):
+            nome = inp.attrib.get("name", "")
+            if "txt" in nome.lower():
+                texto_field = nome
+                break
+
+    if not marcador_field:
+        raise ValueError("Campo de seleção de marcador não encontrado")
+
+    return MarcadorForm(
+        action=urljoin(base_url, action),
+        hidden_fields=hidden_fields,
+        select_fields=select_fields,
+        marcador_field=marcador_field,
+        texto_field=texto_field,
+        marcadores=marcadores,
+    )

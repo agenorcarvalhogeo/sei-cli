@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from html import unescape
 from typing import Any
 
@@ -610,3 +611,116 @@ def summarize(r: RelatorioServico) -> str:
         lines.append(f"🔄 Passagem para: {r.passagem_para}")
 
     return "\n".join(lines)
+
+
+def summarize_batch(relatorios: list[RelatorioServico]) -> str:
+    """Generate a Markdown weekly summary from multiple reports."""
+    if not relatorios:
+        return "# Resumo Semanal\n\nNenhum relatório encontrado."
+
+    ordered = sorted(
+        relatorios,
+        key=lambda r: _parse_ddmmyyyy(r.data_inicio) or datetime.min,
+    )
+
+    lines: list[str] = ["# Resumo Semanal", ""]
+
+    lines.extend(["## Escala e Efetivo", ""])
+    prev_extra: set[str] | None = None
+    prev_perm: set[str] | None = None
+    for r in ordered:
+        date_label = r.data_inicio or "sem data"
+        extra = {
+            f"{m.posto} {m.nome}".strip()
+            for m in r.militares
+            if m.status == "extraordinario"
+        }
+        perm = {
+            f"{m.posto} {m.nome}".strip()
+            for m in r.militares
+            if m.status == "permuta"
+        }
+        lines.append(f"### {date_label}")
+        lines.append(f"- Extraordinário: {len(extra)}")
+        lines.append(f"- Permuta: {len(perm)}")
+        if prev_extra is not None:
+            entrou_extra = sorted(extra - prev_extra)
+            saiu_extra = sorted(prev_extra - extra)
+            if entrou_extra:
+                lines.append(f"- Entraram em extraordinário: {', '.join(entrou_extra)}")
+            if saiu_extra:
+                lines.append(f"- Saíram de extraordinário: {', '.join(saiu_extra)}")
+        if prev_perm is not None:
+            entrou_perm = sorted(perm - prev_perm)
+            saiu_perm = sorted(prev_perm - perm)
+            if entrou_perm:
+                lines.append(f"- Entraram em permuta: {', '.join(entrou_perm)}")
+            if saiu_perm:
+                lines.append(f"- Saíram de permuta: {', '.join(saiu_perm)}")
+        lines.append("")
+        prev_extra = extra
+        prev_perm = perm
+
+    lines.extend(["## Viaturas", ""])
+    prev_status: dict[str, str] | None = None
+    for r in ordered:
+        date_label = r.data_inicio or "sem data"
+        status_atual = {v.prefixo: v.situacao.lower() for v in r.viaturas}
+        lines.append(f"### {date_label}")
+        if prev_status is None:
+            for v in r.viaturas:
+                lines.append(f"- {v.prefixo}: {v.situacao}")
+        else:
+            mudou = False
+            for prefixo, situacao in status_atual.items():
+                anterior = prev_status.get(prefixo)
+                if anterior and anterior != situacao:
+                    mudou = True
+                    alerta = ""
+                    if "operante" in anterior and "inoperante" in situacao:
+                        alerta = " **(ATENCAO: operante -> inoperante)**"
+                    lines.append(
+                        f"- {prefixo}: {anterior} -> {situacao}{alerta}"
+                    )
+            if not mudou:
+                lines.append("- Sem mudanças relevantes.")
+        lines.append("")
+        prev_status = status_atual
+
+    lines.extend(["## Ocorrências por Dia", ""])
+    for r in ordered:
+        date_label = r.data_inicio or "sem data"
+        natureza_map: dict[str, int] = {}
+        for o in r.ocorrencias:
+            nat = o.natureza.strip().upper() if o.natureza else "SEM TIPO"
+            natureza_map[nat] = natureza_map.get(nat, 0) + 1
+        lines.append(f"### {date_label}")
+        lines.append(f"- Total: {len(r.ocorrencias)}")
+        if natureza_map:
+            tipos = ", ".join(f"{k}: {v}" for k, v in sorted(natureza_map.items()))
+            lines.append(f"- Tipos: {tipos}")
+        else:
+            lines.append("- Tipos: sem ocorrências")
+        lines.append("")
+
+    lines.extend(["## Assuntos Gerais (Destaques)", ""])
+    for r in ordered:
+        if not r.assuntos_gerais:
+            continue
+        date_label = r.data_inicio or "sem data"
+        lines.append(f"### {date_label}")
+        for item in r.assuntos_gerais[:5]:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _parse_ddmmyyyy(value: str) -> datetime | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%d/%m/%Y")
+    except ValueError:
+        return None
