@@ -202,5 +202,47 @@ def switch_cmd(sigla: str, as_json: bool) -> None:
     _print_status(status)
 
 
+@cli.command("read-doc")
+@click.argument("id_documento")
+@click.argument("id_procedimento")
+def read_doc_cmd(id_documento: str, id_procedimento: str) -> None:
+    """Read a document's text content."""
+    with SEIClient() as client:
+        client.login()
+        text = client.read_document(id_documento, id_procedimento)
+    click.echo(text)
+
+
+@cli.command("read-relatorio")
+@click.argument("id_documento")
+@click.argument("id_procedimento")
+@click.option("--unit", default=None, help="Switch to unit before reading (e.g. 'OP 3')")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+@click.option("--summary", is_flag=True, help="Print human-readable summary")
+def read_relatorio_cmd(
+    id_documento: str,
+    id_procedimento: str,
+    unit: str | None,
+    as_json: bool,
+    summary: bool,
+) -> None:
+    """Parse a Relatório de Serviço Operacional into structured data."""
+    from sei_cli.relatorio_parser import summarize as _summarize, to_dict
+
+    with SEIClient() as client:
+        client.login()
+        if unit:
+            client.switch_unit(unit)
+        r = client.read_relatorio(id_documento, id_procedimento)
+
+    if as_json:
+        click.echo(json.dumps(to_dict(r), ensure_ascii=False, indent=2))
+        return
+
+    if summary or not as_json:
+        click.echo(_summarize(r))
+        return
+
+
 if __name__ == "__main__":
     cli()

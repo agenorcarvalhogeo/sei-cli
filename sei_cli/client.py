@@ -29,6 +29,11 @@ from sei_cli.models import (
     Block, BlockDocument, Document, DocumentCreated, DocumentType,
     EditorSection, Process, ProcessList, SystemStatus, Unit,
 )
+from sei_cli.relatorio_parser import (
+    RelatorioServico,
+    parse_relatorio,
+    summarize as summarize_relatorio,
+)
 from sei_cli.parsers import (
     parse_block_documents,
     parse_blocks,
@@ -572,6 +577,55 @@ class SEIClient:
             return False
 
         return True
+
+    def read_document(
+        self, id_documento: str, id_procedimento: str
+    ) -> str:
+        """Read a document's body content as plain text.
+
+        Fetches the editor sections and returns the largest one (body),
+        unescaped from HTML to readable text.
+        """
+        from html import unescape as _unescape
+        save_url, sections = self.get_editor_sections(id_documento, id_procedimento)
+        if not sections:
+            raise RuntimeError(f"Documento {id_documento} não tem conteúdo")
+        body = max(sections, key=lambda s: len(s.content))
+        content = _unescape(body.content)
+        soup = BeautifulSoup(content, "lxml")
+        for img in soup.find_all("img"):
+            img.decompose()
+        return soup.get_text("\n", strip=True)
+
+    def read_relatorio(
+        self, id_documento: str, id_procedimento: str
+    ) -> RelatorioServico:
+        """Read and parse a Relatório de Serviço Operacional.
+
+        Returns a structured RelatorioServico with personnel, vehicles,
+        occurrences, etc.
+        """
+        from html import unescape as _unescape
+        save_url, sections = self.get_editor_sections(id_documento, id_procedimento)
+        if not sections:
+            raise RuntimeError(f"Documento {id_documento} não tem conteúdo")
+
+        # The body is typically the section with most content (not timbre/footer)
+        # Find it — exclude very short sections (title, footer)
+        body_candidates = [s for s in sections if len(s.content) > 1000]
+        if not body_candidates:
+            body_candidates = sections
+
+        # Pick the one that contains "RELATÓRIO" or "Fiscal" keywords
+        body_sec = None
+        for s in body_candidates:
+            if "Fiscal" in s.content or "RELAT" in s.content:
+                body_sec = s
+                break
+        if not body_sec:
+            body_sec = max(body_candidates, key=lambda s: len(s.content))
+
+        return parse_relatorio(body_sec.content)
 
     def _navigate_to_arvore(self, id_procedimento: str) -> str | None:
         """Navigate to a process and return the arvore HTML."""
