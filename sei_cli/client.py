@@ -1,12 +1,16 @@
-"""SEI HTTP Client — read-only operations.
+"""SEI HTTP Client — full workflow operations.
 
-Handles the full login flow with manual redirect following to preserve
-the PHPSESSID cookie that changes at inicializar.php.
+Handles login, process listing, document creation/editing, signing,
+and unit switching via pure HTTP (no browser needed).
 
 Key insight: After login, the initial page load is the ONLY guaranteed
 request that works. Subsequent requests to controlador.php fail because
 SEI validates infra_hash per-session. So we cache the control page HTML
 and extract all navigation URLs from it.
+
+Cookie flow: Login creates PHPSESSID on /sip/, then inicializar.php
+creates a NEW PHPSESSID for /sei/. Must follow redirects manually
+(hop-by-hop) to capture both cookies.
 """
 
 from __future__ import annotations
@@ -22,8 +26,8 @@ from bs4 import BeautifulSoup
 from sei_cli import auth
 from sei_cli.config import load_credentials, SESSION_PATH
 from sei_cli.models import (
-    Block, BlockDocument, Document, Process, ProcessList,
-    SystemStatus, Unit,
+    Block, BlockDocument, Document, DocumentCreated, DocumentType,
+    EditorSection, Process, ProcessList, SystemStatus, Unit,
 )
 from sei_cli.parsers import (
     parse_block_documents,
@@ -273,6 +277,347 @@ class SEIClient:
         """Return only processes marked as 'novo' (unread)."""
         procs = self.list_processes()
         return [p for p in procs.recebidos if p.novo]
+
+    # --- Document creation & editing ---
+
+    # Maps friendly name → SEI id_serie (from frmDocumentoEscolherTipo)
+    DOC_TYPES: dict[str, str] = {
+        "externo": "-1",
+        "analise_riscos": "220",
+        "autorizacao": "305",
+        "declaracao": "83",
+        "despacho_diligencial": "377",
+        "despacho": "5",
+        "dfd": "970",
+        "encaminhamento": "327",
+        "etp": "1170",
+        "informacao": "92",
+        "justificativa": "307",
+        "memorando": "12",
+        "minuta_portaria": "235",
+        "oficio": "11",
+        "parecer": "191",
+        "parte_generica": "292",
+        "plano_trabalho": "669",
+        "relatorio_viagem": "326",
+        "solicitacao_providencias": "347",
+        "solicitacao": "178",
+        "termo_referencia": "214",
+    }
+
+    def list_document_types(self, id_procedimento: str) -> list[DocumentType]:
+        """List available document types for a process.
+
+        Navigates to the process → extracts 'Incluir Documento' URL from
+        the arvore toolbar → GETs the type selection page → parses the
+        onclick escolher(id) calls.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            return []
+
+        # Find 'Incluir Documento' href (next to documento_incluir.svg icon)
+        href_match = re.search(
+            r'href="([^"]+)"[^>]*>\s*<img\s+[^>]*documento_incluir',
+            arvore_html,
+        )
+        if not href_match:
+            return []
+
+        incl_url = urljoin(self._sei_url(""), href_match.group(1))
+        rtype = self._get(incl_url)
+
+        # Parse onclick="escolher(ID)" + link text
+        types: list[DocumentType] = []
+        tsoup = BeautifulSoup(rtype.text, "lxml")
+        for a in tsoup.find_all("a"):
+            onclick = a.get("onclick", "")
+            m = re.match(r"escolher\((-?\d+)\)", onclick)
+            if m:
+                types.append(DocumentType(
+                    id_serie=m.group(1),
+                    nome=a.text.strip(),
+                ))
+        return types
+
+    def create_document(
+        self,
+        id_procedimento: str,
+        tipo: str,
+        *,
+        nivel_acesso: str = "0",  # 0=Público, 1=Restrito, 2=Sigiloso
+        texto_inicial: str = "N",  # N=Nenhum, T=Texto Padrão, D=Documento Modelo
+        descricao: str = "",
+        interessados: str = "",
+    ) -> DocumentCreated:
+        """Create a new document inside a process.
+
+        Args:
+            id_procedimento: Process ID.
+            tipo: Document type key (e.g. 'despacho', 'oficio') or numeric id_serie.
+            nivel_acesso: '0' (Público), '1' (Restrito), '2' (Sigiloso).
+            texto_inicial: 'N' (Nenhum), 'T' (Texto Padrão), 'D' (Documento Modelo).
+            descricao: Optional description field.
+            interessados: Optional interested party.
+
+        Returns:
+            DocumentCreated with id_documento and editor URL.
+        """
+        # Resolve tipo to id_serie
+        id_serie = self.DOC_TYPES.get(tipo.lower().replace(" ", "_"), tipo)
+
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError("Não foi possível acessar a árvore do processo")
+
+        # Step 1: Get 'Incluir Documento' URL
+        href_match = re.search(
+            r'href="([^"]+)"[^>]*>\s*<img\s+[^>]*documento_incluir',
+            arvore_html,
+        )
+        if not href_match:
+            raise RuntimeError("Link 'Incluir Documento' não encontrado na árvore")
+
+        incl_url = urljoin(self._sei_url(""), href_match.group(1))
+        rtype = self._get(incl_url)
+
+        # Step 2: Submit type selection form (escolher(id_serie))
+        tsoup = BeautifulSoup(rtype.text, "lxml")
+        form = tsoup.find("form", id="frmDocumentoEscolherTipo")
+        if not form:
+            raise RuntimeError("Formulário de escolha de tipo não encontrado")
+
+        form_action = urljoin(self._sei_url(""), form["action"])
+        fdata: dict[str, str] = {}
+        for inp in form.find_all("input"):
+            n = inp.get("name", "")
+            if n:
+                fdata[n] = inp.get("value", "")
+        fdata["hdnIdSerie"] = id_serie
+
+        rcadastro = self._post(form_action, fdata)
+        csoup = BeautifulSoup(rcadastro.text, "lxml")
+
+        # Step 3: Fill creation form (frmDocumentoCadastro)
+        cform = csoup.find("form", id="frmDocumentoCadastro")
+        if not cform:
+            raise RuntimeError(
+                "Formulário de cadastro não encontrado. "
+                f"Tipo '{tipo}' (id_serie={id_serie}) pode não estar disponível."
+            )
+
+        cform_action = urljoin(self._sei_url(""), cform["action"])
+        cdata: dict[str, str] = {}
+        for inp in cform.find_all("input"):
+            n = inp.get("name", "")
+            if n:
+                cdata[n] = inp.get("value", "")
+        for sel in cform.find_all("select"):
+            n = sel.get("name", "")
+            if n:
+                selected = sel.find("option", selected=True)
+                cdata[n] = selected["value"] if selected else ""
+
+        # Set our values
+        cdata["rdoTextoInicial"] = texto_inicial
+        cdata["rdoNivelAcesso"] = nivel_acesso
+        cdata["rdoFormato"] = "N"  # Nato-digital
+        if descricao:
+            cdata["txtDescricao"] = descricao
+        if interessados:
+            cdata["txtInteressado"] = interessados
+
+        # Submit creation
+        rcreated = self._post(cform_action, cdata)
+
+        # After creation, SEI redirects to the editor page or back to arvore.
+        # The response should contain the new document ID.
+        self._control_html = None
+
+        # Parse the response for the new document
+        created_soup = BeautifulSoup(rcreated.text, "lxml")
+
+        # If redirected to editor_montar, extract doc ID from URL
+        id_doc = ""
+        editor_url = None
+        url_str = str(rcreated.url)
+        id_doc_match = re.search(r"id_documento=(\d+)", url_str)
+        if id_doc_match:
+            id_doc = id_doc_match.group(1)
+            editor_url = url_str
+
+        # Also check the HTML for id_documento
+        if not id_doc:
+            id_doc_match = re.search(r"id_documento=(\d+)", rcreated.text)
+            if id_doc_match:
+                id_doc = id_doc_match.group(1)
+
+        # Extract editor URL if present
+        if not editor_url:
+            editor_match = re.search(
+                r'controlador\.php\?acao=editor_montar[^"\']+id_documento=' + id_doc,
+                rcreated.text,
+            )
+            if editor_match:
+                editor_url = urljoin(self._sei_url(""), editor_match.group())
+
+        tipo_nome = next(
+            (dt.nome for dt in [DocumentType(id_serie, tipo)]
+             if dt.id_serie == id_serie),
+            tipo,
+        )
+
+        return DocumentCreated(
+            id_documento=id_doc,
+            id_procedimento=id_procedimento,
+            tipo=tipo_nome,
+            editor_url=editor_url,
+        )
+
+    def get_editor_sections(
+        self, id_documento: str, id_procedimento: str
+    ) -> tuple[str, list[EditorSection]]:
+        """Load the editor page for a document and return its sections.
+
+        Returns:
+            Tuple of (editor_save_url, list of EditorSection).
+            Each section has name, content (HTML), and section_id.
+        """
+        editor_url = self._get_editor_url(id_documento, id_procedimento)
+        if not editor_url:
+            raise RuntimeError(
+                f"Editor URL não encontrada para documento {id_documento}"
+            )
+
+        re_edit = self._get(editor_url)
+
+        # Check if document is signed (not editable)
+        if "assinado" in re_edit.text and "não pode" in re_edit.text:
+            raise RuntimeError("Documento já assinado — não pode ser editado")
+
+        # Extract form action (editor_salvar URL with infra_hash)
+        form_match = re.search(
+            r'action="(editor/editor_processar\.php\?acao=editor_salvar[^"]+)"',
+            re_edit.text,
+        )
+        if not form_match:
+            raise RuntimeError("URL de salvamento do editor não encontrada")
+        save_url = urljoin(self._sei_url(""), form_match.group(1))
+
+        # Extract textarea sections
+        sections: list[EditorSection] = []
+        for m in re.finditer(
+            r'<textarea[^>]*name="(txaEditor_(\d+))"[^>]*>(.*?)</textarea>',
+            re_edit.text,
+            re.DOTALL,
+        ):
+            sections.append(EditorSection(
+                name=m.group(1),
+                content=m.group(3),
+                section_id=m.group(2),
+            ))
+
+        # Extract hidden fields too (needed for save)
+        self._editor_hiddens: dict[str, str] = {}
+        esoup = BeautifulSoup(re_edit.text, "lxml")
+        form = esoup.find("form", id="frmEditor")
+        if form:
+            for inp in form.find_all("input", {"type": "hidden"}):
+                n = inp.get("name", "")
+                if n:
+                    self._editor_hiddens[n] = inp.get("value", "")
+
+        return save_url, sections
+
+    def save_document(
+        self,
+        save_url: str,
+        sections: list[EditorSection],
+    ) -> bool:
+        """Save document content by POSTing the editor form.
+
+        Args:
+            save_url: The editor_salvar URL (from get_editor_sections).
+            sections: List of EditorSection with modified content.
+
+        Returns:
+            True if save succeeded.
+        """
+        data: dict[str, str] = {}
+
+        # Include hidden fields from editor form
+        data.update(getattr(self, "_editor_hiddens", {}))
+
+        # Add all sections as textarea values
+        for sec in sections:
+            data[sec.name] = sec.content
+
+        r = self._post(save_url, data)
+
+        # editor_salvar typically returns a small page loaded into ifrEditorSalvar
+        # with a success indicator or error message
+        self._control_html = None
+
+        # Check for errors
+        if "erro" in r.text.lower() or "falha" in r.text.lower():
+            return False
+
+        return True
+
+    def _navigate_to_arvore(self, id_procedimento: str) -> str | None:
+        """Navigate to a process and return the arvore HTML."""
+        html = self._ensure_control()
+        soup = BeautifulSoup(html, "lxml")
+
+        # Find process link with valid hash
+        proc_link = None
+        for a in soup.find_all("a"):
+            href = a.get("href", "")
+            if "procedimento_trabalhar" in href and id_procedimento in href:
+                proc_link = urljoin(self._sei_url(""), href)
+                break
+
+        if not proc_link:
+            return None
+
+        rp = self._get(proc_link)
+        psoup = BeautifulSoup(rp.text, "lxml")
+        iframe = psoup.find("iframe", {"name": "ifrArvore"})
+        if not iframe or not iframe.get("src"):
+            return None
+
+        arvore_url = urljoin(self._sei_url(""), iframe["src"])
+        ra = self._get(arvore_url)
+        self._control_html = None
+        return ra.text
+
+    def _get_editor_url(
+        self, id_documento: str, id_procedimento: str
+    ) -> str | None:
+        """Get the editor_montar URL for a document."""
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            return None
+
+        # Find the document's arvore_visualizar URL
+        doc_pattern = re.compile(
+            rf'controlador\.php\?acao=arvore_visualizar[^"]*id_documento={id_documento}[^"]*'
+        )
+        doc_match = doc_pattern.search(arvore_html)
+        if not doc_match:
+            return None
+
+        doc_url = urljoin(self._sei_url(""), doc_match.group())
+        rd = self._get(doc_url)
+
+        # Extract linkEditarConteudo
+        edit_match = re.search(
+            r"var\s+linkEditarConteudo\s*=\s*'([^']+)'", rd.text
+        )
+        if not edit_match:
+            return None
+
+        return urljoin(self._sei_url(""), edit_match.group(1))
 
     # --- Signing ---
 

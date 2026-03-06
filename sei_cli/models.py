@@ -99,6 +99,30 @@ class ProcessDetails:
     documentos: list[Document] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class DocumentType:
+    """A type of document available for creation (e.g., Despacho, Ofício)."""
+    id_serie: str
+    nome: str
+
+
+@dataclass(slots=True)
+class EditorSection:
+    """A section of a document in the CKEditor form."""
+    name: str         # e.g. txaEditor_406
+    content: str      # HTML content
+    section_id: str   # e.g. 406
+
+
+@dataclass(slots=True)
+class DocumentCreated:
+    """Result of creating a new document."""
+    id_documento: str
+    id_procedimento: str
+    tipo: str
+    editor_url: str | None = None
+
+
 def as_json(data: Any) -> Any:
     if hasattr(data, "__dataclass_fields__"):
         return asdict(data)
