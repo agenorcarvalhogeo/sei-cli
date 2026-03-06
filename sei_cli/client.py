@@ -240,11 +240,20 @@ class SEIClient:
         # POST form with selInfraUnidades (the key JS creates dynamically)
         post_url = urljoin(str(r.url), form_action) if form_action else switch_url
         data = {**hiddens, "selInfraUnidades": target.link}
-        
+
         r2 = self._post(post_url, data)
-        self._control_html = r2.text
-        self._menu_links = parse_menu_links(r2.text, self._sei_url(""))
-        return parse_system_status(r2.text)
+
+        # After switching, the response is a confirmation page, not the control
+        # page. We need to explicitly load the control page to get process lists.
+        status = parse_system_status(r2.text)
+        control_url = self._sei_url(
+            f"controlador.php?acao=procedimento_controlar"
+            f"&infra_sistema=100000100&infra_unidade_atual={target.link}"
+        )
+        rc = self._get(control_url)
+        self._control_html = rc.text
+        self._menu_links = parse_menu_links(rc.text, self._sei_url(""))
+        return parse_system_status(rc.text)
 
     # --- Search ---
 
