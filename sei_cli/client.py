@@ -1077,33 +1077,72 @@ class SEIClient:
         return parse_marcadores_list(r.text, self._sei_url(""))
 
     def set_marcador(self, id_procedimento: str, marcador_id: str, texto: str = "") -> bool:
-        """Apply marker to a process."""
-        rp = self._navigate_process_page(id_procedimento)
-        marc_url = (
-            self._extract_action_url(rp.text, "andamento_marcador_gerenciar")
-            or self._extract_action_url(rp.text, "andamento_marcador_cadastrar")
+        """Apply marker to a process.
+
+        Navigates: process tree → Nos[0] toolbar → andamento_marcador_gerenciar
+        → "Adicionar" button → andamento_marcador_cadastrar form → POST.
+
+        Args:
+            id_procedimento: Process ID.
+            marcador_id: Marker ID from the select (e.g. '64956' for Diárias).
+            texto: Description text for the marker.
+
+        Returns:
+            True if the marker was applied successfully.
+        """
+        # Step 1: Navigate to tree and get gerenciar URL from toolbar
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError("Could not navigate to process tree")
+
+        start = arvore_html.find('Nos[0]')
+        end = arvore_html.find('Nos[1]', start)
+        nos0 = arvore_html[start:end].replace('\\"', '"')
+
+        ger_m = re.search(
+            r'href="(controlador\.php\?acao=andamento_marcador_gerenciar[^"]*)"',
+            nos0,
         )
-        if not marc_url:
-            control_html = self._ensure_control()
-            marc_url = self._extract_action_url(control_html, "andamento_marcador_cadastrar")
-        if not marc_url:
-            raise RuntimeError("Ação de marcador não encontrada")
+        if not ger_m:
+            raise RuntimeError("Gerenciar Marcador action not found in toolbar")
 
-        rm = self._get(marc_url)
-        form = parse_marcador_form(rm.text, self._sei_url(""), str(rm.url))
-        data: dict[str, str] = {}
-        data.update(form.hidden_fields)
-        data.update(form.select_fields)
-        data[form.marcador_field] = marcador_id
-        if form.texto_field:
-            data[form.texto_field] = texto
+        # Step 2: Go to gerenciar page (lists existing marcadores)
+        r_ger = self._get(self._sei_url(ger_m.group(1).replace('&amp;', '&')))
 
-        rset = self._post(form.action, data)
+        # Step 3: Find the "Adicionar" button → andamento_marcador_cadastrar
+        add_m = re.search(
+            r'(controlador\.php\?acao=andamento_marcador_cadastrar[^"\']+)',
+            r_ger.text,
+        )
+        if not add_m:
+            raise RuntimeError("Adicionar marcador link not found")
+
+        # Step 4: Load the cadastrar form
+        r_cad = self._get(self._sei_url(add_m.group(1).replace('&amp;', '&')))
+
+        soup = BeautifulSoup(r_cad.text, 'lxml')
+        form = soup.find('form', id='frmAndamentoMarcadorCadastro')
+        if not form:
+            raise RuntimeError("Marcador cadastro form not found")
+
+        action_url = urljoin(self._sei_url(""), form['action'])
+
+        # Step 5: POST with marcador data
+        data = {
+            'hdnInfraTipoPagina': '2',
+            'selMarcador': marcador_id,
+            'hdnIdMarcador': marcador_id,
+            'txaTexto': texto,
+            'hdnIdProtocolo': id_procedimento,
+            'sbmSalvar': 'Salvar',
+        }
+
+        r_save = self._post(action_url, data)
         self._control_html = None
-        lower = rset.text.lower()
-        if "erro" in lower or "falha" in lower:
-            return False
-        return True
+
+        # Success: redirects to gerenciar (200 with table showing the marker)
+        # or shows the form again (error)
+        return marcador_id in r_save.text or 'andamento_marcador_gerenciar' in str(r_save.url)
 
     def remove_marcador(self, id_procedimento: str) -> bool:
         """Remove marker from a process."""
