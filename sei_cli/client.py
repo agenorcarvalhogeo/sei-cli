@@ -334,6 +334,194 @@ class SEIClient:
 
     # --- Enhanced document tree with folder expansion ---
 
+    def get_actions(
+        self,
+        id_procedimento: str,
+        id_documento: str | None = None,
+    ) -> dict[str, str]:
+        """Return available actions for a process or document.
+
+        Navigates to ``arvore_visualizar`` (optionally with a document
+        selected) and extracts the ``var linkXxx = '...'`` JS variables
+        that define the action menu URLs.
+
+        Args:
+            id_procedimento: Process ID.
+            id_documento: If given, returns document-level actions.
+                If None, returns process-level actions.
+
+        Returns:
+            Dict mapping JS variable names (e.g. ``linkExcluirDocumento``,
+            ``linkAssinarDocumento``) to their full URL paths.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            return {}
+
+        # Find the arvore_visualizar URL for the target
+        target_id = id_documento or id_procedimento
+        pattern = (
+            rf'(controlador\.php\?acao=arvore_visualizar[^"]*'
+            rf'id_{"documento" if id_documento else "procedimento"}={re.escape(target_id)}[^"]*)'
+        )
+
+        sel_url = None
+        # Search in main tree and expanded folders
+        m = re.search(pattern, arvore_html)
+        if m:
+            sel_url = self._sei_url(m.group(1).replace('&amp;', '&'))
+            # For process-level, strip id_documento if present
+            if not id_documento:
+                sel_url = re.sub(r'&id_documento=\d+', '', sel_url)
+
+        if not sel_url:
+            # Try expanding lazy folders
+            from sei_cli.parsers import parse_tree_folders
+            for folder in parse_tree_folders(arvore_html):
+                if folder.carregado:
+                    continue
+                r = self._post(self._sei_url(folder.link), {
+                    'hdnArvore': '',
+                    'hdnPastaAtual': folder.folder_id,
+                    'hdnProtocolos': folder.protocolos,
+                })
+                m = re.search(pattern, r.text)
+                if m:
+                    sel_url = self._sei_url(m.group(1).replace('&amp;', '&'))
+                    break
+
+        if not sel_url:
+            return {}
+
+        r_sel = self._get(sel_url)
+
+        # Extract var linkXxx = 'url' patterns
+        links = re.findall(r"var\s+(link\w+)\s*=\s*'([^']+)'", r_sel.text)
+        return {name: url for name, url in links}
+
+    def alter_process(
+        self,
+        id_procedimento: str,
+        *,
+        descricao: str | None = None,
+        observacoes: str | None = None,
+    ) -> bool:
+        """Update a process's description and/or observations.
+
+        Navigates to ``procedimento_alterar``, reads the current form
+        values, updates the specified fields, and POSTs back.
+
+        Args:
+            id_procedimento: Process ID.
+            descricao: New description/specification (``txtDescricao``).
+            observacoes: New observations (``txaObservacoes``).
+
+        Returns:
+            True if the update succeeded (302 redirect).
+
+        Raises:
+            RuntimeError: If the alter form is unavailable.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError("Could not navigate to process tree")
+
+        # Find procedimento_alterar URL from Nos[0] acoes
+        start = arvore_html.find('Nos[0]')
+        end = arvore_html.find('Nos[1]', start)
+        nos0 = arvore_html[start:end].replace('\\"', '"')
+
+        alt_m = re.search(
+            r'href="(controlador\.php\?acao=procedimento_alterar[^"]*)"',
+            nos0,
+        )
+        if not alt_m:
+            raise RuntimeError("Alterar Processo action not found in toolbar")
+
+        alt_url = self._sei_url(alt_m.group(1).replace('&amp;', '&'))
+        r_form = self._get(alt_url)
+
+        # Parse form
+        soup = BeautifulSoup(r_form.text, 'lxml')
+        form = soup.find('form', id='frmProcedimentoCadastro')
+        if not form:
+            raise RuntimeError("Alter process form not found")
+
+        action_url = urljoin(self._sei_url(""), form['action'])
+
+        # Collect all current field values
+        data: dict[str, str] = {}
+        for inp in form.find_all('input'):
+            name = inp.get('name', '')
+            if not name:
+                continue
+            typ = inp.get('type', '')
+            if typ == 'radio':
+                if inp.get('checked'):
+                    data[name] = inp.get('value', '')
+            elif typ != 'button' and typ != 'submit':
+                data[name] = inp.get('value', '')
+
+        for sel in form.find_all('select'):
+            name = sel.get('name', '')
+            if name:
+                selected = sel.find('option', selected=True)
+                data[name] = selected.get('value', '') if selected else ''
+
+        for ta in form.find_all('textarea'):
+            name = ta.get('name', '')
+            if name:
+                data[name] = ta.string or ''
+
+        # Set flag to "alterar" mode
+        data['hdnFlagProcedimentoCadastro'] = '2'
+
+        # Apply changes
+        if descricao is not None:
+            data['txtDescricao'] = descricao
+        if observacoes is not None:
+            data['txaObservacoes'] = observacoes
+
+        # --- Fill required hidden fields from their select counterparts ---
+        # SEI JS normally syncs these; we must do it manually.
+
+        # Assuntos: hdnAssuntos must mirror selAssuntos options
+        if not data.get('hdnAssuntos'):
+            sel_a = soup.find('select', id='selAssuntos')
+            if sel_a:
+                vals = [o.get('value', '') for o in sel_a.find_all('option') if o.get('value')]
+                data['hdnAssuntos'] = vals[0] if vals else ''
+                if vals:
+                    data['selAssuntos'] = vals[0]
+
+        # Interessados: hdnInteressadosProcedimento must mirror selInteressadosProcedimento
+        if not data.get('hdnInteressadosProcedimento'):
+            sel_i = soup.find('select', id='selInteressadosProcedimento')
+            if sel_i:
+                vals = [o.get('value', '') for o in sel_i.find_all('option') if o.get('value')]
+                data['hdnInteressadosProcedimento'] = vals[0] if vals else ''
+                if vals:
+                    data['selInteressadosProcedimento'] = vals[0]
+
+        # POST — use _post which handles redirects
+        r_save = self._post(action_url, data)
+        self._control_html = None
+
+        # After _follow, a successful save redirects to arvore_visualizar
+        # Check the final URL or look for the process tree
+        final_url = str(r_save.url)
+        if 'arvore_visualizar' in final_url or 'procedimento_trabalhar' in final_url:
+            return True
+        # If still on the alter page, check for flag=1 (means form re-rendered = error)
+        if 'hdnFlagProcedimentoCadastro' in r_save.text:
+            flag_m = re.search(
+                r'name="hdnFlagProcedimentoCadastro"[^>]*value="(\d)"',
+                r_save.text,
+            )
+            if flag_m and flag_m.group(1) == '1':
+                return False
+        return True
+
     def get_full_document_tree(
         self, id_procedimento: str, *, expand_all: bool = True
     ) -> list[TreeDocument]:
@@ -477,6 +665,94 @@ class SEIClient:
             raise RuntimeError(
                 f"pdftotext failed for {doc.nome}: {proc.stderr}"
             )
+
+    def delete_document(
+        self,
+        id_documento: str,
+        id_procedimento: str,
+    ) -> bool:
+        """Delete an unsigned document from a process.
+
+        Navigates to arvore_visualizar with the document selected, which
+        exposes JS link variables including ``linkExcluirDocumento``.
+        That URL is the direct delete action (the browser JS just does
+        ``confirm()`` then ``location.href = linkExcluirDocumento``).
+
+        Only works for documents created by the current unit that have NOT
+        been signed.
+
+        Args:
+            id_documento: Document ID to delete.
+            id_procedimento: Process ID containing the document.
+
+        Returns:
+            True if deletion succeeded.
+
+        Raises:
+            RuntimeError: If the document cannot be deleted.
+        """
+        # Step 1: Navigate to tree and find the doc link
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError("Could not navigate to process tree")
+
+        # The doc might be inside a lazy-loaded folder — expand all
+        from sei_cli.parsers import parse_tree_folders
+
+        search_sources = [arvore_html]
+        for folder in parse_tree_folders(arvore_html):
+            if folder.carregado:
+                continue
+            r = self._post(self._sei_url(folder.link), {
+                'hdnArvore': '',
+                'hdnPastaAtual': folder.folder_id,
+                'hdnProtocolos': folder.protocolos,
+            })
+            if id_documento in r.text:
+                search_sources.append(r.text)
+
+        # Step 2: Find arvore_visualizar link for this document
+        sel_url = None
+        for src in search_sources:
+            m = re.search(
+                rf'(controlador\.php\?acao=arvore_visualizar[^"]*'
+                rf'id_documento={re.escape(id_documento)}[^"]*)',
+                src,
+            )
+            if m:
+                sel_url = self._sei_url(m.group(1).replace('&amp;', '&'))
+                break
+
+        if not sel_url:
+            raise RuntimeError(
+                f"Document {id_documento} not found in process tree. "
+                "It may not exist or may be in a different unit."
+            )
+
+        # Step 3: Load arvore_visualizar with doc selected → get JS links
+        r_sel = self._get(sel_url)
+
+        # Step 4: Extract linkExcluirDocumento (direct delete URL)
+        link_match = re.search(
+            r"linkExcluirDocumento\s*=\s*'(controlador\.php[^']+)'",
+            r_sel.text,
+        )
+        if not link_match:
+            raise RuntimeError(
+                f"Delete action not available for document {id_documento}. "
+                "It may be signed or belong to another unit."
+            )
+
+        delete_url = self._sei_url(link_match.group(1).replace('&amp;', '&'))
+
+        # Step 5: Execute the delete (single GET)
+        r_delete = self._get(delete_url)
+        self._control_html = None
+
+        if 'erro' in r_delete.text.lower():
+            raise RuntimeError("Delete failed: check SEI for details")
+
+        return True
 
     def list_acompanhamento_especial(self) -> list[Process]:
         """List processes in 'Acompanhamento Especial'.
