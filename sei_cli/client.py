@@ -63,6 +63,7 @@ class SEIClient:
         self._control_html: str | None = None
         self._menu_links: dict[str, str] = {}
         self._editor_hiddens: dict[str, str] = {}
+        self._current_unit_id: str | None = None
 
     def close(self) -> None:
         self.client.close()
@@ -199,6 +200,137 @@ class SEIClient:
         self._control_html = None
         
         return parse_document_tree(ra.text, base_url=self._sei_url(""))
+
+    # --- Process creation ---
+
+    def create_process(
+        self,
+        tipo_processo_id: str,
+        *,
+        especificacao: str = "",
+        interessados: str = "",
+        observacoes: str = "",
+        nivel_acesso: str = "0",  # 0=Público, 1=Restrito, 2=Sigiloso
+    ) -> dict:
+        """Create a new process (Iniciar Processo).
+
+        Args:
+            tipo_processo_id: The process type ID (e.g. '100000506' for Diárias).
+            especificacao: Description/specification field.
+            interessados: Interested party text.
+            observacoes: Notes for the unit.
+            nivel_acesso: '0' (Público), '1' (Restrito), '2' (Sigiloso).
+
+        Returns:
+            Dict with 'numero' (process number), 'id_procedimento', 'link'.
+        """
+        html = self._ensure_control()
+
+        # Step 1: Navigate to type chooser page
+        href_match = re.search(
+            r'href="(controlador\.php\?acao=procedimento_escolher_tipo[^"]+)"',
+            html,
+        )
+        if not href_match:
+            raise RuntimeError("Link 'Iniciar Processo' não encontrado")
+
+        tipo_url = self._sei_url(href_match.group(1))
+        r_tipo = self._get(tipo_url)
+
+        soup_tipo = BeautifulSoup(r_tipo.text, "lxml")
+        form_tipo = soup_tipo.find(
+            "form", id="frmProcedimentoEscolherTipo"
+        )
+        if not form_tipo:
+            raise RuntimeError("Formulário de escolha de tipo não encontrado")
+
+        action_tipo = urljoin(self._sei_url(""), form_tipo["action"])
+        data_tipo: dict[str, str] = {}
+        for inp in form_tipo.find_all("input"):
+            n = inp.get("name", "")
+            if n and inp.get("type") != "checkbox":
+                data_tipo[n] = inp.get("value", "")
+        data_tipo["hdnIdTipoProcedimento"] = tipo_processo_id
+
+        # Step 2: Submit type selection → get cadastro form
+        r_cad = self._post(action_tipo, data_tipo)
+        soup_cad = BeautifulSoup(r_cad.text, "lxml")
+        form_cad = soup_cad.find("form", id="frmProcedimentoCadastro")
+        if not form_cad:
+            raise RuntimeError("Formulário de cadastro de processo não encontrado")
+
+        action_cad = urljoin(self._sei_url(""), form_cad["action"])
+
+        # Collect all form fields
+        data_cad: dict[str, str] = {}
+        for inp in form_cad.find_all("input"):
+            n = inp.get("name", "")
+            if not n:
+                continue
+            if inp.get("type") == "radio":
+                # Only include checked radios or set our defaults
+                if inp.get("checked"):
+                    data_cad[n] = inp.get("value", "")
+            else:
+                data_cad[n] = inp.get("value", "")
+        for sel in form_cad.find_all("select"):
+            n = sel.get("name", "")
+            if n:
+                selected = sel.find("option", selected=True)
+                data_cad[n] = selected["value"] if selected else ""
+        for ta in form_cad.find_all("textarea"):
+            n = ta.get("name", "")
+            if n:
+                data_cad[n] = ta.get_text()
+
+        # Set our values
+        data_cad["hdnFlagProcedimentoCadastro"] = "2"  # Critical: triggers save
+        data_cad["rdoProtocolo"] = "A"  # Automático
+        data_cad["selTipoProcedimento"] = tipo_processo_id
+        data_cad["rdoNivelAcesso"] = nivel_acesso
+        if especificacao:
+            data_cad["txtDescricao"] = especificacao
+        if observacoes:
+            data_cad["txaObservacoes"] = observacoes
+
+        # Submit creation
+        r_create = self._post(action_cad, data_cad)
+        self._control_html = None
+
+        # Parse response for process number
+        url_str = str(r_create.url)
+        id_proc_match = re.search(r"id_procedimento=(\d+)", url_str)
+        if not id_proc_match:
+            id_proc_match = re.search(r"id_procedimento=(\d+)", r_create.text)
+
+        # Extract process number from page
+        csoup = BeautifulSoup(r_create.text, "lxml")
+        title = csoup.title.get_text() if csoup.title else ""
+        # Title is usually "SEI - 08810xxx.xxxxxx/2026-xx"
+        num_match = re.search(r"(\d{8}\.\d+/\d{4}-\d{2})", title)
+        if not num_match:
+            num_match = re.search(
+                r"(\d{8}\.\d+/\d{4}-\d{2})", r_create.text
+            )
+
+        return {
+            "numero": num_match.group(1) if num_match else "",
+            "id_procedimento": id_proc_match.group(1) if id_proc_match else "",
+            "link": url_str,
+        }
+
+    # Process type constants for convenience
+    PROC_TYPES: dict[str, str] = {
+        "diarias": "100000506",
+        "diarias_passagens": "100000506",
+        "curso_proprio": "100000515",
+        "curso_outra": "100000205",
+        "ferias": "100000182",
+        "escala_plantao": "100000191",
+        "informacao": "100000595",
+        "requerimento": "100000268",
+        "suprimento_fundos": "100000815",
+    }
 
     # --- Enhanced document tree with folder expansion ---
 
@@ -488,6 +620,7 @@ class SEIClient:
         # After switching, the response is a confirmation page, not the control
         # page. We need to explicitly load the control page to get process lists.
         status = parse_system_status(r2.text)
+        self._current_unit_id = target.link
         control_url = self._sei_url(
             f"controlador.php?acao=procedimento_controlar"
             f"&infra_sistema=100000100&infra_unidade_atual={target.link}"
@@ -500,27 +633,84 @@ class SEIClient:
     # --- Search ---
 
     def search(self, query: str) -> str:
-        """Quick search (pesquisa rápida). Returns raw HTML."""
+        """Quick search (pesquisa rápida).
+
+        When given a SEI protocol/document number, navigates directly
+        to that document or process. Returns raw HTML of the result page.
+        """
         html = self._ensure_control()
         soup = BeautifulSoup(html, "lxml")
-        
+
         pesq_form = soup.find("form", {"id": "frmProtocoloPesquisaRapida"})
         if not pesq_form:
-            # Fallback: find any form with txtPesquisaRapida
             pesq_input = soup.find("input", {"id": "txtPesquisaRapida"})
             if pesq_input:
                 pesq_form = pesq_input.find_parent("form")
-        
+
         if not pesq_form:
             raise RuntimeError("Formulário de pesquisa não encontrado")
-        
+
         action = pesq_form.get("action", "")
         search_url = urljoin(self._sei_url(""), action)
-        
+
         r = self._post(search_url, data={"txtPesquisaRapida": query})
         self._control_html = None
-        
+
+        # Check if we were redirected to a process/document page
+        final_url = str(r.url)
+        if "procedimento_trabalhar" in final_url:
+            # Landed on a process page — return it
+            return r.text
+        if "documento_visualizar" in final_url:
+            # Landed on a document view — return it
+            return r.text
+
+        # Check for frameset — SEI often uses framesets
+        rsoup = BeautifulSoup(r.text, "lxml")
+        frame = rsoup.find("iframe", {"id": "ifrVisualizacao"})
+        if frame and frame.get("src"):
+            # Follow the iframe to get actual content
+            iframe_url = urljoin(self._sei_url(""), frame["src"])
+            ri = self._get(iframe_url)
+            return ri.text
+
         return r.text
+
+    def search_document(self, protocolo: str) -> tuple[str, str] | None:
+        """Search for a document by its SEI protocol number.
+
+        Uses pesquisa rápida to find a document and extracts
+        id_documento and id_procedimento from the resulting page.
+
+        Args:
+            protocolo: SEI protocol number (e.g. '39701977').
+
+        Returns:
+            Tuple of (id_documento, id_procedimento) or None if not found.
+        """
+        html = self.search(protocolo)
+        soup = BeautifulSoup(html, "lxml")
+
+        # Check URL patterns in the page
+        final_url = ""
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "id_documento" in href:
+                id_doc = re.search(r"id_documento=(\d+)", href)
+                id_proc = re.search(r"id_procedimento=(\d+)", href)
+                if id_doc and id_proc:
+                    return (id_doc.group(1), id_proc.group(1))
+
+        # Try extracting from any script or hidden field
+        for pattern in [
+            r'"id_documento":"(\d+)".*?"id_procedimento":"(\d+)"',
+            r'id_documento=(\d+).*?id_procedimento=(\d+)',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                return (m.group(1), m.group(2))
+
+        return None
 
     # --- New processes check ---
 
@@ -956,24 +1146,161 @@ class SEIClient:
 
         return True
 
+    def view_document_html(
+        self, id_documento: str, id_procedimento: str
+    ) -> str:
+        """View a document's rendered HTML (works for signed documents too).
+
+        Uses documento_imprimir_web which renders the full document
+        including signed ones that can't be opened in the editor.
+
+        Args:
+            id_documento: Internal document ID.
+            id_procedimento: Process ID containing the document.
+
+        Returns:
+            Raw HTML content of the document body.
+        """
+        # Navigate to the process tree to establish session context
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado"
+            )
+
+        # Find the documento_imprimir_web URL with infra_hash from the tree
+        print_match = re.search(
+            rf'(controlador\.php\?acao=documento_imprimir_web[^"]*'
+            rf'id_documento={id_documento}[^"]*)',
+            arvore_html,
+        )
+
+        if not print_match:
+            # Fallback: try documento_visualizar
+            vis_match = re.search(
+                rf'(controlador\.php\?acao=documento_visualizar[^"]*'
+                rf'id_documento={id_documento}[^"]*)',
+                arvore_html,
+            )
+            if vis_match:
+                r = self._get(self._sei_url(vis_match.group(1)))
+                if "login.php" not in str(r.url):
+                    return r.text
+            raise RuntimeError(
+                f"Link de visualização não encontrado para documento {id_documento}"
+            )
+
+        r = self._get(self._sei_url(print_match.group(1)))
+
+        # Check for login redirect
+        if "login.php" in str(r.url) or "pwdSenha" in r.text:
+            raise RuntimeError(
+                "Session expired viewing document. Re-login needed."
+            )
+
+        return r.text
+
+    def view_document(
+        self, id_documento: str, id_procedimento: str
+    ) -> str:
+        """View a document as plain text (works for signed documents too).
+
+        Args:
+            id_documento: Internal document ID.
+            id_procedimento: Process ID containing the document.
+
+        Returns:
+            Plain text content of the document.
+        """
+        html = self.view_document_html(id_documento, id_procedimento)
+        soup = BeautifulSoup(html, "lxml")
+
+        # Remove timbre/header images
+        for img in soup.find_all("img"):
+            img.decompose()
+
+        # Remove navigation/chrome elements
+        for tag_id in ["divInfraAreaGlobal", "navInfraBarraNavegacao"]:
+            tag = soup.find(id=tag_id)
+            if tag:
+                tag.decompose()
+
+        return soup.get_text("\n", strip=True)
+
+    def view_document_sections(
+        self, id_documento: str, id_procedimento: str
+    ) -> list[EditorSection]:
+        """Extract document sections from the print view (works for signed docs).
+
+        Returns sections similar to get_editor_sections() but read-only,
+        extracted from the rendered HTML rather than the editor form.
+
+        Args:
+            id_documento: Internal document ID.
+            id_procedimento: Process ID.
+
+        Returns:
+            List of EditorSection with content (HTML of each section).
+        """
+        html = self.view_document_html(id_documento, id_procedimento)
+        soup = BeautifulSoup(html, "lxml")
+
+        sections: list[EditorSection] = []
+
+        # documento_imprimir_web renders sections as divs with id="txaEditor_NNN"
+        # or directly as content divs
+        for div in soup.find_all(
+            lambda tag: tag.get("id", "").startswith("txaEditor_")
+                        or tag.get("name", "").startswith("txaEditor_")
+        ):
+            sec_id = re.search(r'(\d+)', div.get("id", div.get("name", "")))
+            if sec_id:
+                inner = "".join(str(child) for child in div.children)
+                sections.append(EditorSection(
+                    name=f"txaEditor_{sec_id.group(1)}",
+                    content=inner,
+                    section_id=sec_id.group(1),
+                ))
+
+        # Fallback: if no txaEditor divs found, extract from the print layout
+        if not sections:
+            # The print view has the document body in a specific structure
+            # Look for the main content area
+            body = soup.find("body")
+            if body:
+                inner = "".join(str(child) for child in body.children)
+                sections.append(EditorSection(
+                    name="body",
+                    content=inner,
+                    section_id="0",
+                ))
+
+        return sections
+
     def read_document(
         self, id_documento: str, id_procedimento: str
     ) -> str:
         """Read a document's body content as plain text.
 
-        Fetches the editor sections and returns the largest one (body),
-        unescaped from HTML to readable text.
+        Tries the editor first (for unsigned docs), falls back to
+        the print view (for signed docs).
         """
         from html import unescape as _unescape
-        save_url, sections = self.get_editor_sections(id_documento, id_procedimento)
-        if not sections:
-            raise RuntimeError(f"Documento {id_documento} não tem conteúdo")
-        body = max(sections, key=lambda s: len(s.content))
-        content = _unescape(body.content)
-        soup = BeautifulSoup(content, "lxml")
-        for img in soup.find_all("img"):
-            img.decompose()
-        return soup.get_text("\n", strip=True)
+        try:
+            save_url, sections = self.get_editor_sections(
+                id_documento, id_procedimento
+            )
+            if not sections:
+                raise RuntimeError("empty")
+            body = max(sections, key=lambda s: len(s.content))
+            content = _unescape(body.content)
+            soup = BeautifulSoup(content, "lxml")
+            for img in soup.find_all("img"):
+                img.decompose()
+            return soup.get_text("\n", strip=True)
+        except RuntimeError:
+            # Fallback: signed document — use print view
+            return self.view_document(id_documento, id_procedimento)
 
     def read_relatorio(
         self, id_documento: str, id_procedimento: str
