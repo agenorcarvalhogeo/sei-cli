@@ -802,6 +802,165 @@ class SEIClient:
 
         return procs
 
+    def list_grupos_acompanhamento(self) -> list[tuple[str, str]]:
+        """List available Acompanhamento Especial groups for current unit.
+
+        Returns list of (group_id, group_name) tuples.
+        """
+        html = self._ensure_control()
+
+        # Navigate to acompanhamento_cadastrar to access the grupo select
+        cad = re.search(
+            r'(controlador\.php\?acao=acompanhamento_cadastrar[^"\']+)', html
+        )
+        if not cad:
+            return []
+
+        r = self._get(self._sei_url(cad.group(1).replace("&amp;", "&")))
+        soup = BeautifulSoup(r.text, "lxml")
+        sel = soup.find("select", {"name": "selGrupoAcompanhamento"})
+        if not sel:
+            return []
+
+        result = []
+        for opt in sel.find_all("option"):
+            val = opt.get("value", "")
+            name = opt.get_text(strip=True)
+            if val and val != "null" and name:
+                result.append((val, name))
+        return result
+
+    def create_grupo_acompanhamento(self, nome: str) -> bool:
+        """Create a new Acompanhamento Especial group in the current unit.
+
+        Args:
+            nome: Group name (e.g. 'Pessoal', 'Operacional').
+
+        Returns:
+            True if created successfully.
+        """
+        html = self._ensure_control()
+
+        cad = re.search(
+            r'(controlador\.php\?acao=acompanhamento_cadastrar[^"\']+)', html
+        )
+        if not cad:
+            raise RuntimeError("Link acompanhamento_cadastrar not found")
+
+        r_cad = self._get(self._sei_url(cad.group(1).replace("&amp;", "&")))
+        grupo_url = re.search(
+            r'(controlador\.php\?acao=grupo_acompanhamento_cadastrar[^"\']+)',
+            r_cad.text,
+        )
+        if not grupo_url:
+            raise RuntimeError("Link grupo_acompanhamento_cadastrar not found")
+
+        r_form = self._get(
+            self._sei_url(grupo_url.group(1).replace("&amp;", "&"))
+        )
+        soup = BeautifulSoup(r_form.text, "lxml")
+        form = soup.find("form", id="frmGrupoAcompanhamentoCadastro")
+        if not form:
+            raise RuntimeError("Grupo cadastro form not found")
+
+        action = self._sei_url(form["action"])
+        data = {
+            "hdnInfraTipoPagina": "2",
+            "txtNome": nome,
+            "hdnIdGrupoAcompanhamento": "",
+            "sbmCadastrarGrupoAcompanhamento": "Salvar",
+        }
+        self._post(action, data)
+        self._control_html = None
+        return True
+
+    def add_acompanhamento_especial(
+        self, id_procedimento: str, grupo_id: str, observacao: str
+    ) -> bool:
+        """Add a process to Acompanhamento Especial.
+
+        Flow: procedimento_trabalhar → ifrVisualizacao → acompanhamento_gerenciar → POST
+
+        Args:
+            id_procedimento: Process ID.
+            grupo_id: Group ID from list_grupos_acompanhamento().
+            observacao: Description text (required by SEI).
+
+        Returns:
+            True if added successfully.
+        """
+        html = self._ensure_control()
+
+        # Navigate to process
+        proc_link = re.search(
+            rf'(controlador\.php\?acao=procedimento_trabalhar[^"]*'
+            rf'id_procedimento={id_procedimento}[^"]*)',
+            html,
+        )
+        if not proc_link:
+            raise RuntimeError(
+                f"Process {id_procedimento} not found in control page"
+            )
+
+        r = self._get(
+            self._sei_url(proc_link.group(1).replace("&amp;", "&"))
+        )
+
+        # Get visualization iframe
+        vis = re.search(
+            r'src="(controlador\.php\?acao=procedimento_visualizar[^"]+)"',
+            r.text,
+        )
+        if not vis:
+            raise RuntimeError("Visualization iframe not found")
+
+        r_vis = self._get(
+            self._sei_url(vis.group(1).replace("&amp;", "&"))
+        )
+
+        # Get acompanhamento_gerenciar URL
+        acomp = re.search(
+            r'(controlador\.php\?acao=acompanhamento_gerenciar[^"\\]+)',
+            r_vis.text,
+        )
+        if not acomp:
+            raise RuntimeError("acompanhamento_gerenciar link not found")
+
+        r_ger = self._get(
+            self._sei_url(
+                acomp.group(1).replace("&amp;", "&").replace("\\", "")
+            )
+        )
+
+        soup = BeautifulSoup(r_ger.text, "lxml")
+        form = soup.find("form", id="frmAcompanhamentoCadastro")
+        if not form:
+            raise RuntimeError(
+                "Cadastro form not found (process may already be in "
+                "Acompanhamento Especial)"
+            )
+
+        action = self._sei_url(form["action"])
+        data = {
+            "hdnInfraTipoPagina": "2",
+            "selGrupoAcompanhamento": str(grupo_id),
+            "txaObservacao": observacao,
+            "hdnIdAcompanhamento": "",
+            "hdnIdProtocolo": str(id_procedimento),
+            "sbmCadastrarAcompanhamento": "Salvar",
+        }
+
+        r_add = self._post(action, data)
+        self._control_html = None
+
+        if (
+            "Lista de Acompanhamentos" in r_add.text
+            or "Acompanhamentos Especiais" in r_add.text
+        ):
+            return True
+
+        return False
+
     # --- Blocks ---
 
     def list_blocks(self) -> list[Block]:
