@@ -18,7 +18,7 @@ from lxml import html
 from sei_cli.models import (
     Block, BlockDocument, Document, LoginForm, Process,
     Marcador, MarcadorForm, ProcessDetails, ProcessList, SystemStatus,
-    TramitarDestino, TramitarForm, Unit,
+    TramitarDestino, TramitarForm, TreeDocument, TreeFolder, Unit,
 )
 
 
@@ -171,6 +171,147 @@ def parse_document_tree(content: str, base_url: str) -> list[Document]:
             id_documento=doc_id,
             link=urljoin(base_url, url),
         ))
+    return docs
+
+
+def parse_tree_folders(content: str) -> list[TreeFolder]:
+    """Parse folder definitions (Pastas[N]) and carregado status from arvore JS.
+
+    Returns list of TreeFolder with link, protocolos, and loaded status.
+    """
+    folders: list[TreeFolder] = []
+
+    # Extract Pastas[N]['link'] and Pastas[N]['protocolos']
+    links: dict[int, str] = {}
+    protos: dict[int, str] = {}
+    for m in re.finditer(r"Pastas\[(\d+)\]\['link'\]\s*=\s*'([^']+)'", content):
+        links[int(m.group(1))] = m.group(2)
+    for m in re.finditer(r"Pastas\[(\d+)\]\['protocolos'\]\s*=\s*'([^']+)'", content):
+        protos[int(m.group(1))] = m.group(2)
+
+    # Extract carregado status per Nos[] index
+    carregado_map: dict[int, bool] = {}
+    for m in re.finditer(r'Nos\[(\d+)\]\.carregado\s*=\s*(true|false)', content):
+        carregado_map[int(m.group(1))] = m.group(2) == 'true'
+
+    # Match Nos[N] PASTA nodes to get folder_id and label
+    pasta_idx = 0
+    for m in re.finditer(r'Nos\[(\d+)\]\s*=\s*new\s+infraArvoreNo\(([^;]+)\)', content):
+        nos_idx = int(m.group(1))
+        params_raw = m.group(2)
+        params = re.findall(r'"([^"]*)"', params_raw)
+        if len(params) >= 2 and params[0] == 'PASTA':
+            folder_id = params[1]  # e.g. "PASTA1"
+            idx_num = int(folder_id.replace('PASTA', ''))
+            label = params[5] if len(params) > 5 else folder_id
+            loaded = carregado_map.get(nos_idx, True)
+
+            if idx_num in links:
+                folders.append(TreeFolder(
+                    folder_id=folder_id,
+                    index=idx_num,
+                    label=label,
+                    link=links[idx_num],
+                    protocolos=protos.get(idx_num, ''),
+                    carregado=loaded,
+                ))
+
+    return folders
+
+
+def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument]:
+    """Parse the AJAX response from expanding a lazy-loaded folder.
+
+    The response starts with 'OK\\n' followed by JS statements defining
+    Nos[] nodes with .src and .html properties.
+
+    Returns list of TreeDocument with download/view URLs.
+    """
+    if content.startswith('OK'):
+        content = content[2:].lstrip('\n')
+
+    docs: list[TreeDocument] = []
+    lines = content.split('\n')
+
+    # Parse all Nos[N] definitions and their .src/.html assignments
+    nodes: dict[int, dict] = {}
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Match node creation: Nos[N] = new infraArvoreNo(...)
+        m = re.match(r'Nos\[(\d+)\]\s*=\s*new\s+infraArvoreNo\((.+)\);?$', line)
+        if m:
+            idx = int(m.group(1))
+            params = re.findall(r'"([^"]*)"', m.group(2))
+            if len(params) >= 6:
+                nodes.setdefault(idx, {})
+                nodes[idx]['tipo_raw'] = params[0]
+                nodes[idx]['id'] = params[1]
+                nodes[idx]['parent'] = params[2]
+                nodes[idx]['arvore_url'] = params[3]
+                nodes[idx]['target'] = params[4]
+                nodes[idx]['nome'] = params[5]
+                nodes[idx]['label'] = params[6] if len(params) > 6 else params[5]
+                # Detect type from icon
+                icon = params[7] if len(params) > 7 else ''
+                if 'documento_pdf' in icon:
+                    nodes[idx]['tipo'] = 'pdf'
+                elif 'documento_externo' in icon:
+                    nodes[idx]['tipo'] = 'externo'
+                elif 'documento_interno' in icon:
+                    nodes[idx]['tipo'] = 'interno'
+                else:
+                    nodes[idx]['tipo'] = 'documento'
+                # Extract SEI number from name (e.g. "Despacho 35516263")
+                sei_m = re.search(r'\((\d+)\)$', params[5])
+                if sei_m:
+                    nodes[idx]['sei_number'] = sei_m.group(1)
+                else:
+                    sei_m2 = re.search(r'\s(\d{8,})$', params[5])
+                    if sei_m2:
+                        nodes[idx]['sei_number'] = sei_m2.group(1)
+            continue
+
+        # Match .src assignment
+        m = re.match(r"Nos\[(\d+)\]\.src\s*=\s*'([^']+)';?$", line)
+        if m:
+            idx = int(m.group(1))
+            nodes.setdefault(idx, {})
+            nodes[idx]['src_url'] = m.group(2)
+            continue
+
+        # Match .html assignment (can be multi-line, but usually single)
+        m = re.match(r"Nos\[(\d+)\]\.html\s*=\s*'(.*?)';?$", line)
+        if m:
+            idx = int(m.group(1))
+            nodes.setdefault(idx, {})
+            html_val = m.group(2)
+            if html_val:
+                nodes[idx]['html_content'] = html_val
+            continue
+
+    for idx in sorted(nodes.keys()):
+        node = nodes[idx]
+        if node.get('tipo_raw') not in ('DOCUMENTO',):
+            continue
+
+        # Clean HTML tags from name
+        nome_clean = re.sub(r'<[^>]+>', '', node.get('nome', '')).strip()
+
+        docs.append(TreeDocument(
+            id_documento=node.get('id', ''),
+            nome=nome_clean,
+            tipo=node.get('tipo', 'documento'),
+            parent_folder=node.get('parent', ''),
+            arvore_url=urljoin(base_url, node['arvore_url']) if node.get('arvore_url') else None,
+            src_url=urljoin(base_url, node['src_url']) if node.get('src_url') else None,
+            html_content=node.get('html_content'),
+            sei_number=node.get('sei_number'),
+        ))
+
     return docs
 
 

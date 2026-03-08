@@ -27,8 +27,8 @@ from sei_cli import auth
 from sei_cli.config import load_credentials, SESSION_PATH
 from sei_cli.models import (
     Block, BlockDocument, Document, DocumentCreated, DocumentType,
-    EditorSection, Marcador, Process, ProcessList, SystemStatus, TramitarForm,
-    Unit,
+    EditorSection, Marcador, Process, ProcessList, SystemStatus,
+    TramitarForm, TreeDocument, TreeFolder, Unit,
 )
 from sei_cli.relatorio_parser import (
     RelatorioServico,
@@ -40,12 +40,14 @@ from sei_cli.parsers import (
     parse_block_documents,
     parse_blocks,
     parse_document_tree,
+    parse_expanded_folder,
     parse_marcador_form,
     parse_marcadores_list,
     parse_menu_links,
     parse_processes,
     parse_system_status,
     parse_tramitar_form,
+    parse_tree_folders,
     parse_unit_switch_form,
     parse_unit_switch_link,
     parse_units_switch_page,
@@ -197,6 +199,200 @@ class SEIClient:
         self._control_html = None
         
         return parse_document_tree(ra.text, base_url=self._sei_url(""))
+
+    # --- Enhanced document tree with folder expansion ---
+
+    def get_full_document_tree(
+        self, id_procedimento: str, *, expand_all: bool = True
+    ) -> list[TreeDocument]:
+        """Get complete document tree for a process, expanding lazy-loaded folders.
+
+        Unlike get_process_documents(), this method:
+        1. Parses folder metadata (Pastas[]) from the arvore JS
+        2. POSTs to expand any folders with carregado=false
+        3. Returns TreeDocument objects with download/view URLs (.src_url)
+
+        Args:
+            id_procedimento: Process ID.
+            expand_all: If True, expand all unloaded folders. If False,
+                        only return already-loaded documents.
+
+        Returns:
+            List of TreeDocument with src_url for download/viewing.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            return []
+
+        all_docs: list[TreeDocument] = []
+
+        # Parse folders from the tree JS
+        folders = parse_tree_folders(arvore_html)
+
+        # Parse already-loaded documents (from folders with carregado=true)
+        loaded_docs = parse_expanded_folder(arvore_html, self._sei_url(""))
+        all_docs.extend(loaded_docs)
+
+        if expand_all:
+            # Expand each unloaded folder via POST
+            for folder in folders:
+                if folder.carregado:
+                    continue
+
+                post_url = self._sei_url(folder.link)
+                r = self._post(post_url, {
+                    'hdnArvore': '',
+                    'hdnPastaAtual': folder.folder_id,
+                    'hdnProtocolos': folder.protocolos,
+                })
+
+                if r.text.startswith('OK'):
+                    folder_docs = parse_expanded_folder(
+                        r.text, self._sei_url("")
+                    )
+                    # Tag docs with their parent folder
+                    for doc in folder_docs:
+                        if not doc.parent_folder:
+                            doc.parent_folder = folder.folder_id
+                    all_docs.extend(folder_docs)
+
+        return all_docs
+
+    def download_document(
+        self,
+        doc: TreeDocument,
+        output_path: str | None = None,
+    ) -> bytes | str:
+        """Download a document's content.
+
+        For PDF/external documents (src_url contains documento_download_anexo):
+            Returns binary PDF content. If output_path given, saves to file.
+        For internal SEI documents (src_url contains documento_visualizar):
+            Returns the rendered HTML content as text.
+
+        Args:
+            doc: TreeDocument from get_full_document_tree().
+            output_path: Optional file path to save binary content.
+
+        Returns:
+            bytes for PDF downloads, str for HTML documents.
+        """
+        if not doc.src_url:
+            raise ValueError(
+                f"Document {doc.id_documento} ({doc.nome}) has no download URL"
+            )
+
+        r = self._get(doc.src_url)
+
+        content_type = r.headers.get('content-type', '')
+
+        if 'pdf' in content_type or 'octet-stream' in content_type:
+            if output_path:
+                with open(output_path, 'wb') as f:
+                    f.write(r.content)
+            return r.content
+
+        # HTML content (internal SEI document)
+        if 'html' in content_type:
+            soup = BeautifulSoup(r.text, 'lxml')
+            # Check if it's a login page (session expired)
+            if soup.find('input', {'name': 'pwdSenha'}):
+                raise RuntimeError(
+                    "Session expired during document download. Re-login needed."
+                )
+            return r.text
+
+        # Unknown type — return raw
+        if output_path:
+            with open(output_path, 'wb') as f:
+                f.write(r.content)
+        return r.content
+
+    def read_document_content(
+        self,
+        doc: TreeDocument,
+    ) -> str:
+        """Read a document and return plain text content.
+
+        Works for both internal SEI documents (HTML → text) and
+        external PDFs (requires pdftotext).
+
+        Args:
+            doc: TreeDocument from get_full_document_tree().
+
+        Returns:
+            Plain text content of the document.
+        """
+        result = self.download_document(doc)
+
+        if isinstance(result, str):
+            # HTML content — extract text
+            soup = BeautifulSoup(result, 'lxml')
+            return soup.get_text('\n', strip=True)
+
+        # Binary (PDF) — try pdftotext
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=True) as tmp:
+            tmp.write(result)
+            tmp.flush()
+            proc = subprocess.run(
+                ['pdftotext', '-layout', tmp.name, '-'],
+                capture_output=True, text=True,
+            )
+            if proc.returncode == 0:
+                return proc.stdout
+            raise RuntimeError(
+                f"pdftotext failed for {doc.nome}: {proc.stderr}"
+            )
+
+    def list_acompanhamento_especial(self) -> list[Process]:
+        """List processes in 'Acompanhamento Especial'.
+
+        Returns list of Process objects found on the acompanhamento page.
+        """
+        html = self._ensure_control()
+        soup = BeautifulSoup(html, "lxml")
+
+        acomp_url = None
+        for a in soup.find_all("a", href=True):
+            if "acompanhamento_listar" in a["href"]:
+                acomp_url = urljoin(self._sei_url(""), a["href"])
+                break
+
+        if not acomp_url:
+            acomp_url = self._menu_links.get("acompanhamento")
+        if not acomp_url:
+            return []
+
+        r = self._get(acomp_url)
+        self._control_html = None
+
+        # Parse process links from the page
+        procs: list[Process] = []
+        asoup = BeautifulSoup(r.text, "lxml")
+        for a in asoup.find_all("a", href=True):
+            href = a["href"]
+            text = a.get_text(strip=True)
+            if "procedimento_trabalhar" not in href:
+                continue
+            id_m = re.search(r"id_procedimento=(\d+)", href)
+            if not id_m:
+                continue
+            # Extract process number from link text (e.g. "08810035.004097/2025-01")
+            numero = text.strip()
+            if not re.match(r"\d{8}\.\d+/\d{4}-\d{2}", numero):
+                continue
+            procs.append(Process(
+                numero=numero,
+                tipo="Acompanhamento Especial",
+                especificacao="",
+                id_procedimento=id_m.group(1),
+                link=urljoin(self._sei_url(""), href),
+                novo=False,
+            ))
+
+        return procs
 
     # --- Blocks ---
 
@@ -856,17 +1052,27 @@ class SEIClient:
         }
 
     def _navigate_to_arvore(self, id_procedimento: str) -> str | None:
-        """Navigate to a process and return the arvore HTML."""
+        """Navigate to a process and return the arvore HTML.
+
+        Tries multiple strategies:
+        1. Direct link from control page (recebidos/gerados)
+        2. Search in Acompanhamento Especial
+        3. Pesquisa Rápida fallback
+        """
         html = self._ensure_control()
         soup = BeautifulSoup(html, "lxml")
 
-        # Find process link with valid hash
+        # Strategy 1: Direct link from control page
         proc_link = None
         for a in soup.find_all("a"):
             href = a.get("href", "")
             if "procedimento_trabalhar" in href and id_procedimento in href:
                 proc_link = urljoin(self._sei_url(""), href)
                 break
+
+        if not proc_link:
+            # Strategy 2: Try Acompanhamento Especial
+            proc_link = self._find_in_acompanhamento(id_procedimento)
 
         if not proc_link:
             return None
@@ -881,6 +1087,32 @@ class SEIClient:
         ra = self._get(arvore_url)
         self._control_html = None
         return ra.text
+
+    def _find_in_acompanhamento(self, id_procedimento: str) -> str | None:
+        """Search for a process link in Acompanhamento Especial."""
+        html = self._ensure_control()
+        soup = BeautifulSoup(html, "lxml")
+
+        acomp_url = None
+        for a in soup.find_all("a", href=True):
+            if "acompanhamento_listar" in a["href"]:
+                acomp_url = urljoin(self._sei_url(""), a["href"])
+                break
+
+        if not acomp_url:
+            return None
+
+        r = self._get(acomp_url)
+        asoup = BeautifulSoup(r.text, "lxml")
+
+        for a in asoup.find_all("a", href=True):
+            href = a["href"]
+            if "procedimento_trabalhar" in href and id_procedimento in href:
+                self._control_html = None
+                return urljoin(self._sei_url(""), href)
+
+        self._control_html = None
+        return None
 
     def _get_editor_url(
         self, id_documento: str, id_procedimento: str

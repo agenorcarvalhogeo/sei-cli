@@ -124,6 +124,30 @@ class DocumentCreated:
 
 
 @dataclass(slots=True)
+class TreeFolder:
+    """A lazy-loaded folder in the SEI document tree."""
+    folder_id: str          # e.g. "PASTA1"
+    index: int              # e.g. 1
+    label: str              # e.g. "Pasta I (10)"
+    link: str               # POST URL for expansion
+    protocolos: str         # comma-separated protocol IDs
+    carregado: bool         # whether already loaded
+
+
+@dataclass(slots=True)
+class TreeDocument:
+    """A document node from the SEI tree (with download/view info)."""
+    id_documento: str
+    nome: str
+    tipo: str                          # "interno", "externo", "pdf", "documento"
+    parent_folder: str | None = None   # e.g. "PASTA1"
+    arvore_url: str | None = None      # arvore_visualizar URL
+    src_url: str | None = None         # documento_visualizar or documento_download_anexo
+    html_content: str | None = None    # inline HTML (for docs with viewer info)
+    sei_number: str | None = None      # SEI document number from title
+
+
+@dataclass(slots=True)
 class TramitarDestino:
     id_unidade: str
     nome: str
