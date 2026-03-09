@@ -104,7 +104,11 @@ class SEIClient:
         return f"{self.base_url}/sei/{path}"
 
     def _extract_action_url(self, html: str, token: str) -> str | None:
-        """Extract action URL from href or JS onclick snippets."""
+        """Extract action URL from href or JS onclick snippets.
+
+        Uses BeautifulSoup first, then falls back to regex for malformed HTML
+        (SEI often has unclosed tags that confuse lxml).
+        """
         soup = BeautifulSoup(html, "lxml")
         for a in soup.find_all("a"):
             href = a.get("href", "")
@@ -118,6 +122,11 @@ class SEIClient:
                 m = re.search(r'"([^"]*' + re.escape(token) + r'[^"]*)"', onclick)
                 if m:
                     return urljoin(self._sei_url(""), m.group(1))
+
+        # Fallback: regex on raw HTML (handles malformed tags lxml can't parse)
+        m = re.search(r'href=["\']([^"\']*' + re.escape(token) + r'[^"\']*)["\']', html)
+        if m:
+            return urljoin(self._sei_url(""), m.group(1))
         return None
 
     def _find_process_link(self, control_html: str, id_procedimento: str) -> str | None:
@@ -1878,10 +1887,50 @@ class SEIClient:
 
     # --- Tramitação ---
 
-    def get_tramitar_form(self, id_procedimento: str) -> TramitarForm:
-        """Open 'Enviar Processo' form and parse destination units/fields."""
-        rp = self._navigate_process_page(id_procedimento)
-        send_url = self._extract_action_url(rp.text, "procedimento_enviar")
+    def _open_process_page(self, id_procedimento: str) -> str:
+        """Navigate to process page and return the inner visualization HTML.
+
+        Uses direct URL to reach the frameset, then follows the
+        procedimento_visualizar iframe where action links live.
+        """
+        # Direct URL approach — works without the process being in the list
+        self._ensure_session()
+        url = self._sei_url(
+            f"controlador.php?acao=procedimento_trabalhar"
+            f"&id_procedimento={id_procedimento}"
+        )
+        r = self._get(url)
+        outer_html = r.text
+
+        if "ifrArvore" not in outer_html and "procedimento_trabalhar" not in outer_html:
+            raise RuntimeError(
+                f"Não foi possível abrir processo {id_procedimento}. "
+                "Verifique se está na unidade correta."
+            )
+
+        # Follow the procedimento_visualizar iframe to get action links
+        iframe_m = re.search(
+            r'<(?:i?frame)[^>]+src=["\']([^"\']*procedimento_visualizar[^"\']*)["\']',
+            outer_html, re.I,
+        )
+        if iframe_m:
+            iframe_url = iframe_m.group(1)
+            if not iframe_url.startswith("http"):
+                iframe_url = urljoin(self._sei_url(""), iframe_url)
+            ri = self._get(iframe_url)
+            return ri.text
+
+        # No iframe found — page might already be the inner content
+        return outer_html
+
+    def get_tramitar_form(self, id_procedimento: str, _proc_html: str | None = None) -> TramitarForm:
+        """Open 'Enviar Processo' form and parse destination units/fields.
+
+        Navigates to process page, follows iframe, extracts action URL.
+        Pass _proc_html to avoid double navigation.
+        """
+        proc_html = _proc_html or self._open_process_page(id_procedimento)
+        send_url = self._extract_action_url(proc_html, "procedimento_enviar")
         if not send_url:
             raise RuntimeError("Ação 'Enviar Processo' não encontrada na página do processo")
 
@@ -1889,10 +1938,45 @@ class SEIClient:
         tramitar = parse_tramitar_form(rsend.text, self._sei_url(""), str(rsend.url))
         return tramitar
 
+    def _resolve_unit_id(self, unidade: str) -> str:
+        """Resolve a unit name/alias to its SEI ID.
+
+        Priority: exact ID → exact name → contains match.
+        """
+        kw = unidade.lower().strip()
+        # If it's a numeric ID already
+        if kw.isdigit():
+            return kw
+        # Exact name match first
+        for name, uid in self.UNIT_IDS.items():
+            if kw == name.lower():
+                return uid
+        # Contains match (prefer shorter names = more specific)
+        matches = [
+            (name, uid) for name, uid in self.UNIT_IDS.items()
+            if kw in name.lower()
+        ]
+        if len(matches) == 1:
+            return matches[0][1]
+        if len(matches) > 1:
+            # Prefer shortest match (most specific)
+            matches.sort(key=lambda x: len(x[0]))
+            return matches[0][1]
+        raise RuntimeError(
+            f"Unidade '{unidade}' não encontrada. "
+            f"Opções: {', '.join(self.UNIT_IDS.keys())}"
+        )
+
     def list_unidades_destino_tramitacao(self, id_procedimento: str) -> list[Unit]:
-        """List units available in the process send form."""
-        form = self.get_tramitar_form(id_procedimento)
-        return [Unit(sigla=d.nome, descricao=d.nome, link=d.id_unidade) for d in form.destinos]
+        """List known destination units for forwarding.
+
+        Note: SEI's forwarding form uses infraLupaSelect (AJAX),
+        so we return known units from UNIT_IDS instead.
+        """
+        return [
+            Unit(sigla=name, descricao=name, link=uid)
+            for name, uid in self.UNIT_IDS.items()
+        ]
 
     def enviar_processo(
         self,
@@ -1900,29 +1984,50 @@ class SEIClient:
         unidade_destino: str,
         manter_aberto: bool = True,
     ) -> bool:
-        """Send process to another unit."""
-        form = self.get_tramitar_form(id_procedimento)
-        target = None
-        kw = unidade_destino.lower().strip()
-        for dest in form.destinos:
-            if kw == dest.id_unidade or kw in dest.nome.lower():
-                target = dest
-                break
-        if not target:
-            opts = ", ".join(d.nome for d in form.destinos[:15])
-            raise RuntimeError(
-                f"Unidade destino '{unidade_destino}' não encontrada. "
-                f"Algumas opções: {opts}"
-            )
+        """Send process to another unit.
 
+        Uses direct POST with unit ID (same approach as create_block),
+        since the form uses infraLupaSelect which requires JS.
+        """
+        # Resolve unit
+        unit_id = self._resolve_unit_id(unidade_destino)
+
+        # Navigate to the enviar form
+        proc_html = self._open_process_page(id_procedimento)
+        send_url = self._extract_action_url(proc_html, "procedimento_enviar")
+        if not send_url:
+            raise RuntimeError("Ação 'Enviar Processo' não encontrada")
+
+        r_form = self._get(send_url)
+        soup = BeautifulSoup(r_form.text, "lxml")
+        form = soup.find("form", {"id": "frmProcedimentoEnviar"})
+        if not form:
+            form = soup.find("form")
+        if not form:
+            raise RuntimeError("Formulário de enviar não encontrado")
+
+        form_action = form.get("action", "").replace("&amp;", "&")
+        submit_url = urljoin(self._sei_url(""), form_action)
+
+        # Build form data from hidden fields
         data: dict[str, str] = {}
-        data.update(form.hidden_fields)
-        data.update(form.select_fields)
-        data[form.destino_field] = target.id_unidade
-        if form.manter_aberto_field and manter_aberto:
-            data[form.manter_aberto_field] = "S"
+        for inp in form.find_all("input", {"type": "hidden"}):
+            name = inp.get("name", "")
+            if name:
+                data[name] = inp.get("value", "")
 
-        r = self._post(form.action, data)
+        # Add unit selection (same pattern as create_block)
+        data["selUnidades"] = unit_id
+        data["hdnUnidades"] = unit_id
+
+        # Manter aberto checkbox
+        if manter_aberto:
+            data["chkSinManterAberto"] = "S"
+
+        # Submit button
+        data["sbmEnviar"] = "Enviar"
+
+        r = self._post(submit_url, data=data)
         self._control_html = None
         lower = r.text.lower()
         if "erro" in lower or "falha" in lower:

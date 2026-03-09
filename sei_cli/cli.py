@@ -255,6 +255,50 @@ def goto_cmd(numero: str, as_json: bool, do_read: bool, unit: str | None) -> Non
                 console.print(f"[red]❌ Documento {numero} não encontrado[/red]")
 
 
+@cli.command("encaminhar")
+@click.argument("processo")
+@click.argument("destino")
+@click.option("--unit", default=None, help="Unidade SEI atual (trocar antes de encaminhar)")
+@click.option("--fechar", is_flag=True, help="Fechar processo na unidade atual após envio")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def encaminhar_cmd(processo: str, destino: str, unit: str | None, fechar: bool, as_json: bool) -> None:
+    """Encaminhar processo para outra unidade.
+
+    PROCESSO: id_procedimento ou número do processo (ex: 08810254.000081/2026-17)
+    DESTINO: sigla ou nome parcial da unidade destino (ex: "3ºGBM", "PABM APODI")
+    """
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+
+        # Se é número de processo, resolver pra id_procedimento via goto/search
+        id_proc = processo
+        if "." in processo or "/" in processo:
+            import re
+            html = client.search(processo)
+            m = re.search(r"id_procedimento=(\d+)", html)
+            if m:
+                id_proc = m.group(1)
+            else:
+                console.print(f"[red]❌ Processo {processo} não encontrado[/red]")
+                return
+
+        manter_aberto = not fechar
+        try:
+            ok = client.enviar_processo(id_proc, destino, manter_aberto=manter_aberto)
+            if ok:
+                if as_json:
+                    _emit({"status": "ok", "processo": processo, "destino": destino, "mantido_aberto": manter_aberto}, True)
+                else:
+                    console.print(f"[green]✅ Processo {processo} encaminhado para {destino}[/green]")
+                    if manter_aberto:
+                        console.print("  (mantido aberto na unidade atual)")
+            else:
+                console.print(f"[red]❌ Falha ao encaminhar processo[/red]")
+        except RuntimeError as e:
+            console.print(f"[red]❌ {e}[/red]")
+
+
 @cli.command("units")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
 def units_cmd(as_json: bool) -> None:
