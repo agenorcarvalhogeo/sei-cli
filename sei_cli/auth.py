@@ -26,7 +26,7 @@ def create_http_client() -> httpx.Client:
     return httpx.Client(
         follow_redirects=False,
         headers={"User-Agent": UA},
-        timeout=20,
+        timeout=60,
         verify=False,
     )
 

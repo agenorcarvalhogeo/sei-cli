@@ -1003,6 +1003,296 @@ class SEIClient:
         rd = self._get(detail_url)
         return parse_block_documents(rd.text, base_url=self._sei_url(""))
 
+    def _get_blocos_page(self) -> tuple[str, "BeautifulSoup"]:
+        """Navigate to blocos de assinatura page, return (url, soup)."""
+        html = self._ensure_control()
+        blocos_url = self._menu_links.get("blocos_assinatura")
+        if not blocos_url:
+            raise RuntimeError("Link de blocos de assinatura não encontrado no menu")
+        r = self._get(blocos_url)
+        self._control_html = None
+        soup = BeautifulSoup(r.text, "lxml")
+        return blocos_url, soup
+
+    def _blocos_form_action(self, soup: "BeautifulSoup", action_name: str) -> str:
+        """Extract a JS action URL from the blocos page (e.g. bloco_disponibilizar)."""
+        pattern = rf"(controlador\.php\?acao={action_name}[^'\"]+)"
+        match = re.search(pattern, str(soup))
+        if not match:
+            raise RuntimeError(f"URL de {action_name} não encontrada na página de blocos")
+        return self._sei_url(match.group(1).replace("&amp;", "&"))
+
+    def add_document_to_block(
+        self,
+        id_procedimento: str,
+        id_documento: str,
+        block_numero: str,
+        *,
+        disponibilizar: bool = False,
+    ) -> dict:
+        """Include a document in a bloco de assinatura.
+
+        Uses the bloco_escolher page (accessible from the process tree) which
+        lists all documents with checkboxes and a dropdown to select the target
+        block. This approach works reliably because the URL hash is generated
+        server-side in the tree.
+
+        Args:
+            id_procedimento: Process ID containing the document.
+            id_documento: Document ID to include (SEI internal ID).
+            block_numero: Block number (e.g. '871299').
+            disponibilizar: If True, include AND make available in one step
+                           (uses 'Incluir e Disponibilizar' button).
+
+        Returns:
+            dict with 'ok' bool and 'message'.
+
+        Note:
+            If the block is already disponibilizado, you must cancel the
+            disponibilização first before editing or signing documents in it.
+        """
+        # Navigate to process → tree → bloco_escolher
+        r = self._navigate_process_page(id_procedimento)
+        soup = BeautifulSoup(r.text, "lxml")
+        iframe = soup.find("iframe", {"name": "ifrArvore"})
+        if not iframe:
+            return {"ok": False, "message": "Árvore não encontrada"}
+
+        arv_url = urljoin(self._sei_url(""), iframe["src"])
+        r_arv = self._get(arv_url)
+
+        # Find bloco_escolher URL (has valid hash with id_documento)
+        chooser_match = re.search(
+            r"(controlador\.php\?acao=bloco_escolher[^'\"]+)",
+            r_arv.text,
+        )
+        if not chooser_match:
+            return {"ok": False, "message": "Ação 'Incluir em Bloco de Assinatura' não encontrada na árvore"}
+
+        chooser_url = self._sei_url(chooser_match.group(1).replace("&amp;", "&"))
+        r_chooser = self._get(chooser_url)
+        chooser_soup = BeautifulSoup(r_chooser.text, "lxml")
+
+        # Find the form
+        form = chooser_soup.find("form")
+        if not form:
+            return {"ok": False, "message": "Formulário 'Incluir em Bloco' não encontrado"}
+
+        form_action = form.get("action", "")
+        if not form_action:
+            return {"ok": False, "message": "Form action não encontrado"}
+        form_url = self._sei_url(form_action.replace("&amp;", "&"))
+
+        # Verify the target block is in the dropdown
+        sel = chooser_soup.find("select", {"name": "selBloco"})
+        if sel:
+            options = {opt.get("value"): opt.get_text(strip=True) for opt in sel.find_all("option")}
+            if block_numero not in options:
+                available = ", ".join(f"{v} ({k})" for k, v in options.items() if k != "null")
+                return {
+                    "ok": False,
+                    "message": f"Bloco {block_numero} não disponível. Disponíveis: {available}",
+                }
+
+        # Find the checkbox for this document
+        doc_checkbox = None
+        for cb in chooser_soup.find_all("input", {"type": "checkbox"}):
+            if cb.get("value") == id_documento:
+                doc_checkbox = cb
+                break
+
+        # Build POST data from hidden inputs
+        post_data = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name", "")
+            if not name:
+                continue
+            inp_type = inp.get("type", "")
+            if inp_type == "hidden":
+                post_data[name] = inp.get("value", "")
+            elif inp_type == "checkbox" and inp.get("value") == id_documento:
+                post_data[name] = id_documento
+
+        post_data["selBloco"] = block_numero
+        post_data["hdnDocumentosItensSelecionados"] = id_documento
+
+        # Choose button: include only vs include and disponibilizar
+        if disponibilizar:
+            post_data["sbmIncluirDisponibilizar"] = "Incluir e Disponibilizar"
+        else:
+            post_data["sbmIncluir"] = "Incluir"
+
+        r_submit = self._post(form_url, post_data)
+        self._control_html = None
+
+        # Verify success by checking if the block number appears in the Blocos column
+        result_soup = BeautifulSoup(r_submit.text, "lxml")
+
+        # Check for validation errors
+        val = result_soup.find("textarea", {"id": "txaInfraValidacao"})
+        if val and val.get_text(strip=True):
+            return {"ok": False, "message": val.get_text(strip=True)[:200]}
+
+        # Check if block_numero appears in result page
+        for td in result_soup.find_all("td"):
+            if block_numero in td.get_text():
+                action = "incluído e disponibilizado" if disponibilizar else "incluído"
+                return {
+                    "ok": True,
+                    "message": f"Documento {id_documento} {action} no bloco {block_numero}",
+                }
+
+        return {"ok": True, "message": f"Documento incluído no bloco {block_numero} (verificar)"}
+
+    def devolver_block(self, block_numero: str) -> dict:
+        """Return (devolver) a received bloco de assinatura to the sender unit.
+
+        Only works on blocks that were received from another unit (estado=Recebido).
+        After returning, the block goes back to the sender unit.
+
+        Args:
+            block_numero: Block number (e.g. '869251').
+
+        Returns:
+            dict with 'ok' bool and 'message'.
+        """
+        _, soup = self._get_blocos_page()
+        form = soup.find("form", {"id": "frmBlocoLista"})
+        if not form:
+            return {"ok": False, "message": "Formulário de blocos não encontrado"}
+
+        # Check if this block can be returned (has acaoRetornarBloco)
+        retornar_pattern = re.compile(rf"acaoRetornarBloco\('{block_numero}'\)")
+        if not retornar_pattern.search(str(soup)):
+            # Check if block exists at all
+            if block_numero not in str(soup):
+                return {"ok": False, "message": f"Bloco {block_numero} não encontrado"}
+            return {
+                "ok": False,
+                "message": f"Bloco {block_numero} não pode ser devolvido (somente blocos recebidos)",
+            }
+
+        retornar_url = self._blocos_form_action(soup, "bloco_retornar")
+
+        fdata = {}
+        for inp in form.find_all("input", type="hidden"):
+            name = inp.get("name", "")
+            if name:
+                fdata[name] = inp.get("value", "")
+
+        fdata["hdnInfraItemId"] = block_numero
+
+        r = self._post(retornar_url, fdata)
+        self._control_html = None
+
+        if r.status_code == 200:
+            rsoup = BeautifulSoup(r.text, "lxml")
+
+            # Check for validation/error
+            val = rsoup.find("textarea", {"id": "txaInfraValidacao"})
+            if val and val.get_text(strip=True):
+                return {"ok": False, "message": val.get_text(strip=True)[:200]}
+
+            # Check if block disappeared (returned successfully)
+            if block_numero not in rsoup.get_text():
+                return {"ok": True, "message": f"Bloco {block_numero} devolvido com sucesso"}
+
+            # Check state
+            for row in rsoup.find_all("tr", class_=["infraTrClara", "infraTrEscura"]):
+                if block_numero in row.get_text():
+                    tds = row.find_all("td")
+                    if len(tds) > 4:
+                        estado = tds[4].get_text(strip=True)
+                        return {"ok": True, "message": f"Bloco {block_numero} devolvido — estado: {estado}"}
+
+            return {"ok": True, "message": f"Bloco {block_numero} devolvido"}
+
+        return {"ok": False, "message": f"Erro ao devolver bloco (status {r.status_code})"}
+
+    def disponibilizar_block(self, block_numero: str) -> dict:
+        """Make a bloco de assinatura available to the destination unit.
+
+        Args:
+            block_numero: Block number (e.g. '871299').
+
+        Returns:
+            dict with 'ok' bool and 'message'.
+        """
+        _, soup = self._get_blocos_page()
+        form = soup.find("form", {"id": "frmBlocoLista"})
+        if not form:
+            return {"ok": False, "message": "Formulário de blocos não encontrado"}
+
+        # Get the disponibilizar action URL from JS
+        disp_url = self._blocos_form_action(soup, "bloco_disponibilizar")
+
+        # Build form data
+        fdata = {}
+        for inp in form.find_all("input", type="hidden"):
+            name = inp.get("name", "")
+            if name:
+                fdata[name] = inp.get("value", "")
+
+        fdata["hdnInfraItemId"] = block_numero
+
+        r = self._post(disp_url, fdata)
+        self._control_html = None
+
+        # Check if we're back on the list page
+        if r.status_code == 200:
+            rsoup = BeautifulSoup(r.text, "lxml")
+            # After disponibilizar, the block state changes to "Disponibilizado"
+            for row in rsoup.find_all("tr", class_=["infraTrClara", "infraTrEscura"]):
+                if block_numero in row.get_text():
+                    tds = row.find_all("td")
+                    if len(tds) > 4:
+                        estado = tds[4].get_text(strip=True)
+                        return {"ok": True, "message": f"Bloco {block_numero} — estado: {estado}"}
+
+            return {"ok": True, "message": f"Bloco {block_numero} disponibilizado"}
+
+        return {"ok": False, "message": f"Erro ao disponibilizar (status {r.status_code})"}
+
+    def cancelar_disponibilizacao_block(self, block_numero: str) -> dict:
+        """Cancel availability of a bloco de assinatura (retract from destination unit).
+
+        Args:
+            block_numero: Block number (e.g. '871299').
+
+        Returns:
+            dict with 'ok' bool and 'message'.
+        """
+        _, soup = self._get_blocos_page()
+        form = soup.find("form", {"id": "frmBlocoLista"})
+        if not form:
+            return {"ok": False, "message": "Formulário de blocos não encontrado"}
+
+        cancel_url = self._blocos_form_action(soup, "bloco_cancelar_disponibilizacao")
+
+        fdata = {}
+        for inp in form.find_all("input", type="hidden"):
+            name = inp.get("name", "")
+            if name:
+                fdata[name] = inp.get("value", "")
+
+        fdata["hdnInfraItemId"] = block_numero
+
+        r = self._post(cancel_url, fdata)
+        self._control_html = None
+
+        if r.status_code == 200:
+            rsoup = BeautifulSoup(r.text, "lxml")
+            for row in rsoup.find_all("tr", class_=["infraTrClara", "infraTrEscura"]):
+                if block_numero in row.get_text():
+                    tds = row.find_all("td")
+                    if len(tds) > 4:
+                        estado = tds[4].get_text(strip=True)
+                        return {"ok": True, "message": f"Bloco {block_numero} — estado: {estado}"}
+
+            return {"ok": True, "message": f"Disponibilização do bloco {block_numero} cancelada"}
+
+        return {"ok": False, "message": f"Erro ao cancelar disponibilização (status {r.status_code})"}
+
     # --- Units ---
 
     def list_units(self) -> list[Unit]:

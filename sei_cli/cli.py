@@ -202,6 +202,78 @@ def switch_cmd(sigla: str, as_json: bool) -> None:
     _print_status(status)
 
 
+@cli.command("block-add")
+@click.argument("id_procedimento")
+@click.argument("id_documento")
+@click.argument("block_numero")
+@click.option("--disponibilizar", is_flag=True, help="Incluir E disponibilizar no mesmo passo")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def block_add_cmd(
+    id_procedimento: str,
+    id_documento: str,
+    block_numero: str,
+    disponibilizar: bool,
+    as_json: bool,
+) -> None:
+    """Include a document in a bloco de assinatura."""
+    with SEIClient() as client:
+        client.login()
+        result = client.add_document_to_block(
+            id_procedimento, id_documento, block_numero,
+            disponibilizar=disponibilizar,
+        )
+    if as_json:
+        _emit(result, True)
+        return
+    icon = "✅" if result["ok"] else "❌"
+    click.echo(f"{icon} {result['message']}")
+
+
+@cli.command("block-disponibilizar")
+@click.argument("block_numero")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def block_disponibilizar_cmd(block_numero: str, as_json: bool) -> None:
+    """Disponibilizar (make available) a bloco de assinatura."""
+    with SEIClient() as client:
+        client.login()
+        result = client.disponibilizar_block(block_numero)
+    if as_json:
+        _emit(result, True)
+        return
+    icon = "✅" if result["ok"] else "❌"
+    click.echo(f"{icon} {result['message']}")
+
+
+@cli.command("block-cancelar")
+@click.argument("block_numero")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def block_cancelar_cmd(block_numero: str, as_json: bool) -> None:
+    """Cancel disponibilização of a bloco de assinatura."""
+    with SEIClient() as client:
+        client.login()
+        result = client.cancelar_disponibilizacao_block(block_numero)
+    if as_json:
+        _emit(result, True)
+        return
+    icon = "✅" if result["ok"] else "❌"
+    click.echo(f"{icon} {result['message']}")
+
+
+@cli.command("block-devolver")
+@click.argument("block_numero")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def block_devolver_cmd(block_numero: str, as_json: bool) -> None:
+    """Devolver (return) a received bloco de assinatura to the sender."""
+    with SEIClient() as client:
+        client.login()
+        result = client.devolver_block(block_numero)
+    if as_json:
+        _emit(result, True)
+        return
+    icon = "✅" if result["ok"] else "❌"
+    click.echo(f"{icon} {result['message']}")
+
+
 @cli.command("read-doc")
 @click.argument("id_documento")
 @click.argument("id_procedimento")
