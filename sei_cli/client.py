@@ -1057,6 +1057,85 @@ class SEIClient:
 
         raise RuntimeError("Bloco criado mas número não identificado")
 
+    def delete_block(self, block_numero: str) -> bool:
+        """Delete a bloco de assinatura (must be empty — no documents).
+
+        Args:
+            block_numero: The block number to delete.
+
+        Returns:
+            True if deletion succeeded.
+
+        Raises:
+            RuntimeError: If block has documents or deletion fails.
+        """
+        # Check if block has documents first
+        docs = self.get_block_documents(block_numero)
+        if docs:
+            raise RuntimeError(
+                f"Bloco {block_numero} contém {len(docs)} documento(s). "
+                "Remova-os antes de excluir."
+            )
+
+        # Navigate directly to blocos page (need fresh hash)
+        html = self._ensure_control()
+        blocos_url = self._menu_links.get("blocos_assinatura")
+        if not blocos_url:
+            raise RuntimeError("Link de blocos de assinatura não encontrado")
+
+        r = self._get(blocos_url)
+        self._control_html = None
+
+        # Extract the bloco_excluir URL with fresh hash
+        match = re.search(
+            r"controlador\.php\?acao=bloco_excluir[^'\"]+", r.text
+        )
+        if not match:
+            raise RuntimeError("URL de exclusão de bloco não encontrada")
+
+        excluir_url = self._sei_url(match.group().replace("&amp;", "&"))
+
+        # Extract form fields for proper submission
+        soup = BeautifulSoup(r.text, "lxml")
+        form = soup.find("form", id="frmBlocoLista")
+        if not form:
+            raise RuntimeError("Formulário frmBlocoLista não encontrado")
+
+        def _field(name: str) -> str:
+            el = form.find("input", {"name": name})
+            return el.get("value", "") if el else ""
+
+        data = {
+            "hdnInfraTipoPagina": "1",
+            "hdnInfraItemId": block_numero,
+            "hdnMeusBlocos": _field("hdnMeusBlocos"),
+            "hdnFlagBlocos": _field("hdnFlagBlocos"),
+            "hdnInfraNroItens": _field("hdnInfraNroItens"),
+            "hdnInfraItens": _field("hdnInfraItens"),
+            "hdnInfraItensHash": _field("hdnInfraItensHash"),
+            "hdnInfraItensSelecionados": "",
+            "hdnInfraSelecoes": "Infra",
+            "hdnInfraCampoOrd": "IdBloco",
+            "hdnInfraTipoOrd": "DESC",
+            "hdnInfraPaginaAtual": "0",
+            "hdnInfraHashCriterios": _field("hdnInfraHashCriterios"),
+        }
+
+        rd = self._post(excluir_url, data=data)
+
+        if "login" in str(rd.url):
+            raise RuntimeError("Sessão expirou durante exclusão")
+
+        if "bloco_assinatura_listar" not in str(rd.url):
+            raise RuntimeError("Exclusão falhou — redirecionamento inesperado")
+
+        # Verify deletion
+        remaining = parse_blocks(rd.text, base_url=self._sei_url(""))
+        if any(b.numero == block_numero for b in remaining):
+            raise RuntimeError(f"Bloco {block_numero} ainda existe após tentativa de exclusão")
+
+        return True
+
     def list_blocks(self) -> list[Block]:
         """List blocos de assinatura."""
         html = self._ensure_control()

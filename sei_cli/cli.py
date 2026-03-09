@@ -304,6 +304,27 @@ def block_cancelar_cmd(block_numero: str, as_json: bool) -> None:
     click.echo(f"{icon} {result['message']}")
 
 
+@cli.command("block-delete")
+@click.argument("block_numero")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def block_delete_cmd(block_numero: str, as_json: bool) -> None:
+    """Delete an empty bloco de assinatura."""
+    with SEIClient() as client:
+        client.login()
+        try:
+            client.delete_block(block_numero)
+        except RuntimeError as e:
+            if as_json:
+                _emit({"ok": False, "message": str(e)}, True)
+            else:
+                click.echo(f"❌ {e}")
+            raise SystemExit(1)
+    if as_json:
+        _emit({"ok": True, "message": f"Bloco {block_numero} excluído"}, True)
+        return
+    click.echo(f"✅ Bloco {block_numero} excluído")
+
+
 @cli.command("block-devolver")
 @click.argument("block_numero")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
