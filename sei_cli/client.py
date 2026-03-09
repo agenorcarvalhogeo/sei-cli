@@ -1293,6 +1293,95 @@ class SEIClient:
 
         return {"ok": False, "message": f"Erro ao cancelar disponibilização (status {r.status_code})"}
 
+    def remove_document_from_block(
+        self,
+        id_documento: str,
+        block_numero: str,
+    ) -> dict:
+        """Remove a document from a bloco de assinatura.
+
+        Navigates to the block's document list and submits the removal form.
+        The block must NOT be disponibilizado — cancel first if needed.
+
+        Args:
+            id_documento: Document ID (SEI internal ID, e.g. '48218774').
+            block_numero: Block number (e.g. '871303').
+
+        Returns:
+            dict with 'ok' bool and 'message'.
+        """
+        _, blocos_soup = self._get_blocos_page()
+
+        # Find rel_bloco_protocolo_listar URL for this block
+        list_pattern = re.compile(
+            rf"controlador\.php\?acao=rel_bloco_protocolo_listar[^'\"]*id_bloco={block_numero}[^'\"]*"
+        )
+        list_match = list_pattern.search(str(blocos_soup))
+        if not list_match:
+            return {"ok": False, "message": f"Bloco {block_numero} não encontrado na lista de blocos"}
+
+        doc_list_url = self._sei_url(list_match.group(0).replace("&amp;", "&"))
+        r_docs = self._get(doc_list_url)
+        docs_soup = BeautifulSoup(r_docs.text, "lxml")
+
+        # Verify document is in this block
+        item_key = f"{id_documento}-{block_numero}"
+        cb = docs_soup.find("input", {"type": "checkbox", "value": item_key})
+        if not cb:
+            return {
+                "ok": False,
+                "message": f"Documento {id_documento} não encontrado no bloco {block_numero}",
+            }
+
+        # Extract rel_bloco_protocolo_excluir URL
+        excluir_match = re.search(
+            r"(controlador\.php\?acao=rel_bloco_protocolo_excluir[^'\"]+)",
+            r_docs.text,
+        )
+        if not excluir_match:
+            return {"ok": False, "message": "URL de remoção não encontrada"}
+
+        excluir_url = self._sei_url(excluir_match.group(1).replace("&amp;", "&"))
+
+        # Build form data
+        form = docs_soup.find("form", {"id": "frmRelBlocoProtocoloLista"})
+        if not form:
+            for f in docs_soup.find_all("form"):
+                if f.find("input", {"name": "hdnInfraItemId"}):
+                    form = f
+                    break
+
+        if not form:
+            return {"ok": False, "message": "Formulário de documentos do bloco não encontrado"}
+
+        fdata = {}
+        for inp in form.find_all("input", type="hidden"):
+            name = inp.get("name", "")
+            if name:
+                fdata[name] = inp.get("value", "")
+
+        fdata["hdnInfraItemId"] = item_key
+
+        r = self._post(excluir_url, fdata)
+        self._control_html = None
+
+        if r.status_code == 200:
+            result_soup = BeautifulSoup(r.text, "lxml")
+
+            val = result_soup.find("textarea", {"id": "txaInfraValidacao"})
+            if val and val.get_text(strip=True):
+                return {"ok": False, "message": val.get_text(strip=True)[:200]}
+
+            if id_documento not in result_soup.get_text():
+                return {
+                    "ok": True,
+                    "message": f"Documento {id_documento} removido do bloco {block_numero}",
+                }
+
+            return {"ok": True, "message": f"Remoção submetida (verificar bloco {block_numero})"}
+
+        return {"ok": False, "message": f"Erro ao remover documento (status {r.status_code})"}
+
     # --- Units ---
 
     def list_units(self) -> list[Unit]:

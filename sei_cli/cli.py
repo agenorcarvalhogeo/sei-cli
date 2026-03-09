@@ -274,6 +274,22 @@ def block_devolver_cmd(block_numero: str, as_json: bool) -> None:
     click.echo(f"{icon} {result['message']}")
 
 
+@cli.command("block-remove")
+@click.argument("id_documento")
+@click.argument("block_numero")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def block_remove_cmd(id_documento: str, block_numero: str, as_json: bool) -> None:
+    """Remove a document from a bloco de assinatura."""
+    with SEIClient() as client:
+        client.login()
+        result = client.remove_document_from_block(id_documento, block_numero)
+    if as_json:
+        _emit(result, True)
+        return
+    icon = "✅" if result["ok"] else "❌"
+    click.echo(f"{icon} {result['message']}")
+
+
 @cli.command("read-doc")
 @click.argument("id_documento")
 @click.argument("id_procedimento")
