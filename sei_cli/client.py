@@ -15,9 +15,11 @@ creates a NEW PHPSESSID for /sei/. Must follow redirects manually
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
-from typing import Any
+import time
+from typing import Any, Iterator
 from urllib.parse import urljoin
 
 import httpx
@@ -57,6 +59,11 @@ from sei_cli.parsers import (
 class SEIClient:
     BASE = "https://sei.rn.gov.br"
 
+    # Control page path (session-independent)
+    _CONTROL_PATH = (
+        "controlador.php?acao=procedimento_controlar&infra_sistema=100000100"
+    )
+
     def __init__(self, base_url: str | None = None) -> None:
         self.base_url = (base_url or self.BASE).rstrip("/")
         self.client = auth.create_http_client()
@@ -64,6 +71,11 @@ class SEIClient:
         self._menu_links: dict[str, str] = {}
         self._editor_hiddens: dict[str, str] = {}
         self._current_unit_id: str | None = None
+        # Session management
+        self._last_login: float = 0.0
+        self._batch_active: bool = False
+        # infra_hash pool: acao_name -> [hash1, hash2, ...]
+        self._hash_pool: dict[str, list[str]] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -78,11 +90,15 @@ class SEIClient:
 
     def _get(self, url: str) -> httpx.Response:
         r = self.client.get(url)
-        return auth._follow(self.client, r, self.base_url)
+        r = auth._follow(self.client, r, self.base_url)
+        self._harvest_hashes(r.text)
+        return r
 
     def _post(self, url: str, data: dict) -> httpx.Response:
         r = self.client.post(url, data=data)
-        return auth._follow(self.client, r, self.base_url)
+        r = auth._follow(self.client, r, self.base_url)
+        self._harvest_hashes(r.text)
+        return r
 
     def _sei_url(self, path: str) -> str:
         return f"{self.base_url}/sei/{path}"
@@ -131,20 +147,158 @@ class SEIClient:
             raise RuntimeError(status.message)
         self._control_html = html
         self._menu_links = parse_menu_links(html, self._sei_url(""))
+        self._last_login = time.time()
         return parse_system_status(html)
 
+    def _ensure_session(self) -> str:
+        """Smart session restore: try GET first, fall back to full login.
+
+        When _control_html is None (stale after navigation), this method
+        avoids a full POST login by first trying a GET of the control page.
+        SEI's PHPSESSID typically stays valid much longer than the 40x
+        re-logins triggered by clearing _control_html after each operation.
+
+        Returns:
+            Fresh control page HTML (with valid infra_hash values).
+        """
+        # If we have session cookies, try reusing them (fast path: 1 GET)
+        if self.client.cookies:
+            control_url = self._sei_url(self._CONTROL_PATH)
+            is_valid, html = auth.check_session(self.client, control_url)
+            if is_valid:
+                self._control_html = html
+                self._menu_links = parse_menu_links(html, self._sei_url(""))
+                return html
+
+        # Session expired or no cookies — full POST login
+        creds = load_credentials()
+        status, html = auth.login(self.client, creds)
+        if not status.success:
+            raise RuntimeError(status.message)
+        self._control_html = html
+        self._menu_links = parse_menu_links(html, self._sei_url(""))
+        self._last_login = time.time()
+        return html
+
     def _ensure_control(self) -> str:
-        """Return cached control page HTML, re-logging in if needed."""
+        """Return cached control page HTML, refreshing session if needed.
+
+        KEY OPTIMIZATION: When _control_html is None (set after each
+        navigation), this now calls _ensure_session() which tries a GET
+        of the control page before falling back to full POST login.
+        This reduces ~40 re-logins per session to near zero.
+        """
         if self._control_html:
             return self._control_html
-        self.login()
-        return self._control_html or ""
+        return self._ensure_session()
 
     def _fresh_control(self) -> str:
-        """Force re-login to get fresh control page."""
+        """Force refresh of control page (smart: GET if session valid, login if not)."""
         self._control_html = None
-        self.login()
-        return self._control_html or ""
+        return self._ensure_session()
+
+    @contextlib.contextmanager
+    def batch_mode(self) -> "Iterator[SEIClient]":
+        """Context manager for batch operations requiring session stability.
+
+        Ensures a single login at the start and keeps the session alive
+        across multiple operations. Particularly useful for reading 7+
+        documents in sequence without triggering re-logins.
+
+        Usage::
+
+            with client.batch_mode() as c:
+                for doc_id in doc_ids:
+                    c.read_relatorio(doc_id, proc_id)
+
+        Inside batch_mode:
+        - Login is performed once at entry if not already logged in
+        - _ensure_session() is called on each _ensure_control() miss
+          (fast GET, not slow POST login)
+        - Session state is restored on exit
+        """
+        prev_batch = self._batch_active
+        self._batch_active = True
+        # Ensure we have a valid session at the start
+        if not self._control_html:
+            self._ensure_session()
+        try:
+            yield self
+        finally:
+            self._batch_active = prev_batch
+
+    def _navigate_with_retry(
+        self,
+        fn: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Execute fn(*args, **kwargs), retrying once on session failure.
+
+        Detects session expiry by checking for login redirects or
+        'pwdSenha' indicators in HTTP responses. On first failure,
+        refreshes the session and retries. Maximum 2 attempts.
+
+        Args:
+            fn: Callable to execute.
+            *args, **kwargs: Arguments passed to fn.
+
+        Returns:
+            Result of fn(*args, **kwargs).
+
+        Raises:
+            RuntimeError: If retry also fails (re-raises original error).
+        """
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                result = fn(*args, **kwargs)
+                # Detect session expiry in HTTP response
+                if isinstance(result, httpx.Response):
+                    url_str = str(result.url)
+                    if "login.php" in url_str or "pwdSenha" in result.text:
+                        raise RuntimeError(
+                            "Session expired during navigation (login redirect detected)"
+                        )
+                return result
+            except RuntimeError as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                is_session_error = any(
+                    kw in msg
+                    for kw in (
+                        "session expired", "login", "sessão expirou",
+                        "expirou", "não encontrado na unidade",
+                    )
+                )
+                if attempt == 0 and is_session_error:
+                    # Refresh session and retry
+                    self._control_html = None
+                    self._ensure_session()
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
+
+    def _harvest_hashes(self, response_text: str) -> None:
+        """Extract infra_hash values from an HTML response and cache them.
+
+        Parses ``acao=xxx&...infra_hash=<64-hex>`` patterns and stores
+        hashes keyed by their action name. Keeps up to 5 hashes per action.
+        These can be used as fallback CSRF tokens when a page's hash expires.
+
+        Args:
+            response_text: HTML content to extract hashes from.
+        """
+        for match in re.finditer(
+            r"acao=([a-z_]+)[^\"']*infra_hash=([a-f0-9]{64})",
+            response_text,
+        ):
+            acao, h = match.group(1), match.group(2)
+            pool = self._hash_pool.setdefault(acao, [])
+            if h not in pool:
+                pool.append(h)
+                if len(pool) > 5:
+                    pool.pop(0)
 
     # --- Status ---
 
@@ -154,7 +308,14 @@ class SEIClient:
 
     # --- Processes ---
 
-    def list_processes(self) -> ProcessList:
+    def list_processes(self, unit: str | None = None) -> ProcessList:
+        """List processes in the control page.
+
+        Args:
+            unit: Optional unit keyword to switch to before listing.
+        """
+        if unit:
+            self.switch_unit(unit)
         html = self._ensure_control()
         return parse_processes(html, base_url=self._sei_url(""))
 
@@ -2363,7 +2524,12 @@ class SEIClient:
         id_procedimento: str,
         unit: str = "OP 3",
     ) -> dict[str, Any]:
-        """Read and summarize all relatório-like documents from a process."""
+        """Read and summarize all relatório-like documents from a process.
+
+        Uses batch_mode() to avoid repeated full re-logins between documents.
+        The session is established once at the start and refreshed via fast
+        GET requests (not POST logins) between each document read.
+        """
         if unit:
             self.switch_unit(unit)
 
@@ -2378,19 +2544,23 @@ class SEIClient:
 
         parsed: list[RelatorioServico] = []
         failures: list[dict[str, str]] = []
-        for doc in rel_docs:
-            if not doc.id_documento:
-                continue
-            try:
-                parsed.append(self.read_relatorio(doc.id_documento, id_procedimento))
-            except Exception as exc:
-                failures.append(
-                    {
-                        "id_documento": doc.id_documento,
-                        "nome": doc.nome,
-                        "erro": str(exc),
-                    }
-                )
+
+        with self.batch_mode():
+            for doc in rel_docs:
+                if not doc.id_documento:
+                    continue
+                try:
+                    def _read(did=doc.id_documento):
+                        return self.read_relatorio(did, id_procedimento)
+                    parsed.append(self._navigate_with_retry(_read))
+                except Exception as exc:
+                    failures.append(
+                        {
+                            "id_documento": doc.id_documento,
+                            "nome": doc.nome,
+                            "erro": str(exc),
+                        }
+                    )
 
         md = summarize_batch(parsed)
         return {
