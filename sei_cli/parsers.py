@@ -138,13 +138,13 @@ def parse_processes(content: str, base_url: str) -> ProcessList:
 # Pattern: new infraArvoreNo("TYPE","id_doc","id_proc","url","iframe","title1","title2",...)
 _ARVORE_RE = re.compile(
     r'new\s+infraArvoreNo\('
-    r'"(\w+)",'          # tipo: PROCESSO or DOCUMENTO
-    r'"(\d+)",'          # id
-    r'(?:"(\d+)"|null),' # parent id
-    r'"([^"]+)",'        # url
-    r'"([^"]*)",'        # iframe target
-    r'"([^"]*)",'        # title/label
-    r'"([^"]*)"'         # title2
+    r'"(\w+)",'              # tipo: PROCESSO, DOCUMENTO, PASTA, AGUARDE
+    r'"([^"]+)",'            # id (numeric or string like PASTA7)
+    r'(?:"([^"]+)"|null),'   # parent id (numeric, string, or null)
+    r'"([^"]+)",'            # url
+    r'"([^"]*)",'            # iframe target
+    r'"([^"]*)",'            # title/label
+    r'"([^"]*)"'             # title2
 )
 
 
@@ -153,7 +153,7 @@ def parse_document_tree(content: str, base_url: str) -> list[Document]:
     docs = []
     for m in _ARVORE_RE.finditer(content):
         tipo_raw, doc_id, _parent_id, url, _iframe, title, _title2 = m.groups()
-        if tipo_raw == "PROCESSO":
+        if tipo_raw in ("PROCESSO", "PASTA", "AGUARDE"):
             continue
         # Determine document type from icon in the full match context
         full_line = content[m.start():m.start() + 500]
