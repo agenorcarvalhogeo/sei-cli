@@ -94,8 +94,19 @@ class SEIClient:
         self._harvest_hashes(r.text)
         return r
 
-    def _post(self, url: str, data: dict) -> httpx.Response:
-        r = self.client.post(url, data=data)
+    def _post(self, url: str, data: dict, *, encoding: str = "iso-8859-1") -> httpx.Response:
+        """POST form data, defaulting to ISO-8859-1 (SEI's native encoding).
+
+        SEI pages declare charset=ISO-8859-1 and expect form submissions
+        in the same encoding. Using UTF-8 would corrupt accented characters.
+        """
+        from urllib.parse import urlencode as _urlencode
+        body = _urlencode(list(data.items()), encoding=encoding)
+        r = self.client.post(
+            url,
+            content=body.encode(encoding),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         r = auth._follow(self.client, r, self.base_url)
         self._harvest_hashes(r.text)
         return r
@@ -2689,32 +2700,21 @@ class SEIClient:
         }
 
     def _navigate_to_arvore(self, id_procedimento: str) -> str | None:
-        """Navigate to a process and return the arvore HTML.
+        """Navigate to a process and return the arvore (tree) HTML.
 
-        Tries multiple strategies:
-        1. Direct link from control page (recebidos/gerados)
-        2. Search in Acompanhamento Especial
-        3. Pesquisa Rápida fallback
+        Uses direct URL approach (same as _open_process_page) —
+        works regardless of whether the process is in the current unit's list.
         """
-        html = self._ensure_control()
-        soup = BeautifulSoup(html, "lxml")
+        self._ensure_session()
+        url = self._sei_url(
+            f"controlador.php?acao=procedimento_trabalhar"
+            f"&id_procedimento={id_procedimento}"
+        )
+        rp = self._get(url)
 
-        # Strategy 1: Direct link from control page
-        proc_link = None
-        for a in soup.find_all("a"):
-            href = a.get("href", "")
-            if "procedimento_trabalhar" in href and id_procedimento in href:
-                proc_link = urljoin(self._sei_url(""), href)
-                break
-
-        if not proc_link:
-            # Strategy 2: Try Acompanhamento Especial
-            proc_link = self._find_in_acompanhamento(id_procedimento)
-
-        if not proc_link:
+        if "login.php" in str(rp.url) or "pwdSenha" in rp.text:
             return None
 
-        rp = self._get(proc_link)
         psoup = BeautifulSoup(rp.text, "lxml")
         iframe = psoup.find("iframe", {"name": "ifrArvore"})
         if not iframe or not iframe.get("src"):
