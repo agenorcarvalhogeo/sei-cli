@@ -1849,7 +1849,8 @@ class SEIClient:
                 if id_doc and id_proc:
                     return (id_doc.group(1), id_proc.group(1))
 
-        # Try extracting from any script or hidden field
+        # Try extracting from any script, hidden field, or iframe src
+        # Order varies: sometimes id_documento before id_procedimento, sometimes reversed
         for pattern in [
             r'"id_documento":"(\d+)".*?"id_procedimento":"(\d+)"',
             r'id_documento=(\d+).*?id_procedimento=(\d+)',
@@ -1857,6 +1858,14 @@ class SEIClient:
             m = re.search(pattern, html)
             if m:
                 return (m.group(1), m.group(2))
+
+        # Try reversed order (SEI often puts id_procedimento before id_documento)
+        for pattern in [
+            r'id_procedimento=(\d+).*?id_documento=(\d+)',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                return (m.group(2), m.group(1))  # swap: return (id_doc, id_proc)
 
         return None
 
