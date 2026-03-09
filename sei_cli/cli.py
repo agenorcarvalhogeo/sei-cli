@@ -111,28 +111,65 @@ def processes_cmd(unit: str | None, as_json: bool) -> None:
 
 @cli.command("process")
 @click.argument("numero")
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes)")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
-def process_cmd(numero: str, as_json: bool) -> None:
+def process_cmd(numero: str, unit: str | None, as_json: bool) -> None:
+    """Listar documentos de um processo pelo id_procedimento ou número SEI."""
     with SEIClient() as client:
-        details = client.get_process(numero)
+        if unit:
+            client.switch_unit(unit)
+        # Se parece número de processo (tem ponto/barra), resolve via goto
+        if "." in numero or "/" in numero:
+            result = client.search_document(numero)
+            if not result:
+                click.echo(f"❌ Processo '{numero}' não encontrado", err=True)
+                raise SystemExit(1)
+            id_proc = result[1]
+        else:
+            id_proc = numero
+        docs = client.get_process_documents(id_proc)
+
     if as_json:
-        _emit(asdict(details), True)
+        _emit([asdict(d) for d in docs], True)
         return
 
-    table = Table(title=f"Processo {details.processo_numero}")
-    table.add_column("Documento")
-    table.add_column("Nome")
-    for doc in details.documentos:
-        table.add_row(doc.numero, doc.nome)
+    table = Table(title=f"Processo {numero} ({len(docs)} documentos)")
+    table.add_column("ID")
+    table.add_column("Nº SEI")
+    table.add_column("Tipo")
+    table.add_column("Assinado")
+    for doc in docs:
+        table.add_row(
+            doc.id_documento or "-",
+            doc.numero,
+            doc.nome,
+            "✅" if doc.assinado else "❌",
+        )
     console.print(table)
 
 
 @cli.command("doc")
 @click.argument("numero")
-def doc_cmd(numero: str) -> None:
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes)")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def doc_cmd(numero: str, unit: str | None, as_json: bool) -> None:
+    """Buscar documento por número SEI e mostrar metadados."""
     with SEIClient() as client:
-        content = client.get_document(numero)
-    click.echo(content)
+        if unit:
+            client.switch_unit(unit)
+        result = client.search_document(numero)
+    if not result:
+        click.echo(f"❌ Documento '{numero}' não encontrado", err=True)
+        raise SystemExit(1)
+
+    id_doc, id_proc = result
+    if as_json:
+        _emit({"id_documento": id_doc, "id_procedimento": id_proc, "numero_sei": numero}, True)
+        return
+
+    click.echo(f"✅ Documento SEI {numero}")
+    click.echo(f"  id_documento: {id_doc}")
+    click.echo(f"  id_procedimento: {id_proc}")
 
 
 @cli.command("blocks")
@@ -168,14 +205,24 @@ def block_cmd(block_id: str, as_json: bool) -> None:
 @click.argument("query")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
 def search_cmd(query: str, as_json: bool) -> None:
+    """Search processes by keyword in tipo, especificação, or marcador."""
     with SEIClient() as client:
-        result = client.search(query)
+        proc_list = client.list_processes()
+
+    kw = query.lower()
+    matches = [
+        p for p in proc_list.recebidos + proc_list.gerados
+        if kw in (p.tipo or "").lower()
+        or kw in (p.especificacao or "").lower()
+        or kw in (p.marcador or "").lower()
+        or kw in (p.numero or "").lower()
+    ]
 
     if as_json:
-        _emit({"query": result.query, "processos": [asdict(x) for x in result.processos]}, True)
+        _emit({"query": query, "processos": [asdict(x) for x in matches]}, True)
         return
 
-    _table_processes(f"Pesquisa: {query}", result.processos)
+    _table_processes(f"Pesquisa: {query} ({len(matches)} resultados)", matches)
 
 
 @cli.command("goto")
@@ -480,10 +527,12 @@ def block_remove_cmd(id_documento: str, block_numero: str, as_json: bool) -> Non
 @cli.command("read-doc")
 @click.argument("id_documento")
 @click.argument("id_procedimento")
-def read_doc_cmd(id_documento: str, id_procedimento: str) -> None:
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes)")
+def read_doc_cmd(id_documento: str, id_procedimento: str, unit: str | None) -> None:
     """Read a document's text content."""
     with SEIClient() as client:
-        client.login()
+        if unit:
+            client.switch_unit(unit)
         text = client.read_document(id_documento, id_procedimento)
     click.echo(text)
 
