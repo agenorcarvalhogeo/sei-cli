@@ -324,7 +324,9 @@ def parse_blocks(content: str, base_url: str) -> list[Block]:
     """
     page = _tree(content)
     blocks = []
-    rows = page.xpath("//tr[contains(@class,'infraTrClara') or contains(@class,'infraTrEscura')]")
+    rows = page.xpath(
+        "//tr[contains(@class,'infraTrClara') or contains(@class,'infraTrEscura') or contains(@class,'trVermelha')]"
+    )
     
     for row in rows:
         tds = row.xpath("./td")
@@ -337,7 +339,9 @@ def parse_blocks(content: str, base_url: str) -> list[Block]:
         
         estado = _norm(tds[4].text_content())
         unidade_origem = _norm(tds[5].text_content())
-        unidade_destino = _norm(tds[6].text_content())
+        # Column 6 may contain "Aguardando Devolução <unit>" for disponibilizado blocks
+        raw_dest = _norm(tds[6].text_content())
+        unidade_destino = raw_dest.replace("Aguardando Devolução", "").strip() if raw_dest else ""
         descricao = _norm(tds[8].text_content()) if len(tds) > 8 else ""
         
         # Link to bloco detail

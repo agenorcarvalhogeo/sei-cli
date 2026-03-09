@@ -963,6 +963,100 @@ class SEIClient:
 
     # --- Blocks ---
 
+    # Well-known SEI unit IDs for block creation (CBM scope)
+    UNIT_IDS: dict[str, str] = {
+        "CMDO 1SGB/3GBM": "110003477",
+        "CMDO 2SGB/3GBM": "110003483",
+        "CMDO 3GBM": "110003475",
+        "LOGISTICA 3GBM": "110010205",
+        "OP 3GBM": "110003486",
+        "SEC 1SGB/3GBM": "110003478",
+        "SEC 2SGB/3GBM": "110003484",
+        "SECRETARIA 3GBM": "110003476",
+        "CMDO PABM APODI": "110008367",
+        "PAD-PDF": "110003697",
+        "DAT-1CAT": "110005347",
+    }
+
+    def create_block(
+        self,
+        descricao: str,
+        unidade_destino_id: str,
+        *,
+        grupo: str = "null",
+    ) -> str:
+        """Create a new bloco de assinatura.
+
+        Args:
+            descricao: Block description.
+            unidade_destino_id: SEI unit ID for the destination unit.
+                Use UNIT_IDS class dict for known units, or query the
+                unit selector for other IDs.
+            grupo: Optional group (default "null" = Nenhum).
+
+        Returns:
+            The new block number (str).
+
+        Raises:
+            RuntimeError: If block creation fails.
+        """
+        # Navigate to blocos page and find the cadastrar URL
+        _, soup = self._get_blocos_page()
+        cadastrar_url = None
+        for inp in soup.find_all(["input", "button"]):
+            onclick = inp.get("onclick", "")
+            if "bloco_assinatura_cadastrar" in onclick:
+                url_match = re.search(r"location\.href='([^']+)'", onclick)
+                if url_match:
+                    cadastrar_url = self._sei_url(
+                        url_match.group(1).replace("&amp;", "&")
+                    )
+                    break
+
+        if not cadastrar_url:
+            raise RuntimeError("URL de cadastro de bloco não encontrada")
+
+        # Load the form to get a valid hash
+        r_cad = self._get(cadastrar_url)
+        cad_soup = BeautifulSoup(r_cad.text, "lxml")
+        form = cad_soup.find("form", id="frmBlocoCadastro")
+        if not form:
+            raise RuntimeError("Formulário frmBlocoCadastro não encontrado")
+
+        form_action = form.get("action", "").replace("&amp;", "&")
+        submit_url = self._sei_url(form_action)
+
+        # Get block count before creation to detect new block
+        before_blocks = {b.numero for b in self.list_blocks()}
+
+        data = {
+            "hdnInfraTipoPagina": "1",
+            "txtIdBloco": "",
+            "txtDescricao": descricao,
+            "selGrupoBloco": grupo,
+            "txtUnidade": "",
+            "hdnIdUnidade": "",
+            "selUnidades": unidade_destino_id,
+            "hdnIdBloco": "",
+            "hdnUnidades": unidade_destino_id,
+            "sbmCadastrarBloco": "Salvar",
+        }
+
+        r_save = self._post(submit_url, data=data)
+
+        if "bloco_assinatura_listar" not in str(r_save.url):
+            raise RuntimeError(
+                "Criação de bloco falhou — servidor não redirecionou para lista"
+            )
+
+        # Find the new block number
+        after_blocks = self.list_blocks()
+        for b in after_blocks:
+            if b.numero not in before_blocks:
+                return b.numero
+
+        raise RuntimeError("Bloco criado mas número não identificado")
+
     def list_blocks(self) -> list[Block]:
         """List blocos de assinatura."""
         html = self._ensure_control()

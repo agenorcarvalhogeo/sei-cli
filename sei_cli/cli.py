@@ -53,12 +53,19 @@ def _table_processes(title: str, items: list[Process]) -> None:
 
 def _table_blocks(items: list[Block]) -> None:
     table = Table(title="Blocos")
-    table.add_column("ID")
-    table.add_column("Tipo")
-    table.add_column("Descrição")
+    table.add_column("Número")
     table.add_column("Estado")
+    table.add_column("Descrição")
+    table.add_column("Origem")
+    table.add_column("Destino")
     for item in items:
-        table.add_row(item.id, item.tipo, item.descricao, item.estado or "-")
+        table.add_row(
+            item.numero,
+            item.estado or "-",
+            item.descricao,
+            item.unidade_origem,
+            item.unidade_destino,
+        )
     console.print(table)
 
 
@@ -200,6 +207,44 @@ def switch_cmd(sigla: str, as_json: bool) -> None:
         _emit(asdict(status), True)
         return
     _print_status(status)
+
+
+@cli.command("block-create")
+@click.argument("descricao")
+@click.argument("unidade_destino")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def block_create_cmd(descricao: str, unidade_destino: str, as_json: bool) -> None:
+    """Create a new bloco de assinatura.
+
+    UNIDADE_DESTINO can be a known alias (e.g. 'CMDO 3GBM') or a numeric SEI unit ID.
+    Known aliases: CMDO 3GBM, CMDO PABM APODI, SEC 1SGB/3GBM, SEC 2SGB/3GBM,
+    SECRETARIA 3GBM, OP 3GBM, LOGISTICA 3GBM, PAD-PDF, DAT-1CAT.
+    """
+    # Resolve alias or use as-is
+    unit_id = SEIClient.UNIT_IDS.get(unidade_destino.upper(), None)
+    if not unit_id:
+        # Try case-insensitive fuzzy match
+        for alias, uid in SEIClient.UNIT_IDS.items():
+            if unidade_destino.upper().replace("º", "").replace("°", "") in alias.replace("º", ""):
+                unit_id = uid
+                break
+    if not unit_id:
+        if unidade_destino.isdigit():
+            unit_id = unidade_destino
+        else:
+            click.echo(f"❌ Unidade desconhecida: {unidade_destino}")
+            click.echo(f"   Aliases válidos: {', '.join(SEIClient.UNIT_IDS.keys())}")
+            raise SystemExit(1)
+
+    with SEIClient() as client:
+        client.login()
+        numero = client.create_block(descricao, unit_id)
+
+    result = {"ok": True, "numero": numero, "descricao": descricao, "unidade_id": unit_id}
+    if as_json:
+        _emit(result, True)
+        return
+    click.echo(f"✅ Bloco {numero} criado — {descricao}")
 
 
 @cli.command("block-add")
