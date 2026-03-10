@@ -76,6 +76,8 @@ class SEIClient:
         self._batch_active: bool = False
         # infra_hash pool: acao_name -> [hash1, hash2, ...]
         self._hash_pool: dict[str, list[str]] = {}
+        # Load persisted session cookie
+        self._restore_session()
 
     def close(self) -> None:
         self.client.close()
@@ -168,29 +170,69 @@ class SEIClient:
         self._control_html = html
         self._menu_links = parse_menu_links(html, self._sei_url(""))
         self._last_login = time.time()
+        self._persist_session()
         return parse_system_status(html)
 
-    def _ensure_session(self) -> str:
-        """Smart session restore: try GET first, fall back to full login.
+    def _restore_session(self) -> None:
+        """Load persisted PHPSESSID from disk into httpx client."""
+        from sei_cli.config import load_session
 
-        When _control_html is None (stale after navigation), this method
-        avoids a full POST login by first trying a GET of the control page.
-        SEI's PHPSESSID typically stays valid much longer than the 40x
-        re-logins triggered by clearing _control_html after each operation.
+        data = load_session()
+        if data and data.get("phpsessid"):
+            self.client.cookies.set(
+                "PHPSESSID", data["phpsessid"],
+                domain="sei.rn.gov.br", path="/",
+            )
+            self._current_unit_id = data.get("unit_id")
 
-        Returns:
-            Fresh control page HTML (with valid infra_hash values).
+    def _persist_session(self) -> None:
+        """Save current PHPSESSID + unit to disk for reuse."""
+        from sei_cli.config import save_session
+
+        cookie = self.client.cookies.get("PHPSESSID")
+        if cookie:
+            save_session(cookie, self._current_unit_id)
+
+    def _try_inicializar(self) -> str | None:
+        """Fast session refresh via inicializar.php (~0.2s).
+
+        If the PHPSESSID is still valid server-side, inicializar.php
+        redirects to the control page with fresh infra_hash values.
+        Returns control page HTML on success, None on failure.
         """
-        # If we have session cookies, try reusing them (fast path: 1 GET)
-        if self.client.cookies:
-            control_url = self._sei_url(self._CONTROL_PATH)
-            is_valid, html = auth.check_session(self.client, control_url)
-            if is_valid:
+        r = self.client.get(self._sei_url("inicializar.php"))
+        if r.status_code != 302:
+            return None
+        location = r.headers.get("location", "")
+        if not location or "login.php" in location:
+            return None
+        # Resolve relative URL
+        full_url = urljoin(self._sei_url("inicializar.php"), location)
+        r2 = self.client.get(full_url)
+        if r2.status_code == 200 and "Controle de Processos" in r2.text:
+            return r2.text
+        return None
+
+    def _ensure_session(self) -> str:
+        """Restore session with minimal overhead.
+
+        Strategy (fast → slow):
+        1. Try inicializar.php with existing cookie (~0.2s)
+        2. Full POST login as fallback (~1.5s)
+
+        After successful login, persists cookie to disk for reuse
+        by other agents/processes.
+        """
+        # Fast path: reuse existing PHPSESSID via inicializar.php
+        if self.client.cookies.get("PHPSESSID"):
+            html = self._try_inicializar()
+            if html:
                 self._control_html = html
                 self._menu_links = parse_menu_links(html, self._sei_url(""))
                 return html
 
-        # Session expired or no cookies — full POST login
+        # Slow path: full login (clear stale cookies first)
+        self.client.cookies.clear()
         creds = load_credentials()
         status, html = auth.login(self.client, creds)
         if not status.success:
@@ -198,6 +240,7 @@ class SEIClient:
         self._control_html = html
         self._menu_links = parse_menu_links(html, self._sei_url(""))
         self._last_login = time.time()
+        self._persist_session()
         return html
 
     def _ensure_control(self) -> str:
@@ -1796,6 +1839,7 @@ class SEIClient:
         rc = self._get(control_url)
         self._control_html = rc.text
         self._menu_links = parse_menu_links(rc.text, self._sei_url(""))
+        self._persist_session()
         return parse_system_status(rc.text)
 
     # --- Search ---

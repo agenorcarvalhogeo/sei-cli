@@ -57,25 +57,31 @@ def orgao_to_value(orgao: str) -> str:
     return ORGAO_MAP.get(orgao.upper(), orgao)
 
 
-def save_session(data: SessionData, path: Path = SESSION_PATH) -> None:
+def save_session(
+    cookie: str,
+    unit_id: str | None = None,
+    path: Path = SESSION_PATH,
+) -> None:
+    """Persist PHPSESSID + optional unit to disk (chmod 600)."""
     _ensure_parent(path)
-    payload = {
-        "base_url": data.base_url,
-        "last_url": data.last_url,
-        "cookies": data.cookies,
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    import time
+
+    payload = {"phpsessid": cookie, "unit_id": unit_id, "saved_at": time.time()}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
 
 
-def load_session(path: Path = SESSION_PATH) -> SessionData | None:
+def load_session(path: Path = SESSION_PATH) -> dict | None:
+    """Load saved session. Returns {"phpsessid": str, "unit_id": str|None, "saved_at": float} or None."""
     if not path.exists():
         return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return SessionData(
-        base_url=str(data.get("base_url", "https://sei.rn.gov.br")),
-        last_url=data.get("last_url"),
-        cookies={str(k): str(v) for k, v in (data.get("cookies") or {}).items()},
-    )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if "phpsessid" not in data:
+            return None
+        return data
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def clear_session(path: Path = SESSION_PATH) -> None:
