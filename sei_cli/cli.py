@@ -682,5 +682,144 @@ def download_doc_pdf_cmd(
     console.print(f"[green]✅ PDF salvo em: {path}[/green]")
 
 
+@cli.command("ciencia-doc")
+@click.argument("id_documento")
+@click.argument("id_procedimento")
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes)")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def ciencia_doc_cmd(id_documento: str, id_procedimento: str, unit: str | None, as_json: bool) -> None:
+    """Dar ciência em um documento específico (acknowledge a document).
+
+    ID_DOCUMENTO: Internal SEI document ID (numeric).
+    ID_PROCEDIMENTO: Internal SEI process ID containing the document.
+
+    'Dar ciência' registra que você leu o documento. Diferente de assinar —
+    não requer senha, é apenas uma confirmação de leitura.
+    """
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        try:
+            result = client.give_notice_document(id_documento, id_procedimento)
+        except RuntimeError as e:
+            if as_json:
+                _emit({"ok": False, "error": str(e)}, True)
+            else:
+                console.print(f"[red]❌ {e}[/red]")
+            raise SystemExit(1)
+
+    if as_json:
+        _emit(result, True)
+        return
+    icon = "✅" if result.get("ok") else "❌"
+    console.print(f"{icon} {result.get('message', result)}")
+
+
+@cli.command("ciencia")
+@click.argument("id_procedimento")
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes)")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def ciencia_cmd(id_procedimento: str, unit: str | None, as_json: bool) -> None:
+    """Dar ciência no processo inteiro (acknowledge entire process).
+
+    ID_PROCEDIMENTO: Internal SEI process ID (numeric).
+
+    'Dar ciência' registra que você leu o processo. Diferente de assinar —
+    não requer senha, é apenas uma confirmação de leitura.
+    """
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        try:
+            result = client.give_notice_process(id_procedimento)
+        except RuntimeError as e:
+            if as_json:
+                _emit({"ok": False, "error": str(e)}, True)
+            else:
+                console.print(f"[red]❌ {e}[/red]")
+            raise SystemExit(1)
+
+    if as_json:
+        _emit(result, True)
+        return
+    icon = "✅" if result.get("ok") else "❌"
+    console.print(f"{icon} {result.get('message', result)}")
+
+
+@cli.command("upload")
+@click.argument("id_procedimento")
+@click.argument("file_path")
+@click.option("--tipo", default="externo", show_default=True,
+              help="Tipo de documento (ex: oficio, despacho, externo)")
+@click.option("--descricao", default="", help="Descrição do documento")
+@click.option("--data", "data_elaboracao", default=None,
+              help="Data de elaboração (DD/MM/YYYY). Padrão: hoje")
+@click.option("--conferencia", "tipo_conferencia", default="4", show_default=True,
+              help="Tipo de conferência: 1=Cópia Simples, 2=Auth Adm, 3=Auth Cartório, 4=Original")
+@click.option("--nivel", "nivel_acesso", default="0", show_default=True,
+              help="Nível de acesso: 0=Público, 1=Restrito, 2=Sigiloso")
+@click.option("--numero", default="", help="Número do documento (opcional)")
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes)")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def upload_cmd(
+    id_procedimento: str,
+    file_path: str,
+    tipo: str,
+    descricao: str,
+    data_elaboracao: str | None,
+    tipo_conferencia: str,
+    nivel_acesso: str,
+    numero: str,
+    unit: str | None,
+    as_json: bool,
+) -> None:
+    """Anexar um PDF como Documento Externo em um processo.
+
+    ID_PROCEDIMENTO: Internal SEI process ID (numeric).
+    FILE_PATH: Caminho para o arquivo PDF a ser anexado.
+
+    Faz o upload do arquivo como documento externo no processo SEI.
+    Diferente de 'criar documento' — anexa um arquivo existente.
+    """
+    import os
+    if not os.path.exists(file_path):
+        if as_json:
+            _emit({"ok": False, "error": f"Arquivo não encontrado: {file_path}"}, True)
+        else:
+            console.print(f"[red]❌ Arquivo não encontrado: {file_path}[/red]")
+        raise SystemExit(1)
+
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        try:
+            id_doc = client.upload_external_document(
+                id_procedimento,
+                file_path,
+                tipo,
+                nivel_acesso=nivel_acesso,
+                descricao=descricao,
+                data_elaboracao=data_elaboracao,
+                tipo_conferencia=tipo_conferencia,
+                numero=numero,
+            )
+        except (RuntimeError, FileNotFoundError) as e:
+            if as_json:
+                _emit({"ok": False, "error": str(e)}, True)
+            else:
+                console.print(f"[red]❌ {e}[/red]")
+            raise SystemExit(1)
+
+    if as_json:
+        _emit({
+            "ok": True,
+            "id_documento": id_doc,
+            "id_procedimento": id_procedimento,
+            "file_path": file_path,
+        }, True)
+        return
+    console.print(f"[green]✅ Documento externo criado — id_documento: {id_doc}[/green]")
+
+
 if __name__ == "__main__":
     cli()

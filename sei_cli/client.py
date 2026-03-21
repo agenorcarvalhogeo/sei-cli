@@ -3375,6 +3375,467 @@ class SEIClient:
         """
         return self._sign_from_blocos(block_numero)
 
+    # --- Ciência (acknowledgement) ---
+
+    def give_notice_document(
+        self,
+        id_documento: str,
+        id_procedimento: str,
+    ) -> dict:
+        """Dar ciência em um documento específico (acknowledge a document).
+
+        Navigates to arvore_visualizar for the document, extracts the
+        ``linkCienciaDocumento`` JS variable, and GETs that URL.  If the
+        server returns a confirmation form, it is submitted automatically.
+
+        Supports _auto_unit_switch so it works across units.
+
+        Args:
+            id_documento: Document internal ID.
+            id_procedimento: Process ID containing the document.
+
+        Returns:
+            dict with 'ok' (bool), 'message' (str), 'id_documento'.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado ou sessão expirada"
+            )
+
+        with self._auto_unit_switch(arvore_html) as switched_to:
+            if switched_to:
+                arvore_html = self._navigate_to_arvore(id_procedimento)
+                if not arvore_html:
+                    raise RuntimeError(
+                        f"Processo {id_procedimento} não acessível na unidade {switched_to}"
+                    )
+
+            # Find arvore_visualizar URL for this document
+            doc_pattern = re.compile(
+                rf'controlador\.php\?acao=arvore_visualizar[^"]*'
+                rf'id_documento={re.escape(id_documento)}[^"]*'
+            )
+            doc_match = doc_pattern.search(arvore_html)
+            if not doc_match:
+                return {
+                    "ok": False,
+                    "message": f"Documento {id_documento} não encontrado na árvore do processo",
+                    "id_documento": id_documento,
+                }
+
+            sel_url = self._sei_url(doc_match.group().replace('&amp;', '&'))
+            r_sel = self._get(sel_url)
+
+            # Extract linkCienciaDocumento from JS
+            # Pattern: var linkCienciaDocumento = 'controlador.php?acao=documento_ciencia&...&id_documento=';
+            # The id_documento= is empty in the variable (appended dynamically by JS)
+            ciencia_match = re.search(
+                r"var\s+linkCienciaDocumento\s*=\s*'([^']+)'",
+                r_sel.text,
+            )
+            if not ciencia_match:
+                return {
+                    "ok": False,
+                    "message": f"Ação 'Dar Ciência' não disponível para o documento {id_documento}. "
+                               "O documento pode já ter sido lido ou não permite ciência.",
+                    "id_documento": id_documento,
+                }
+
+            # Build full URL: variable ends with 'id_documento=' (no value)
+            ciencia_url_raw = ciencia_match.group(1).replace('&amp;', '&')
+            # Append the actual id_documento value if not already present
+            if ciencia_url_raw.endswith('id_documento='):
+                ciencia_url_raw = ciencia_url_raw + id_documento
+            elif 'id_documento=' not in ciencia_url_raw:
+                ciencia_url_raw = ciencia_url_raw + f'&id_documento={id_documento}'
+
+            ciencia_url = urljoin(self._sei_url(""), ciencia_url_raw)
+            r_ciencia = self._get(ciencia_url)
+            self._control_html = None
+
+            return self._handle_ciencia_response(r_ciencia, id_documento)
+
+    def give_notice_process(self, id_procedimento: str) -> dict:
+        """Dar ciência no processo inteiro (acknowledge entire process).
+
+        Navigates to arvore_visualizar for the process root, extracts
+        ``linkCienciaProcesso`` JS variable, and GETs that URL.  If the
+        server returns a confirmation form, it is submitted automatically.
+
+        Supports _auto_unit_switch so it works across units.
+
+        Args:
+            id_procedimento: Process internal ID.
+
+        Returns:
+            dict with 'ok' (bool), 'message' (str), 'id_procedimento'.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado ou sessão expirada"
+            )
+
+        with self._auto_unit_switch(arvore_html) as switched_to:
+            if switched_to:
+                arvore_html = self._navigate_to_arvore(id_procedimento)
+                if not arvore_html:
+                    raise RuntimeError(
+                        f"Processo {id_procedimento} não acessível na unidade {switched_to}"
+                    )
+
+            # Load arvore_visualizar for the process root (no id_documento)
+            proc_vis_match = re.search(
+                rf'controlador\.php\?acao=arvore_visualizar[^"]*'
+                rf'id_procedimento={re.escape(id_procedimento)}[^"]*',
+                arvore_html,
+            )
+            if proc_vis_match:
+                # Remove id_documento if present (we want the process-level view)
+                vis_url_raw = proc_vis_match.group().replace('&amp;', '&')
+                vis_url_raw = re.sub(r'&id_documento=\d+', '', vis_url_raw)
+                vis_url = self._sei_url(vis_url_raw)
+                r_vis = self._get(vis_url)
+                tree_html = r_vis.text
+            else:
+                tree_html = arvore_html
+
+            # Extract linkCienciaProcesso from JS
+            ciencia_match = re.search(
+                r"var\s+linkCienciaProcesso\s*=\s*'([^']+)'",
+                tree_html,
+            )
+            if not ciencia_match:
+                # Also check for linkCienciaProcessoAnexado as fallback
+                ciencia_match = re.search(
+                    r"var\s+linkCienciaProcessoAnexado\s*=\s*'([^']+)'",
+                    tree_html,
+                )
+            if not ciencia_match:
+                return {
+                    "ok": False,
+                    "message": f"Ação 'Dar Ciência' não disponível para o processo {id_procedimento}. "
+                               "O processo pode já ter sido lido ou não permite ciência.",
+                    "id_procedimento": id_procedimento,
+                }
+
+            ciencia_url_raw = ciencia_match.group(1).replace('&amp;', '&')
+            ciencia_url = urljoin(self._sei_url(""), ciencia_url_raw)
+            r_ciencia = self._get(ciencia_url)
+            self._control_html = None
+
+            result = self._handle_ciencia_response(r_ciencia, id_procedimento)
+            result['id_procedimento'] = id_procedimento
+            return result
+
+    def _handle_ciencia_response(self, response: "httpx.Response", entity_id: str) -> dict:
+        """Parse the server response after a ciência GET request.
+
+        SEI may return:
+        - A simple success redirect (back to arvore/process page)
+        - A confirmation form (if confirmation required)
+        - An error message
+
+        Args:
+            response: HTTP response from the ciência GET.
+            entity_id: Document or process ID (for error messages).
+
+        Returns:
+            dict with 'ok', 'message', and optionally other fields.
+        """
+        final_url = str(response.url)
+
+        # If there's a confirmation form, submit it
+        soup = BeautifulSoup(response.text, 'lxml')
+        confirm_form = soup.find('form', id='frmCiencia')
+        if not confirm_form:
+            # Try generic form with ciência-related action
+            for form in soup.find_all('form'):
+                action = form.get('action', '')
+                if 'ciencia' in action.lower():
+                    confirm_form = form
+                    break
+
+        if confirm_form:
+            action_url = urljoin(self._sei_url(""), confirm_form.get('action', ''))
+            form_data: dict[str, str] = {}
+            for inp in confirm_form.find_all('input'):
+                name = inp.get('name', '')
+                if name and inp.get('type') != 'button':
+                    form_data[name] = inp.get('value', '')
+            # Add submit button value if present
+            submit_btn = confirm_form.find('input', {'type': 'submit'})
+            if not submit_btn:
+                submit_btn = confirm_form.find('button', {'type': 'submit'})
+            if submit_btn and submit_btn.get('name'):
+                form_data[submit_btn['name']] = submit_btn.get('value', 'Confirmar')
+
+            r2 = self._post(action_url, form_data)
+            response = r2
+            final_url = str(r2.url)
+            soup = BeautifulSoup(r2.text, 'lxml')
+
+        # Check for error messages
+        error_patterns = ['erro', 'falha', 'não foi possível', 'nao foi possivel']
+        page_text_lower = response.text.lower()
+        for pat in error_patterns:
+            if pat in page_text_lower:
+                # Check if it's actually an error section
+                err_div = soup.find(class_=re.compile(r'(alert|erro|infraMsg)', re.I))
+                if err_div:
+                    return {
+                        "ok": False,
+                        "message": err_div.get_text(strip=True)[:200],
+                        "id": entity_id,
+                    }
+
+        # Success: redirected to process/arvore or received a success message
+        if ('arvore_visualizar' in final_url
+                or 'procedimento_trabalhar' in final_url
+                or 'procedimento_controlar' in final_url):
+            return {"ok": True, "message": "Ciência registrada com sucesso", "id": entity_id}
+
+        # Check for SEI success messages in the page
+        success_msgs = soup.find_all(string=re.compile(r'ciência', re.I))
+        if success_msgs:
+            return {"ok": True, "message": "Ciência registrada com sucesso", "id": entity_id}
+
+        # Default: assume success (no error = OK for SEI)
+        return {"ok": True, "message": "Ciência registrada (verificar no SEI)", "id": entity_id}
+
+    # --- Upload external document ---
+
+    def upload_external_document(
+        self,
+        id_procedimento: str,
+        file_path: str,
+        tipo: str = "externo",
+        *,
+        nivel_acesso: str = "0",
+        descricao: str = "",
+        data_elaboracao: str | None = None,
+        tipo_conferencia: str = "4",
+        numero: str = "",
+    ) -> str:
+        """Upload a PDF as an external document (Documento Externo) to a process.
+
+        Flow:
+          1. Navigate to arvore → get "Incluir Documento" URL
+          2. Submit type selection with rdoFormato=E (Externo)
+          3. Fill the cadastro form (date, description, access level, etc.)
+          4. Upload file via multipart POST to controlador_ajax.php?acao_ajax=upload_arquivo
+          5. Build hdnAnexos string with ± separator in Latin-1 encoding
+          6. Submit the cadastro form with hdnAnexos
+
+        CRITICAL: The ± separator (U+00B1) MUST be encoded as Latin-1 \\xb1.
+        The SEI server uses ISO-8859-1 throughout.
+
+        Args:
+            id_procedimento: Process ID.
+            file_path: Path to the PDF file to upload.
+            tipo: Document type key or id_serie. Defaults to 'externo' (-1).
+            nivel_acesso: '0' (Público), '1' (Restrito), '2' (Sigiloso).
+            descricao: Document description.
+            data_elaboracao: Date in DD/MM/YYYY format. Defaults to today.
+            tipo_conferencia: Type of copy:
+                '1' = Cópia Simples
+                '2' = Cópia Autenticada Administrativamente
+                '3' = Cópia Autenticada por Cartório
+                '4' = Documento Original (default)
+            numero: Optional document number.
+
+        Returns:
+            id_documento of the newly created external document.
+
+        Raises:
+            RuntimeError: If any step fails.
+            FileNotFoundError: If file_path does not exist.
+        """
+        import os
+        import mimetypes
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Arquivo não encontrado: {file_path}")
+
+        if data_elaboracao is None:
+            from datetime import date
+            data_elaboracao = date.today().strftime('%d/%m/%Y')
+
+        # Resolve tipo to id_serie
+        id_serie = self.DOC_TYPES.get(tipo.lower().replace(' ', '_'), tipo)
+
+        # Step 1: Navigate to arvore, find "Incluir Documento" URL
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado ou sessão expirada"
+            )
+
+        href_match = re.search(
+            r'href="([^"]+)"[^>]*>\s*<img\s+[^>]*documento_incluir',
+            arvore_html,
+        )
+        if not href_match:
+            raise RuntimeError("Link 'Incluir Documento' não encontrado na árvore")
+
+        incl_url = urljoin(self._sei_url(""), href_match.group(1))
+        rtype = self._get(incl_url)
+
+        # Step 2: Submit type selection form
+        tsoup = BeautifulSoup(rtype.text, 'lxml')
+        form = tsoup.find('form', id='frmDocumentoEscolherTipo')
+        if not form:
+            raise RuntimeError("Formulário de escolha de tipo não encontrado")
+
+        form_action = urljoin(self._sei_url(""), form['action'])
+        fdata: dict[str, str] = {}
+        for inp in form.find_all('input'):
+            n = inp.get('name', '')
+            if n:
+                fdata[n] = inp.get('value', '')
+        fdata['hdnIdSerie'] = id_serie
+
+        rcadastro = self._post(form_action, fdata)
+        csoup = BeautifulSoup(rcadastro.text, 'lxml')
+
+        # Step 3: Parse cadastro form (frmDocumentoCadastro)
+        cform = csoup.find('form', id='frmDocumentoCadastro')
+        if not cform:
+            raise RuntimeError(
+                f"Formulário de cadastro não encontrado para tipo '{tipo}' "
+                f"(id_serie={id_serie})"
+            )
+
+        cform_action = urljoin(self._sei_url(""), cform['action'])
+
+        # Collect current form values
+        cdata: dict[str, str] = {}
+        for inp in cform.find_all('input'):
+            n = inp.get('name', '')
+            if not n:
+                continue
+            t = inp.get('type', '')
+            if t == 'radio':
+                if inp.get('checked'):
+                    cdata[n] = inp.get('value', '')
+            elif t not in ('button', 'submit'):
+                cdata[n] = inp.get('value', '')
+        for sel in cform.find_all('select'):
+            n = sel.get('name', '')
+            if n:
+                selected = sel.find('option', selected=True)
+                cdata[n] = selected['value'] if selected else ''
+
+        # Override with our values
+        cdata['hdnFlagDocumentoCadastro'] = '2'
+        cdata['rdoFormato'] = 'E'              # Externo (not N=Nato-digital)
+        cdata['rdoNivelAcesso'] = nivel_acesso
+        cdata['selSerie'] = id_serie
+        cdata['hdnIdSerie'] = id_serie
+        cdata['txtDataElaboracao'] = data_elaboracao
+        cdata['selTipoConferencia'] = tipo_conferencia
+        cdata['hdnAnexos'] = ''                 # Will be set after upload
+
+        if descricao:
+            cdata['txtDescricao'] = descricao
+        if numero:
+            cdata['txtNumero'] = numero
+
+        # Step 4: Upload file via AJAX multipart POST
+        upload_url = self._sei_url(
+            'controlador_ajax.php?acao_ajax=upload_arquivo'
+            f'&infra_sistema=100000100'
+        )
+        # Add infra_hash if available
+        if 'upload_arquivo' in self._hash_pool:
+            h = self._hash_pool['upload_arquivo'][-1]
+            upload_url = upload_url + f'&infra_hash={h}'
+
+        file_name = os.path.basename(file_path)
+        mime_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
+
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
+
+        # Build multipart form data
+        # SEI uses field name 'hdnAnexoNome' but the actual file upload field
+        # may vary. Try standard multipart with 'file' and 'Filedata'.
+        import httpx as _httpx
+        files = {'Filedata': (file_name, file_content, mime_type)}
+        r_upload = self.client.post(upload_url, files=files)
+        r_upload = self._follow_upload(r_upload)
+
+        upload_response = r_upload.text.strip()
+        # Response format: hash#filename#mimetype#size#datetime#
+        # or error indicator
+        if not upload_response or '#' not in upload_response:
+            raise RuntimeError(
+                f"Upload falhou. Resposta do servidor: {upload_response!r}"
+            )
+
+        # Step 5: Build hdnAnexos string with ± separator in Latin-1
+        # Format: hash±filename±datetime±size±pages±user_id±unit_name
+        # Parse upload response: hash#filename#mimetype#size#datetime#
+        parts = upload_response.rstrip('#').split('#')
+        if len(parts) < 5:
+            raise RuntimeError(
+                f"Resposta de upload inesperada: {upload_response!r}"
+            )
+        hash_val = parts[0]
+        fname = parts[1]
+        # mimetype = parts[2]
+        fsize = parts[3]
+        fdatetime = parts[4] if len(parts) > 4 else data_elaboracao
+
+        # Gather user_id and unit from the form's hidden fields
+        user_id = cdata.get('hdnIdUsuario', '')
+        unit_name = ''  # SEI fills this from session; leave empty if unknown
+
+        # Build hdnAnexos with ± (U+00B1 = Latin-1 \xb1) separator
+        # The value must be a Latin-1 string (will be encoded by _post)
+        sep = '\xb1'  # Latin-1 ± character
+        hdn_anexos = sep.join([
+            hash_val,
+            fname,
+            fdatetime,
+            fsize,
+            '0',        # pages (unknown at this point)
+            user_id,
+            unit_name,
+        ])
+        cdata['hdnAnexos'] = hdn_anexos
+
+        # Step 6: Submit the cadastro form with all fields
+        r_created = self._post(cform_action, cdata)
+        self._control_html = None
+
+        # Parse response for new document ID
+        url_str = str(r_created.url)
+        id_doc_match = re.search(r'id_documento=(\d+)', url_str)
+        if not id_doc_match:
+            id_doc_match = re.search(r'id_documento=(\d+)', r_created.text)
+
+        if id_doc_match:
+            return id_doc_match.group(1)
+
+        # Check for error
+        esoup = BeautifulSoup(r_created.text, 'lxml')
+        val = esoup.find('textarea', {'id': 'txaInfraValidacao'})
+        if val and val.get_text(strip=True):
+            raise RuntimeError(
+                f"SEI rejeitou o documento externo: {val.get_text(strip=True)[:200]}"
+            )
+
+        raise RuntimeError(
+            "Documento externo submetido mas id_documento não encontrado na resposta. "
+            f"URL final: {url_str}"
+        )
+
+    def _follow_upload(self, response: "httpx.Response") -> "httpx.Response":
+        """Follow redirects for an upload response (no hash harvesting needed)."""
+        return auth._follow(self.client, response, self.base_url)
+
     def sign_document(self, id_documento: str, id_procedimento: str) -> dict:
         """Sign a single document by ID (from process tree).
 
@@ -3420,66 +3881,45 @@ class SEIClient:
         *,
         _reuse_process: bool = False,
     ) -> dict:
-        """Internal: navigate to a document in the process tree and sign/authenticate it."""
-        html = self._ensure_control()
+        """Internal: navigate to a document in the process tree and sign/authenticate it.
 
-        if not _reuse_process:
-            # Navigate to process
-            proc_url = (
-                self._sei_url("controlador.php")
-                + f"?acao=procedimento_trabalhar&id_procedimento={id_procedimento}"
+        Now supports _auto_unit_switch: if the document belongs to another unit,
+        automatically switches to that unit and restores the original after signing.
+        """
+        # Navigate to arvore using _navigate_to_arvore (handles session refresh)
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            return {"error": f"Processo {id_procedimento} não encontrado ou sessão expirada"}
+
+        with self._auto_unit_switch(arvore_html) as switched_to:
+            if switched_to:
+                # Re-fetch arvore from the correct unit
+                arvore_html = self._navigate_to_arvore(id_procedimento)
+                if not arvore_html:
+                    return {
+                        "error": f"Processo {id_procedimento} não acessível na unidade {switched_to}"
+                    }
+
+            # Find the specific document's arvore_visualizar URL
+            doc_pattern = re.compile(
+                rf'controlador\.php\?acao=arvore_visualizar[^"]*id_documento={id_documento}[^"]*'
             )
-            # Find with valid hash
-            soup = BeautifulSoup(html, "lxml")
-            proc_link = None
-            for a in soup.find_all("a"):
-                href = a.get("href", "")
-                if "procedimento_trabalhar" in href and id_procedimento in href:
-                    proc_link = urljoin(self._sei_url(""), href)
-                    break
+            doc_match = doc_pattern.search(arvore_html)
+            if not doc_match:
+                return {"error": f"Documento {id_documento} não encontrado na árvore"}
 
-            if not proc_link:
-                # Fallback: use direct URL (works when process is in current unit)
-                proc_link = proc_url
+            doc_url = urljoin(self._sei_url(""), doc_match.group())
+            rd = self._get(doc_url)
 
-            self._last_process_resp = self._get(proc_link)
-        else:
-            # Re-navigate to process to refresh arvore
-            proc_url = (
-                self._sei_url("controlador.php")
-                + f"?acao=procedimento_trabalhar&id_procedimento={id_procedimento}"
-            )
-            self._last_process_resp = self._get(proc_url)
+            # Extract linkAssinarDocumento
+            sign_match = re.search(r"var\s+linkAssinarDocumento\s*=\s*'([^']+)'", rd.text)
+            if not sign_match:
+                return {"error": "Link de assinatura/autenticação não encontrado para este documento"}
 
-        rp = self._last_process_resp
-        psoup = BeautifulSoup(rp.text, "lxml")
-        iframe = psoup.find("iframe", {"name": "ifrArvore"})
-        if not iframe:
-            return {"error": "Árvore de documentos não encontrada"}
+            sign_url = urljoin(self._sei_url(""), sign_match.group(1))
+            self._control_html = None
 
-        arvore_url = urljoin(self._sei_url(""), iframe["src"])
-        ra = self._get(arvore_url)
-
-        # Find the specific document's arvore_visualizar URL
-        doc_pattern = re.compile(
-            rf'controlador\.php\?acao=arvore_visualizar[^"]*id_documento={id_documento}[^"]*'
-        )
-        doc_match = doc_pattern.search(ra.text)
-        if not doc_match:
-            return {"error": f"Documento {id_documento} não encontrado na árvore"}
-
-        doc_url = urljoin(self._sei_url(""), doc_match.group())
-        rd = self._get(doc_url)
-
-        # Extract linkAssinarDocumento
-        sign_match = re.search(r"var\s+linkAssinarDocumento\s*=\s*'([^']+)'", rd.text)
-        if not sign_match:
-            return {"error": "Link de assinatura/autenticação não encontrado para este documento"}
-
-        sign_url = urljoin(self._sei_url(""), sign_match.group(1))
-        self._control_html = None
-
-        return self._execute_sign(sign_url, id_documento)
+            return self._execute_sign(sign_url, id_documento)
 
     def _sign_from_blocos(self, block_numero: str) -> dict:
         """Navigate to blocos, find the block, and sign its documents."""
