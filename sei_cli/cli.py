@@ -118,16 +118,20 @@ def process_cmd(numero: str, unit: str | None, as_json: bool) -> None:
     with SEIClient() as client:
         if unit:
             client.switch_unit(unit)
-        # Se parece número de processo (tem ponto/barra), resolve via goto
+        # Se parece número de processo (tem ponto/barra), resolve via search
+        process_html = None
         if "." in numero or "/" in numero:
-            result = client.search_document(numero)
-            if not result:
+            import re as _re
+            html = client.search(numero)
+            if "ifrArvore" not in html:
                 click.echo(f"❌ Processo '{numero}' não encontrado", err=True)
                 raise SystemExit(1)
-            id_proc = result[1]
+            id_proc_m = _re.search(r"id_procedimento=(\d+)", html)
+            id_proc = id_proc_m.group(1) if id_proc_m else numero
+            process_html = html
         else:
             id_proc = numero
-        docs = client.get_process_documents(id_proc)
+        docs = client.get_process_documents(id_proc, process_html=process_html)
 
     if as_json:
         _emit([asdict(d) for d in docs], True)
@@ -251,7 +255,7 @@ def goto_cmd(numero: str, as_json: bool, do_read: bool, unit: str | None) -> Non
                 id_proc_m = re.search(r"id_procedimento=(\d+)", html)
                 id_proc = id_proc_m.group(1) if id_proc_m else "?"
                 if as_json:
-                    docs = client.get_process_documents(id_proc) if id_proc != "?" else []
+                    docs = client.get_process_documents(id_proc, process_html=html) if id_proc != "?" else []
                     _emit({
                         "tipo": "processo",
                         "numero": numero,
@@ -261,7 +265,7 @@ def goto_cmd(numero: str, as_json: bool, do_read: bool, unit: str | None) -> Non
                 else:
                     console.print(f"[green]✅ Processo {numero}[/green] (id_procedimento={id_proc})")
                     if id_proc != "?":
-                        docs = client.get_process_documents(id_proc)
+                        docs = client.get_process_documents(id_proc, process_html=html)
                         table = Table(title=f"Documentos ({len(docs)})")
                         table.add_column("ID")
                         table.add_column("Nome")
@@ -566,6 +570,116 @@ def read_relatorio_cmd(
     if summary or not as_json:
         click.echo(_summarize(r))
         return
+
+
+@cli.command("authenticate")
+@click.argument("id_procedimento")
+@click.argument("id_documentos", nargs=-1, required=True)
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes)")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def authenticate_cmd(
+    id_procedimento: str,
+    id_documentos: tuple[str, ...],
+    unit: str | None,
+    as_json: bool,
+) -> None:
+    """Authenticate (autenticar) external documents in a process.
+
+    Usage: sei authenticate <id_procedimento> <doc1> <doc2> ...
+
+    External documents (PDFs uploaded to SEI) need authentication
+    instead of signing.  The mechanism is identical to signing but
+    the SEI UI labels it "Autenticação de Documento".
+    """
+    with SEIClient() as client:
+        client.login()
+        if unit:
+            client.switch_unit(unit)
+        results = client.authenticate_documents(list(id_documentos), id_procedimento)
+
+    if as_json:
+        click.echo(json.dumps(results, ensure_ascii=False, indent=2))
+        return
+
+    for r in results:
+        doc_id = r.get("id_documento", "?")
+        if r.get("error"):
+            console.print(f"❌ Doc {doc_id}: {r['error']}")
+        elif r.get("already_signed"):
+            console.print(f"✅ Doc {doc_id}: já autenticado")
+        elif r.get("signed"):
+            console.print(f"✅ Doc {doc_id}: autenticado com sucesso")
+        else:
+            console.print(f"⚠️  Doc {doc_id}: resultado indefinido — {r}")
+
+
+@cli.command("download-pdf")
+@click.argument("id_procedimento")
+@click.option("-o", "--output", default=None, help="Output PDF path")
+@click.option("--unit", default=None, help="Switch unit before download")
+@click.option("--json", "as_json", is_flag=True)
+def download_pdf_cmd(id_procedimento: str, output: str | None, unit: str | None, as_json: bool) -> None:
+    """Download process PDF via SEI's native PDF generation.
+
+    ID_PROCEDIMENTO: Internal SEI process ID (numeric).
+
+    Downloads the full process as a single PDF using SEI's
+    'Gerar PDF do Processo' feature.
+    """
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        try:
+            path = client.download_pdf(id_procedimento, output_path=output)
+        except RuntimeError as e:
+            if as_json:
+                _emit({"ok": False, "error": str(e)}, True)
+            else:
+                console.print(f"[red]❌ {e}[/red]")
+            raise SystemExit(1)
+
+    if as_json:
+        _emit({"ok": True, "path": path, "id_procedimento": id_procedimento}, True)
+        return
+    console.print(f"[green]✅ PDF salvo em: {path}[/green]")
+
+
+@cli.command("download-doc-pdf")
+@click.argument("id_documento")
+@click.argument("id_procedimento")
+@click.option("-o", "--output", default=None, help="Output PDF path")
+@click.option("--unit", default=None, help="Switch unit before download")
+@click.option("--json", "as_json", is_flag=True)
+def download_doc_pdf_cmd(
+    id_documento: str,
+    id_procedimento: str,
+    output: str | None,
+    unit: str | None,
+    as_json: bool,
+) -> None:
+    """Download a single document as PDF via SEI's documento_gerar_pdf.
+
+    ID_DOCUMENTO: Internal SEI document ID (numeric).
+    ID_PROCEDIMENTO: Internal SEI process ID containing the document.
+    """
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        try:
+            path = client.download_document_pdf(
+                id_documento, id_procedimento, output_path=output
+            )
+        except RuntimeError as e:
+            if as_json:
+                _emit({"ok": False, "error": str(e)}, True)
+            else:
+                console.print(f"[red]❌ {e}[/red]")
+            raise SystemExit(1)
+
+    if as_json:
+        _emit({"ok": True, "path": path, "id_documento": id_documento}, True)
+        return
+    console.print(f"[green]✅ PDF salvo em: {path}[/green]")
 
 
 if __name__ == "__main__":

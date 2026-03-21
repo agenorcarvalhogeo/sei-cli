@@ -382,48 +382,72 @@ class SEIClient:
         html = self._ensure_control()
         return parse_processes(html, base_url=self._sei_url(""))
 
-    def get_process_documents(self, id_procedimento: str) -> list[Document]:
-        """Get document tree for a process by navigating to it and parsing the JS tree."""
-        html = self._ensure_control()
-        
-        # Find the process link
-        soup = BeautifulSoup(html, "lxml")
-        proc_link = None
-        for a in soup.find_all("a"):
-            href = a.get("href", "")
-            if "procedimento_trabalhar" in href and id_procedimento in href:
-                proc_link = urljoin(self._sei_url(""), href)
-                break
-        
-        if not proc_link:
-            # Try constructing URL from infra_hash
-            hashes = re.findall(r'infra_hash=([a-f0-9]{64})', html)
-            if hashes:
-                proc_link = (
-                    self._sei_url("controlador.php")
-                    + f"?acao=procedimento_trabalhar&id_procedimento={id_procedimento}"
-                    + f"&infra_sistema=100000100&infra_hash={hashes[0]}"
-                )
-        
-        if not proc_link:
-            return []
-        
-        # Navigate to process page
-        r = self._get(proc_link)
-        psoup = BeautifulSoup(r.text, "lxml")
-        
+    def get_process_documents(
+        self, id_procedimento: str, *, process_html: str | None = None
+    ) -> list[Document]:
+        """Get document tree for a process by parsing the JS tree.
+
+        Args:
+            id_procedimento: The internal SEI procedure ID.
+            process_html: If provided, skip navigation and extract the
+                ifrArvore iframe directly from this HTML (e.g. the page
+                returned by ``search()``).  This avoids hash-invalidation
+                issues that occur when navigating from the control page.
+        """
+        if process_html is not None:
+            # Fast path: caller already has the process page HTML
+            psoup = BeautifulSoup(process_html, "lxml")
+        else:
+            # Legacy path: navigate from control page
+            psoup = self._navigate_to_process_page(id_procedimento)
+            if psoup is None:
+                return []
+
         # Find ifrArvore iframe
         iframe = psoup.find("iframe", {"name": "ifrArvore"})
         if not iframe or not iframe.get("src"):
             return []
-        
+
         arvore_url = urljoin(self._sei_url(""), iframe["src"])
         ra = self._get(arvore_url)
-        
-        # Need to re-login after navigating away from control page
+
+        # Invalidate control page cache after navigating away
         self._control_html = None
-        
+
         return parse_document_tree(ra.text, base_url=self._sei_url(""))
+
+    def _navigate_to_process_page(self, id_procedimento: str):
+        """Navigate to a process page and return its BeautifulSoup, or None.
+
+        Strategy order:
+        1. Look for a direct link with valid hash in the control page
+           (works when the process is in the inbox).
+        2. Use pesquisa rápida (search) which generates its own valid hash
+           (works for formatted process numbers like 08810198.000066/2026-91,
+           but NOT for bare numeric id_procedimento values).
+        """
+        # Strategy 1: direct link from control page (preserves valid hash)
+        html = self._ensure_control()
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.find_all("a"):
+            href = a.get("href", "")
+            if "procedimento_trabalhar" in href and id_procedimento in href:
+                proc_link = urljoin(self._sei_url(""), href)
+                r = self._get(proc_link)
+                if "ifrArvore" in r.text:
+                    self._control_html = None
+                    return BeautifulSoup(r.text, "lxml")
+                break
+
+        # Strategy 2: pesquisa rápida — valid for formatted SEI numbers
+        try:
+            result_html = self.search(id_procedimento)
+            if "ifrArvore" in result_html:
+                return BeautifulSoup(result_html, "lxml")
+        except Exception:
+            pass
+
+        return None
 
     # --- Process creation ---
 
@@ -517,9 +541,48 @@ class SEIClient:
         if observacoes:
             data_cad["txaObservacoes"] = observacoes
 
+        # --- Fill required hidden fields from their select counterparts ---
+        # SEI JS normally syncs these on form submit; we must do it manually.
+
+        # hdnAssuntos: mandatory — JS validation rejects empty value.
+        # Mirror from selAssuntos options, or use first available.
+        if not data_cad.get("hdnAssuntos"):
+            sel_a = soup_cad.find("select", id="selAssuntos")
+            if sel_a:
+                vals = [
+                    o.get("value", "")
+                    for o in sel_a.find_all("option")
+                    if o.get("value")
+                ]
+                if vals:
+                    data_cad["hdnAssuntos"] = vals[0]
+                    data_cad["selAssuntos"] = vals[0]
+
+        # hdnInteressadosProcedimento: mirror from selInteressadosProcedimento
+        if not data_cad.get("hdnInteressadosProcedimento"):
+            sel_i = soup_cad.find("select", id="selInteressadosProcedimento")
+            if sel_i:
+                vals = [
+                    o.get("value", "")
+                    for o in sel_i.find_all("option")
+                    if o.get("value")
+                ]
+                if vals:
+                    data_cad["hdnInteressadosProcedimento"] = "|".join(vals) + "|"
+
         # Submit creation
         r_create = self._post(action_cad, data_cad)
         self._control_html = None
+
+        # Detect silent form reload (server-side validation failure).
+        # When SEI rejects the form, it re-renders "Iniciar Processo" with
+        # hdnFlagProcedimentoCadastro back on the page — not a redirect.
+        if "frmProcedimentoCadastro" in r_create.text and "Iniciar Processo" in r_create.text:
+            raise RuntimeError(
+                "SEI create_process: server reloaded the form instead of "
+                "saving. Likely missing required field (hdnAssuntos, "
+                "rdoNivelAcesso, or interessado). Check form data."
+            )
 
         # Parse response for process number
         url_str = str(r_create.url)
@@ -2477,6 +2540,11 @@ class SEIClient:
         Args:
             save_url: The editor_salvar URL (from get_editor_sections).
             sections: List of EditorSection with modified content.
+                **Important:** section content must be raw HTML (e.g.
+                ``<p class="Texto_Justificado">text</p>``).
+                Do NOT html.escape() the content — the HTTP POST handles
+                URL-encoding automatically. Double-escaping causes the
+                SEI editor to render raw ``&lt;p&gt;`` tags as text.
 
         Returns:
             True if save succeeded.
@@ -2743,6 +2811,232 @@ class SEIClient:
             "relatorios": [r.__dict__ for r in parsed],
         }
 
+    def download_pdf(
+        self,
+        id_procedimento: str,
+        output_path: str | None = None,
+        id_documento: str | None = None,
+    ) -> str:
+        """Download a process as PDF via procedimento_gerar_pdf.
+
+        Implements the 7-step flow discovered through reverse-engineering:
+        1. Navigate to arvore (get valid infra_hash)
+        2. Find process-level procedimento_gerar_pdf URL (no id_documento)
+        3. GET the gerar page
+        4. Extract form action from the page via regex
+        5. POST with hdnFlagGerar=1 and rdoTipo=T
+        6. Extract iframe src from JavaScript (.src = 'controlador.php?acao=exibir_arquivo...')
+           and clean whitespace/non-printable chars (WAF rejects dirty URLs)
+        7. GET the PDF binary
+
+        Args:
+            id_procedimento: Process internal ID.
+            output_path: Where to save the PDF. If None, uses /tmp/sei_<id>.pdf.
+            id_documento: Unused (kept for API compatibility).
+
+        Returns:
+            Path to the downloaded PDF file.
+
+        Raises:
+            RuntimeError: If session expired, PDF URL not found, or response is not a PDF.
+        """
+        from html import unescape
+
+        if output_path is None:
+            output_path = f"/tmp/sei_{id_procedimento}.pdf"
+
+        # Step 1: Navigate to arvore to get valid infra_hash
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado ou sessão expirada"
+            )
+
+        # Step 2: Find process-level procedimento_gerar_pdf URL (no id_documento)
+        # Handles both & and &amp; separators in HTML — only value= parts matter
+        candidates = re.findall(
+            r'(controlador\.php\?acao=procedimento_gerar_pdf[^"\'<>\s]+)',
+            arvore_html,
+        )
+        page_url_raw: str | None = None
+        for url in candidates:
+            if f'id_procedimento={id_procedimento}' in url and 'id_documento=' not in url:
+                page_url_raw = url
+                break
+        if page_url_raw is None:
+            # Fallback: accept any procedimento_gerar_pdf URL for this process
+            for url in candidates:
+                if f'id_procedimento={id_procedimento}' in url:
+                    page_url_raw = url
+                    break
+        if page_url_raw is None:
+            raise RuntimeError(
+                f"Link 'Gerar PDF' não encontrado na árvore do processo {id_procedimento}. "
+                "Verifique se você tem permissão para gerar PDF deste processo."
+            )
+
+        page_url = self._sei_url(unescape(page_url_raw))
+
+        # Step 3: GET the gerar page
+        r_page = self._get(page_url)
+        if "login.php" in str(r_page.url) or "pwdSenha" in r_page.text:
+            raise RuntimeError("Sessão expirada ao acessar página de geração de PDF")
+
+        # Step 4: Extract form action from the gerar page
+        form_match = re.search(r'<form[^>]+action="([^"]+)"', r_page.text)
+        if not form_match:
+            raise RuntimeError(
+                "Formulário de geração de PDF não encontrado na página de confirmação"
+            )
+        action_url = self._sei_url(unescape(form_match.group(1)))
+
+        # Step 5: POST with Gerar flag
+        post_data: dict[str, str] = {
+            'hdnInfraTipoPagina': '2',
+            'hdnFlagGerar': '1',
+            'rdoTipo': 'T',
+        }
+        r_post = self._post(action_url, post_data)
+
+        # Step 6: Extract iframe src from JavaScript in POST response
+        # Pattern: document.getElementById(...).src = 'controlador.php?acao=exibir_arquivo...'
+        iframe_match = re.search(
+            r"\.src\s*=\s*'(controlador\.php\?acao=exibir_arquivo[^']+)'",
+            r_post.text,
+        )
+        if not iframe_match:
+            raise RuntimeError(
+                "URL do PDF não encontrada na resposta. SEI pode estar gerando o arquivo."
+            )
+        raw_url = iframe_match.group(1)
+        # Clean non-printable and whitespace chars (WAF blocks URLs with stray whitespace)
+        clean_url = ''.join(
+            ch for ch in raw_url if ch.isprintable() and ch not in ' \t\n\r'
+        )
+        full_url = self._sei_url(unescape(clean_url))
+
+        # Step 7: GET the PDF
+        r_pdf = self._get(full_url)
+        pdf_bytes = r_pdf.content
+
+        if not pdf_bytes:
+            raise RuntimeError(
+                f"Resposta vazia ao gerar PDF do processo {id_procedimento}"
+            )
+
+        with open(output_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        self._control_html = None
+        return output_path
+
+    def download_document_pdf(
+        self,
+        id_documento: str,
+        id_procedimento: str,
+        output_path: str | None = None,
+    ) -> str:
+        """Download a single document as PDF via procedimento_gerar_pdf.
+
+        Uses the same 7-step flow as download_pdf, but searches for the
+        procedimento_gerar_pdf URL that contains id_documento in the query string.
+        Note: acao is ALWAYS procedimento_gerar_pdf even for single-document PDFs.
+
+        Args:
+            id_documento: Document internal ID.
+            id_procedimento: Process ID containing the document.
+            output_path: Where to save the PDF. If None, uses /tmp/sei_doc_<id>.pdf.
+
+        Returns:
+            Path to the downloaded PDF file.
+
+        Raises:
+            RuntimeError: If session expired, PDF URL not found, or response is not a PDF.
+        """
+        from html import unescape
+
+        if output_path is None:
+            output_path = f"/tmp/sei_doc_{id_documento}.pdf"
+
+        # Step 1: Navigate to arvore to get valid infra_hash
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado ou sessão expirada"
+            )
+
+        # Step 2: Find procedimento_gerar_pdf URL that includes id_documento
+        # acao is ALWAYS procedimento_gerar_pdf even for individual documents
+        candidates = re.findall(
+            r'(controlador\.php\?acao=procedimento_gerar_pdf[^"\'<>\s]+)',
+            arvore_html,
+        )
+        page_url_raw: str | None = None
+        for url in candidates:
+            if f'id_documento={id_documento}' in url:
+                page_url_raw = url
+                break
+
+        if page_url_raw is None:
+            raise RuntimeError(
+                f"Link 'Gerar PDF' não encontrado para documento {id_documento}. "
+                "Verifique se o documento existe e se você tem permissão."
+            )
+
+        page_url = self._sei_url(unescape(page_url_raw))
+
+        # Step 3: GET the gerar page
+        r_page = self._get(page_url)
+        if "login.php" in str(r_page.url) or "pwdSenha" in r_page.text:
+            raise RuntimeError("Sessão expirada ao acessar página de geração de PDF")
+
+        # Step 4: Extract form action from the gerar page
+        form_match = re.search(r'<form[^>]+action="([^"]+)"', r_page.text)
+        if not form_match:
+            raise RuntimeError(
+                "Formulário de geração de PDF não encontrado para o documento"
+            )
+        action_url = self._sei_url(unescape(form_match.group(1)))
+
+        # Step 5: POST with Gerar flag
+        post_data: dict[str, str] = {
+            'hdnInfraTipoPagina': '2',
+            'hdnFlagGerar': '1',
+            'rdoTipo': 'T',
+        }
+        r_post = self._post(action_url, post_data)
+
+        # Step 6: Extract iframe src from JavaScript in POST response
+        iframe_match = re.search(
+            r"\.src\s*=\s*'(controlador\.php\?acao=exibir_arquivo[^']+)'",
+            r_post.text,
+        )
+        if not iframe_match:
+            raise RuntimeError(
+                f"URL do PDF não encontrada na resposta para documento {id_documento}."
+            )
+        raw_url = iframe_match.group(1)
+        # Clean non-printable and whitespace chars
+        clean_url = ''.join(
+            ch for ch in raw_url if ch.isprintable() and ch not in ' \t\n\r'
+        )
+        full_url = self._sei_url(unescape(clean_url))
+
+        # Step 7: GET the PDF
+        r_pdf = self._get(full_url)
+        pdf_bytes = r_pdf.content
+
+        if not pdf_bytes:
+            raise RuntimeError(
+                f"Resposta vazia ao gerar PDF do documento {id_documento}"
+            )
+
+        with open(output_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        self._control_html = None
+        return output_path
+
     def _navigate_to_arvore(self, id_procedimento: str) -> str | None:
         """Navigate to a process and return the arvore (tree) HTML.
 
@@ -2836,27 +3130,79 @@ class SEIClient:
         """Sign a single document by ID (from process tree).
 
         Uses the linkAssinarDocumento URL from arvore_visualizar.
+        Works for both internal (sign) and external (authenticate) documents —
+        SEI uses the same form action ``documento_assinar`` for both.
         """
+        return self._sign_or_authenticate(id_documento, id_procedimento)
+
+    def authenticate_document(self, id_documento: str, id_procedimento: str) -> dict:
+        """Authenticate an external (uploaded) document in a process.
+
+        In SEI, authenticating an external document uses the exact same
+        ``documento_assinar`` form as signing an internal document.
+        The page title changes to "Autenticação de Documento" but the
+        mechanics are identical.
+
+        Returns dict with 'doc_ids', 'signed', 'already_signed', 'errors'.
+        """
+        return self._sign_or_authenticate(id_documento, id_procedimento)
+
+    def authenticate_documents(
+        self, id_documentos: list[str], id_procedimento: str
+    ) -> list[dict]:
+        """Authenticate multiple external documents in a process.
+
+        Navigates to the process once and authenticates each document
+        sequentially.  Returns a list of result dicts (one per document).
+        """
+        results = []
+        for i, doc_id in enumerate(id_documentos):
+            result = self._sign_or_authenticate(
+                doc_id, id_procedimento, _reuse_process=(i > 0)
+            )
+            result["id_documento"] = doc_id
+            results.append(result)
+        return results
+
+    def _sign_or_authenticate(
+        self,
+        id_documento: str,
+        id_procedimento: str,
+        *,
+        _reuse_process: bool = False,
+    ) -> dict:
+        """Internal: navigate to a document in the process tree and sign/authenticate it."""
         html = self._ensure_control()
 
-        # Navigate to process
-        proc_url = (
-            self._sei_url("controlador.php")
-            + f"?acao=procedimento_trabalhar&id_procedimento={id_procedimento}"
-        )
-        # Find with valid hash
-        soup = BeautifulSoup(html, "lxml")
-        proc_link = None
-        for a in soup.find_all("a"):
-            href = a.get("href", "")
-            if "procedimento_trabalhar" in href and id_procedimento in href:
-                proc_link = urljoin(self._sei_url(""), href)
-                break
+        if not _reuse_process:
+            # Navigate to process
+            proc_url = (
+                self._sei_url("controlador.php")
+                + f"?acao=procedimento_trabalhar&id_procedimento={id_procedimento}"
+            )
+            # Find with valid hash
+            soup = BeautifulSoup(html, "lxml")
+            proc_link = None
+            for a in soup.find_all("a"):
+                href = a.get("href", "")
+                if "procedimento_trabalhar" in href and id_procedimento in href:
+                    proc_link = urljoin(self._sei_url(""), href)
+                    break
 
-        if not proc_link:
-            return {"error": f"Processo {id_procedimento} não encontrado na tela atual"}
+            if not proc_link:
+                # Fallback: use direct URL (works when process is in current unit)
+                proc_link = proc_url
 
-        rp = self._get(proc_link)
+            self._last_process_resp = self._get(proc_link)
+        else:
+            # Re-navigate to process to refresh arvore
+            proc_url = (
+                self._sei_url("controlador.php")
+                + f"?acao=procedimento_trabalhar&id_procedimento={id_procedimento}"
+            )
+            self._last_process_resp = self._get(proc_url)
+
+        rp = self._last_process_resp
         psoup = BeautifulSoup(rp.text, "lxml")
         iframe = psoup.find("iframe", {"name": "ifrArvore"})
         if not iframe:
@@ -2879,7 +3225,7 @@ class SEIClient:
         # Extract linkAssinarDocumento
         sign_match = re.search(r"var\s+linkAssinarDocumento\s*=\s*'([^']+)'", rd.text)
         if not sign_match:
-            return {"error": "Link de assinatura não encontrado para este documento"}
+            return {"error": "Link de assinatura/autenticação não encontrado para este documento"}
 
         sign_url = urljoin(self._sei_url(""), sign_match.group(1))
         self._control_html = None
@@ -2986,27 +3332,48 @@ class SEIClient:
         # Parse response for messages
         result: dict = {"doc_ids": doc_ids, "signed": [], "already_signed": [], "errors": []}
 
-        # Check for server messages
-        for msg in re.findall(
+        # Check for server messages — SEI uses multiple patterns:
+        #   <div class="alert...">  (newer SEI)
+        #   <div id="divInfraMsg..."> or class="infraMensagem" (older SEI)
+        #   Plain text with "já foi assinado" anywhere on page
+        msg_patterns = [
             r'<div[^>]*class="alert[^"]*"[^>]*>.*?</div>',
-            r.text,
-            re.DOTALL,
-        ):
-            text = BeautifulSoup(msg, "lxml").text.strip()
+            r'<div[^>]*class="infraMensagem[^"]*"[^>]*>.*?</div>',
+            r'<div[^>]*id="divInfraMsg[^"]*"[^>]*>.*?</div>',
+        ]
+        found_messages = set()
+        for pattern in msg_patterns:
+            for msg in re.findall(pattern, r.text, re.DOTALL):
+                text = BeautifulSoup(msg, "lxml").text.strip()
+                if text and text not in found_messages:
+                    found_messages.add(text)
+
+        # Also check for inline "já foi assinado" which may not be in a standard div
+        if "já foi assinado" in r.text and not any("já foi assinado" in m for m in found_messages):
+            # Extract the message around it
+            match = re.search(r'Documento\s+\d+\s+já foi assinado[^<]*', r.text)
+            if match:
+                found_messages.add(match.group().strip())
+
+        for text in found_messages:
             if "já foi assinado" in text:
                 result["already_signed"].append(text)
-            elif "assinado com sucesso" in text.lower() or "Blocos de Assinatura" in r.text:
+            elif "assinado com sucesso" in text.lower():
                 result["signed"].append(doc_ids)
-            elif "erro" in text.lower() or "não" in text.lower():
+            elif "erro" in text.lower() or "incorret" in text.lower():
                 result["errors"].append(text)
 
         # Check if redirected to blocos list (success — signed and returned)
         if "Blocos de Assinatura" in r.text and not result["signed"] and not result["already_signed"]:
             result["signed"].append(doc_ids)
 
-        # If still on sign page with no messages, docs were likely all already signed
+        # Check if redirected back to process page (success for individual doc sign/auth)
+        if "procedimento_trabalhar" in str(r.url) and not result["signed"] and not result["already_signed"] and not result["errors"]:
+            result["signed"].append(doc_ids)
+
+        # If still on sign/auth page with no messages, docs were likely all already signed
         if not result["signed"] and not result["already_signed"] and not result["errors"]:
-            if "Assinatura de Documento" in r.text:
+            if "Assinatura de Documento" in r.text or "Autenticação de Documento" in r.text:
                 # The form re-rendered but no error → all docs already signed
                 result["already_signed"].append(f"Documentos {doc_ids} já assinados")
 
