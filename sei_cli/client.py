@@ -3101,11 +3101,122 @@ class SEIClient:
         except Exception:
             return False
 
+    def _find_open_units_from_history(
+        self, arvore_html: str,
+    ) -> list[str]:
+        """Parse process history to find units where the process is currently open.
+
+        Uses ``procedimento_consultar_historico`` from the arvore tree to
+        read the andamento table, then determines open units by tracking
+        'recebido na unidade' vs 'remetido pela unidade' events.
+
+        Returns:
+            List of unit siglas where the process is currently open.
+        """
+        hist_url_match = re.search(
+            r'(controlador\.php\?acao=procedimento_consultar_historico[^"\'<>\s]+)',
+            arvore_html,
+        )
+        if not hist_url_match:
+            return []
+
+        try:
+            r = self._get(self._sei_url(hist_url_match.group(1)))
+        except Exception:
+            return []
+
+        soup = BeautifulSoup(r.text, "lxml")
+        table = soup.find("table")
+        if not table:
+            return []
+
+        rows = table.find_all("tr")[1:]  # skip header
+        # Track state per unit: most recent event wins (list is newest-first)
+        unit_state: dict[str, str] = {}
+        for row in reversed(rows):  # process oldest first
+            cells = row.find_all("td")
+            if len(cells) < 4:
+                continue
+            unidade = cells[1].get_text(strip=True)
+            desc = cells[3].get_text(strip=True)
+
+            if "recebido na unidade" in desc.lower():
+                unit_state[unidade] = "open"
+            elif "remetido pela unidade" in desc.lower():
+                # Extract the source unit from description
+                source = desc.replace("Processo remetido pela unidade", "").strip()
+                if source:
+                    unit_state[source] = "sent"
+
+        return [u for u, state in unit_state.items() if state == "open"]
+
+    def _find_accessible_unit(
+        self,
+        arvore_html: str,
+        *,
+        candidates: list[str] | None = None,
+    ) -> str | None:
+        """Find an accessible unit for a restricted process.
+
+        Strategy (ordered by preference):
+        1. Direct restriction message ('Processo aberto somente na unidade X')
+        2. Explicit candidates list (if provided)
+        3. UNIDADE_GERADORA actions (document origin units)
+        4. Process history (procedimento_consultar_historico)
+
+        Returns:
+            A unit sigla the user can switch to, or None if no accessible unit found.
+        """
+        available = {u.sigla for u in self.list_units()}
+
+        # 1. Direct restriction
+        required = self._detect_unit_restriction(arvore_html)
+        if required and required in available:
+            return required
+
+        # 2. Explicit candidates
+        if candidates:
+            for c in candidates:
+                if c in available:
+                    return c
+
+        # 3. UNIDADE_GERADORA siglas
+        doc_units = set(self._detect_document_units(arvore_html).values())
+        for u in doc_units:
+            if u in available:
+                return u
+
+        # 4. Process history (heavier — makes an HTTP request)
+        open_units = self._find_open_units_from_history(arvore_html)
+        for u in open_units:
+            if u in available:
+                return u
+
+        return None
+
+    def _is_process_inaccessible(self, arvore_html: str) -> bool:
+        """Check if documents in the arvore are inaccessible (about:blank URLs).
+
+        Returns True if ANY document has about:blank URL, indicating the
+        current unit can't view the documents.
+        """
+        return bool(
+            re.search(
+                r'new infraArvoreNo\("DOCUMENTO",[^)]*"about:blank"',
+                arvore_html,
+            )
+        )
+
     @contextlib.contextmanager
     def _auto_unit_switch(
         self, arvore_html: str, *, target_unit: str | None = None
     ) -> Iterator[str | None]:
         """Context manager: auto-switch to the required unit, restore on exit.
+
+        Handles two scenarios:
+        1. Simple: 'Processo aberto somente na unidade X' → switch to X
+        2. Complex: Documents with about:blank (restricted process) → find
+           an accessible unit via history/UNIDADE_GERADORA/candidates
 
         Usage::
 
@@ -3122,8 +3233,16 @@ class SEIClient:
         Yields:
             The unit sigla we switched to, or None if no switch was needed.
         """
-        required = target_unit or self._detect_unit_restriction(arvore_html)
-        if not required:
+        # Determine if we need to switch
+        if target_unit:
+            required = target_unit
+        elif self._is_process_inaccessible(arvore_html):
+            required = self._find_accessible_unit(arvore_html)
+            if not required:
+                # Can't find any accessible unit — yield None, let caller deal with it
+                yield None
+                return
+        else:
             yield None
             return
 

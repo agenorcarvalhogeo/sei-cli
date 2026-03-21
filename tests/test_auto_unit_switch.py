@@ -104,6 +104,7 @@ class TestAutoUnitSwitch:
             usuario="TEST",
             ultimo_acesso="",
         )
+        # list_units called by _find_accessible_unit AND _can_switch_to
         mock_units.return_value = [
             Unit(sigla="CBM - COBM - CMDO PABM APODI", descricao="PABM", link="110008367"),
             Unit(sigla="CBM - DAT - SEC  - 1°SAT/1°CAT", descricao="SAT", link="110007086"),
@@ -117,10 +118,11 @@ class TestAutoUnitSwitch:
         mock_switch.assert_any_call("CBM - COBM - CMDO PABM APODI")
         mock_switch.assert_any_call("CBM - DAT - SEC  - 1°SAT/1°CAT")
 
+    @patch.object(SEIClient, '_find_open_units_from_history', return_value=[])
     @patch.object(SEIClient, 'list_units')
     @patch.object(SEIClient, 'status')
-    def test_raises_when_no_access(self, mock_status, mock_units):
-        """Should raise RuntimeError if user can't access required unit."""
+    def test_yields_none_when_no_access(self, mock_status, mock_units, mock_hist):
+        """Should yield None (no switch) if user can't access any relevant unit."""
         from sei_cli.models import SystemStatus, Unit
         mock_status.return_value = SystemStatus(
             valid=True,
@@ -133,9 +135,8 @@ class TestAutoUnitSwitch:
             Unit(sigla="SOME OTHER UNIT", descricao="Other", link="999"),
         ]
 
-        with pytest.raises(RuntimeError, match="não tem acesso"):
-            with self.client._auto_unit_switch(ARVORE_RESTRICTED):
-                pass
+        with self.client._auto_unit_switch(ARVORE_RESTRICTED) as switched:
+            assert switched is None
 
     @patch.object(SEIClient, 'switch_unit')
     @patch.object(SEIClient, 'list_units')
@@ -171,6 +172,7 @@ class TestAutoUnitSwitch:
         )
         mock_units.return_value = [
             Unit(sigla="CBM - COBM - CMDO PABM APODI", descricao="PABM", link="110008367"),
+            Unit(sigla="CBM - DAT - SEC  - 1°SAT/1°CAT", descricao="SAT", link="110007086"),
         ]
 
         with pytest.raises(ValueError):
@@ -180,3 +182,56 @@ class TestAutoUnitSwitch:
         # Should still have tried to restore
         assert mock_switch.call_count == 2
         mock_switch.assert_any_call("CBM - DAT - SEC  - 1°SAT/1°CAT")
+
+
+class TestFindAccessibleUnit:
+    """Tests for _find_accessible_unit (multi-strategy unit discovery)."""
+
+    def setup_method(self):
+        self.client = SEIClient.__new__(SEIClient)
+
+    @patch.object(SEIClient, 'list_units')
+    def test_direct_restriction_match(self, mock_units):
+        """Strategy 1: direct 'Processo aberto somente na unidade' match."""
+        from sei_cli.models import Unit
+        mock_units.return_value = [
+            Unit(sigla="CBM - COBM - CMDO PABM APODI", descricao="PABM", link="1"),
+        ]
+        result = self.client._find_accessible_unit(ARVORE_RESTRICTED)
+        assert result == "CBM - COBM - CMDO PABM APODI"
+
+    @patch.object(SEIClient, '_find_open_units_from_history', return_value=[])
+    @patch.object(SEIClient, 'list_units')
+    def test_ug_fallback(self, mock_units, mock_hist):
+        """Strategy 3: falls back to UNIDADE_GERADORA siglas."""
+        from sei_cli.models import Unit
+        # Multi-unit: process-level restriction says '1º CAT' but user has PABM
+        mock_units.return_value = [
+            Unit(sigla="CBM - COBM - CMDO PABM APODI", descricao="PABM", link="1"),
+        ]
+        result = self.client._find_accessible_unit(ARVORE_MULTI_UNIT)
+        assert result == "CBM - COBM - CMDO PABM APODI"
+
+    @patch.object(SEIClient, '_find_open_units_from_history')
+    @patch.object(SEIClient, 'list_units')
+    def test_history_fallback(self, mock_units, mock_hist):
+        """Strategy 4: falls back to process history when other methods fail."""
+        from sei_cli.models import Unit
+        mock_units.return_value = [
+            Unit(sigla="UNIT-X", descricao="X", link="1"),
+        ]
+        mock_hist.return_value = ["UNIT-Y", "UNIT-X", "UNIT-Z"]
+        # ARVORE_RESTRICTED has about:blank docs but user doesn't have PABM APODI
+        result = self.client._find_accessible_unit(ARVORE_RESTRICTED)
+        assert result == "UNIT-X"
+
+
+class TestIsProcessInaccessible:
+    def setup_method(self):
+        self.client = SEIClient.__new__(SEIClient)
+
+    def test_detects_blank_docs(self):
+        assert self.client._is_process_inaccessible(ARVORE_RESTRICTED) is True
+
+    def test_accessible_process(self):
+        assert self.client._is_process_inaccessible(ARVORE_UNRESTRICTED) is False
