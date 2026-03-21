@@ -2570,28 +2570,10 @@ class SEIClient:
 
         return True
 
-    def view_document_html(
-        self, id_documento: str, id_procedimento: str
+    def _view_document_html_core(
+        self, id_documento: str, arvore_html: str,
     ) -> str:
-        """View a document's rendered HTML (works for signed documents too).
-
-        Uses documento_imprimir_web which renders the full document
-        including signed ones that can't be opened in the editor.
-
-        Args:
-            id_documento: Internal document ID.
-            id_procedimento: Process ID containing the document.
-
-        Returns:
-            Raw HTML content of the document body.
-        """
-        # Navigate to the process tree to establish session context
-        arvore_html = self._navigate_to_arvore(id_procedimento)
-        if not arvore_html:
-            raise RuntimeError(
-                f"Processo {id_procedimento} não encontrado"
-            )
-
+        """Core: extract and fetch document HTML from pre-fetched arvore."""
         # Find the documento_imprimir_web URL with infra_hash from the tree
         print_match = re.search(
             rf'(controlador\.php\?acao=documento_imprimir_web[^"]*'
@@ -2623,6 +2605,37 @@ class SEIClient:
             )
 
         return r.text
+
+    def view_document_html(
+        self, id_documento: str, id_procedimento: str
+    ) -> str:
+        """View a document's rendered HTML (works for signed documents too).
+
+        Uses documento_imprimir_web which renders the full document
+        including signed ones that can't be opened in the editor.
+        Automatically switches to the correct unit if needed.
+
+        Args:
+            id_documento: Internal document ID.
+            id_procedimento: Process ID containing the document.
+
+        Returns:
+            Raw HTML content of the document body.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado"
+            )
+
+        with self._auto_unit_switch(arvore_html) as switched_to:
+            if switched_to:
+                arvore_html = self._navigate_to_arvore(id_procedimento)
+                if not arvore_html:
+                    raise RuntimeError(
+                        f"Processo {id_procedimento} não acessível na unidade {switched_to}"
+                    )
+            return self._view_document_html_core(id_documento, arvore_html)
 
     def view_document(
         self, id_documento: str, id_procedimento: str
@@ -2811,69 +2824,71 @@ class SEIClient:
             "relatorios": [r.__dict__ for r in parsed],
         }
 
-    def download_pdf(
+    def _gerar_pdf_flow(
         self,
+        arvore_html: str,
         id_procedimento: str,
-        output_path: str | None = None,
+        output_path: str,
+        *,
         id_documento: str | None = None,
     ) -> str:
-        """Download a process as PDF via procedimento_gerar_pdf.
+        """Core 7-step PDF generation flow (no unit switching).
 
-        Implements the 7-step flow discovered through reverse-engineering:
-        1. Navigate to arvore (get valid infra_hash)
-        2. Find process-level procedimento_gerar_pdf URL (no id_documento)
-        3. GET the gerar page
-        4. Extract form action from the page via regex
-        5. POST with hdnFlagGerar=1 and rdoTipo=T
-        6. Extract iframe src from JavaScript (.src = 'controlador.php?acao=exibir_arquivo...')
-           and clean whitespace/non-printable chars (WAF rejects dirty URLs)
-        7. GET the PDF binary
+        Steps:
+        1. (arvore already provided)
+        2. Find procedimento_gerar_pdf URL in tree HTML
+        3. GET the gerar confirmation page
+        4. Extract form action URL
+        5. POST with hdnFlagGerar=1, rdoTipo=T
+        6. Extract exibir_arquivo URL from iframe .src in JS response
+        7. GET the actual PDF binary
 
         Args:
+            arvore_html: Pre-fetched arvore HTML.
             id_procedimento: Process internal ID.
-            output_path: Where to save the PDF. If None, uses /tmp/sei_<id>.pdf.
-            id_documento: Unused (kept for API compatibility).
+            output_path: Where to save the PDF.
+            id_documento: If set, download only this document's PDF.
 
         Returns:
             Path to the downloaded PDF file.
-
-        Raises:
-            RuntimeError: If session expired, PDF URL not found, or response is not a PDF.
         """
         from html import unescape
 
-        if output_path is None:
-            output_path = f"/tmp/sei_{id_procedimento}.pdf"
-
-        # Step 1: Navigate to arvore to get valid infra_hash
-        arvore_html = self._navigate_to_arvore(id_procedimento)
-        if not arvore_html:
-            raise RuntimeError(
-                f"Processo {id_procedimento} não encontrado ou sessão expirada"
-            )
-
-        # Step 2: Find process-level procedimento_gerar_pdf URL (no id_documento)
-        # Handles both & and &amp; separators in HTML — only value= parts matter
+        # Step 2: Find the right procedimento_gerar_pdf URL
         candidates = re.findall(
             r'(controlador\.php\?acao=procedimento_gerar_pdf[^"\'<>\s]+)',
             arvore_html,
         )
         page_url_raw: str | None = None
-        for url in candidates:
-            if f'id_procedimento={id_procedimento}' in url and 'id_documento=' not in url:
-                page_url_raw = url
-                break
-        if page_url_raw is None:
-            # Fallback: accept any procedimento_gerar_pdf URL for this process
+
+        if id_documento:
+            # Single document: find URL with id_documento
             for url in candidates:
-                if f'id_procedimento={id_procedimento}' in url:
+                if f'id_documento={id_documento}' in url:
                     page_url_raw = url
                     break
-        if page_url_raw is None:
-            raise RuntimeError(
-                f"Link 'Gerar PDF' não encontrado na árvore do processo {id_procedimento}. "
-                "Verifique se você tem permissão para gerar PDF deste processo."
-            )
+            if page_url_raw is None:
+                raise RuntimeError(
+                    f"Link 'Gerar PDF' não encontrado para documento {id_documento}. "
+                    "Verifique se o documento existe e se você tem permissão."
+                )
+        else:
+            # Whole process: find URL WITHOUT id_documento
+            for url in candidates:
+                if f'id_procedimento={id_procedimento}' in url and 'id_documento=' not in url:
+                    page_url_raw = url
+                    break
+            if page_url_raw is None:
+                # Fallback: accept any procedimento_gerar_pdf URL for this process
+                for url in candidates:
+                    if f'id_procedimento={id_procedimento}' in url:
+                        page_url_raw = url
+                        break
+            if page_url_raw is None:
+                raise RuntimeError(
+                    f"Link 'Gerar PDF' não encontrado na árvore do processo {id_procedimento}. "
+                    "Verifique se você tem permissão para gerar PDF deste processo."
+                )
 
         page_url = self._sei_url(unescape(page_url_raw))
 
@@ -2882,7 +2897,7 @@ class SEIClient:
         if "login.php" in str(r_page.url) or "pwdSenha" in r_page.text:
             raise RuntimeError("Sessão expirada ao acessar página de geração de PDF")
 
-        # Step 4: Extract form action from the gerar page
+        # Step 4: Extract form action
         form_match = re.search(r'<form[^>]+action="([^"]+)"', r_page.text)
         if not form_match:
             raise RuntimeError(
@@ -2898,18 +2913,19 @@ class SEIClient:
         }
         r_post = self._post(action_url, post_data)
 
-        # Step 6: Extract iframe src from JavaScript in POST response
-        # Pattern: document.getElementById(...).src = 'controlador.php?acao=exibir_arquivo...'
+        # Step 6: Extract iframe src from JavaScript
         iframe_match = re.search(
             r"\.src\s*=\s*'(controlador\.php\?acao=exibir_arquivo[^']+)'",
             r_post.text,
         )
         if not iframe_match:
+            label = f"documento {id_documento}" if id_documento else f"processo {id_procedimento}"
             raise RuntimeError(
-                "URL do PDF não encontrada na resposta. SEI pode estar gerando o arquivo."
+                f"URL do PDF não encontrada na resposta para {label}. "
+                "SEI pode estar gerando o arquivo."
             )
         raw_url = iframe_match.group(1)
-        # Clean non-printable and whitespace chars (WAF blocks URLs with stray whitespace)
+        # Clean non-printable and whitespace chars (WAF blocks dirty URLs)
         clean_url = ''.join(
             ch for ch in raw_url if ch.isprintable() and ch not in ' \t\n\r'
         )
@@ -2921,7 +2937,7 @@ class SEIClient:
 
         if not pdf_bytes:
             raise RuntimeError(
-                f"Resposta vazia ao gerar PDF do processo {id_procedimento}"
+                f"Resposta vazia ao gerar PDF ({id_procedimento})"
             )
 
         with open(output_path, "wb") as f:
@@ -2929,6 +2945,50 @@ class SEIClient:
 
         self._control_html = None
         return output_path
+
+    def download_pdf(
+        self,
+        id_procedimento: str,
+        output_path: str | None = None,
+        id_documento: str | None = None,
+    ) -> str:
+        """Download a process as PDF via procedimento_gerar_pdf.
+
+        Automatically switches to the correct unit if the process is
+        restricted to another unit, then switches back after download.
+
+        Args:
+            id_procedimento: Process internal ID.
+            output_path: Where to save the PDF. If None, uses /tmp/sei_<id>.pdf.
+            id_documento: Unused (kept for API compatibility).
+
+        Returns:
+            Path to the downloaded PDF file.
+
+        Raises:
+            RuntimeError: If session expired, PDF URL not found, no access to unit,
+                or response is not a PDF.
+        """
+        if output_path is None:
+            output_path = f"/tmp/sei_{id_procedimento}.pdf"
+
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado ou sessão expirada"
+            )
+
+        with self._auto_unit_switch(arvore_html) as switched_to:
+            if switched_to:
+                # Re-fetch arvore from the correct unit
+                arvore_html = self._navigate_to_arvore(id_procedimento)
+                if not arvore_html:
+                    raise RuntimeError(
+                        f"Processo {id_procedimento} não acessível mesmo na unidade {switched_to}"
+                    )
+            return self._gerar_pdf_flow(
+                arvore_html, id_procedimento, output_path,
+            )
 
     def download_document_pdf(
         self,
@@ -2938,8 +2998,7 @@ class SEIClient:
     ) -> str:
         """Download a single document as PDF via procedimento_gerar_pdf.
 
-        Uses the same 7-step flow as download_pdf, but searches for the
-        procedimento_gerar_pdf URL that contains id_documento in the query string.
+        Automatically switches to the correct unit if needed.
         Note: acao is ALWAYS procedimento_gerar_pdf even for single-document PDFs.
 
         Args:
@@ -2951,91 +3010,152 @@ class SEIClient:
             Path to the downloaded PDF file.
 
         Raises:
-            RuntimeError: If session expired, PDF URL not found, or response is not a PDF.
+            RuntimeError: If session expired, PDF URL not found, no access to unit,
+                or response is not a PDF.
         """
-        from html import unescape
-
         if output_path is None:
             output_path = f"/tmp/sei_doc_{id_documento}.pdf"
 
-        # Step 1: Navigate to arvore to get valid infra_hash
         arvore_html = self._navigate_to_arvore(id_procedimento)
         if not arvore_html:
             raise RuntimeError(
                 f"Processo {id_procedimento} não encontrado ou sessão expirada"
             )
 
-        # Step 2: Find procedimento_gerar_pdf URL that includes id_documento
-        # acao is ALWAYS procedimento_gerar_pdf even for individual documents
-        candidates = re.findall(
-            r'(controlador\.php\?acao=procedimento_gerar_pdf[^"\'<>\s]+)',
+        with self._auto_unit_switch(arvore_html) as switched_to:
+            if switched_to:
+                arvore_html = self._navigate_to_arvore(id_procedimento)
+                if not arvore_html:
+                    raise RuntimeError(
+                        f"Processo {id_procedimento} não acessível mesmo na unidade {switched_to}"
+                    )
+            return self._gerar_pdf_flow(
+                arvore_html, id_procedimento, output_path,
+                id_documento=id_documento,
+            )
+
+    # --- Unit auto-switch helpers ---
+
+    def _detect_unit_restriction(self, arvore_html: str) -> str | None:
+        """Detect if process/documents are restricted to another unit.
+
+        Parses the arvore HTML for the SEI restriction message:
+        'Processo aberto somente na unidade <a class="ancoraSigla">SIGLA</a>'
+
+        Also checks for documents with about:blank URLs (non-viewable from
+        current unit) paired with UNIDADE_GERADORA actions.
+
+        Returns:
+            The required unit sigla if a restriction is detected, None otherwise.
+        """
+        # Primary: explicit process-level restriction message
+        unit_msg = re.search(
+            r'Processo aberto somente na unidade.*?'
+            r'class="ancoraSigla">([^<]+)</a>',
             arvore_html,
         )
-        page_url_raw: str | None = None
-        for url in candidates:
-            if f'id_documento={id_documento}' in url:
-                page_url_raw = url
-                break
+        if unit_msg:
+            return unit_msg.group(1).strip()
 
-        if page_url_raw is None:
-            raise RuntimeError(
-                f"Link 'Gerar PDF' não encontrado para documento {id_documento}. "
-                "Verifique se o documento existe e se você tem permissão."
-            )
-
-        page_url = self._sei_url(unescape(page_url_raw))
-
-        # Step 3: GET the gerar page
-        r_page = self._get(page_url)
-        if "login.php" in str(r_page.url) or "pwdSenha" in r_page.text:
-            raise RuntimeError("Sessão expirada ao acessar página de geração de PDF")
-
-        # Step 4: Extract form action from the gerar page
-        form_match = re.search(r'<form[^>]+action="([^"]+)"', r_page.text)
-        if not form_match:
-            raise RuntimeError(
-                "Formulário de geração de PDF não encontrado para o documento"
-            )
-        action_url = self._sei_url(unescape(form_match.group(1)))
-
-        # Step 5: POST with Gerar flag
-        post_data: dict[str, str] = {
-            'hdnInfraTipoPagina': '2',
-            'hdnFlagGerar': '1',
-            'rdoTipo': 'T',
-        }
-        r_post = self._post(action_url, post_data)
-
-        # Step 6: Extract iframe src from JavaScript in POST response
-        iframe_match = re.search(
-            r"\.src\s*=\s*'(controlador\.php\?acao=exibir_arquivo[^']+)'",
-            r_post.text,
+        # Secondary: documents with about:blank + UNIDADE_GERADORA
+        has_blank_docs = bool(
+            re.search(r'"about:blank","ifrConteudoVisualizacao"', arvore_html)
         )
-        if not iframe_match:
-            raise RuntimeError(
-                f"URL do PDF não encontrada na resposta para documento {id_documento}."
+        if has_blank_docs:
+            # Extract the unit sigla from UNIDADE_GERADORA actions (last param)
+            ug_siglas = re.findall(
+                r'new infraArvoreAcao\("UNIDADE_GERADORA"[^)]*,"([^"]+)"\)',
+                arvore_html,
             )
-        raw_url = iframe_match.group(1)
-        # Clean non-printable and whitespace chars
-        clean_url = ''.join(
-            ch for ch in raw_url if ch.isprintable() and ch not in ' \t\n\r'
-        )
-        full_url = self._sei_url(unescape(clean_url))
+            if ug_siglas:
+                # All docs in a restricted process usually share the same unit
+                return ug_siglas[0].strip()
 
-        # Step 7: GET the PDF
-        r_pdf = self._get(full_url)
-        pdf_bytes = r_pdf.content
+        return None
 
-        if not pdf_bytes:
+    def _detect_document_units(self, arvore_html: str) -> dict[str, str]:
+        """Map document IDs to their origin unit siglas.
+
+        Parses UNIDADE_GERADORA actions from the arvore tree.
+        Useful when a process spans multiple units.
+
+        Returns:
+            Dict of {doc_id: unit_sigla}.
+        """
+        results: dict[str, str] = {}
+        for m in re.finditer(
+            r'new infraArvoreAcao\("UNIDADE_GERADORA",'
+            r'"UG(\d+)","(\d+)","#",null,"([^"]+)",null,true,"([^"]+)"\)',
+            arvore_html,
+        ):
+            doc_id = m.group(1)
+            unit_sigla = m.group(4)
+            results[doc_id] = unit_sigla
+        return results
+
+    def _can_switch_to(self, unit_sigla: str) -> bool:
+        """Check if the current user has access to a given unit."""
+        try:
+            units = self.list_units()
+            return any(u.sigla == unit_sigla for u in units)
+        except Exception:
+            return False
+
+    @contextlib.contextmanager
+    def _auto_unit_switch(
+        self, arvore_html: str, *, target_unit: str | None = None
+    ) -> Iterator[str | None]:
+        """Context manager: auto-switch to the required unit, restore on exit.
+
+        Usage::
+
+            arvore = self._navigate_to_arvore(proc_id)
+            with self._auto_unit_switch(arvore) as switched_to:
+                if switched_to:
+                    arvore = self._navigate_to_arvore(proc_id)  # re-fetch
+                # ... do work with arvore ...
+
+        Args:
+            arvore_html: The arvore HTML to inspect for restrictions.
+            target_unit: Override: switch to this unit instead of auto-detecting.
+
+        Yields:
+            The unit sigla we switched to, or None if no switch was needed.
+        """
+        required = target_unit or self._detect_unit_restriction(arvore_html)
+        if not required:
+            yield None
+            return
+
+        # Save current unit
+        try:
+            current_status = self.status()
+            original_sigla = current_status.unidade_sigla
+        except Exception:
+            original_sigla = None
+
+        # Already on the right unit?
+        if original_sigla and required in original_sigla:
+            yield None
+            return
+
+        # Check access and switch
+        if not self._can_switch_to(required):
             raise RuntimeError(
-                f"Resposta vazia ao gerar PDF do documento {id_documento}"
+                f"Processo requer unidade '{required}' mas você não tem acesso. "
+                f"Unidades disponíveis: {', '.join(u.sigla for u in self.list_units())}"
             )
 
-        with open(output_path, "wb") as f:
-            f.write(pdf_bytes)
-
-        self._control_html = None
-        return output_path
+        self.switch_unit(required)
+        try:
+            yield required
+        finally:
+            # Restore original unit
+            if original_sigla:
+                try:
+                    self.switch_unit(original_sigla)
+                except Exception:
+                    pass  # Best effort — don't mask the real exception
 
     def _navigate_to_arvore(self, id_procedimento: str) -> str | None:
         """Navigate to a process and return the arvore (tree) HTML.
@@ -3092,30 +3212,40 @@ class SEIClient:
     def _get_editor_url(
         self, id_documento: str, id_procedimento: str
     ) -> str | None:
-        """Get the editor_montar URL for a document."""
+        """Get the editor_montar URL for a document.
+
+        Automatically switches to the correct unit if the document
+        is not accessible from the current unit.
+        """
         arvore_html = self._navigate_to_arvore(id_procedimento)
         if not arvore_html:
             return None
 
-        # Find the document's arvore_visualizar URL
-        doc_pattern = re.compile(
-            rf'controlador\.php\?acao=arvore_visualizar[^"]*id_documento={id_documento}[^"]*'
-        )
-        doc_match = doc_pattern.search(arvore_html)
-        if not doc_match:
-            return None
+        with self._auto_unit_switch(arvore_html) as switched_to:
+            if switched_to:
+                arvore_html = self._navigate_to_arvore(id_procedimento)
+                if not arvore_html:
+                    return None
 
-        doc_url = urljoin(self._sei_url(""), doc_match.group())
-        rd = self._get(doc_url)
+            # Find the document's arvore_visualizar URL
+            doc_pattern = re.compile(
+                rf'controlador\.php\?acao=arvore_visualizar[^"]*id_documento={id_documento}[^"]*'
+            )
+            doc_match = doc_pattern.search(arvore_html)
+            if not doc_match:
+                return None
 
-        # Extract linkEditarConteudo
-        edit_match = re.search(
-            r"var\s+linkEditarConteudo\s*=\s*'([^']+)'", rd.text
-        )
-        if not edit_match:
-            return None
+            doc_url = urljoin(self._sei_url(""), doc_match.group())
+            rd = self._get(doc_url)
 
-        return urljoin(self._sei_url(""), edit_match.group(1))
+            # Extract linkEditarConteudo
+            edit_match = re.search(
+                r"var\s+linkEditarConteudo\s*=\s*'([^']+)'", rd.text
+            )
+            if not edit_match:
+                return None
+
+            return urljoin(self._sei_url(""), edit_match.group(1))
 
     # --- Signing ---
 
