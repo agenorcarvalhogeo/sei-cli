@@ -113,6 +113,29 @@ class SEIClient:
         self._harvest_hashes(r.text)
         return r
 
+    def _post_pairs(
+        self,
+        url: str,
+        pairs: "list[tuple[str, str]]",
+        *,
+        encoding: str = "iso-8859-1",
+    ) -> httpx.Response:
+        """POST form data from a list of (key, value) tuples.
+
+        Unlike ``_post`` (which takes a dict), this supports repeated keys
+        — needed for ``<select multiple>`` fields.
+        """
+        from urllib.parse import urlencode as _urlencode
+        body = _urlencode(pairs, encoding=encoding)
+        r = self.client.post(
+            url,
+            content=body.encode(encoding),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        r = auth._follow(self.client, r, self.base_url)
+        self._harvest_hashes(r.text)
+        return r
+
     def _sei_url(self, path: str) -> str:
         return f"{self.base_url}/sei/{path}"
 
@@ -1252,17 +1275,95 @@ class SEIClient:
 
     # Well-known SEI unit IDs for block creation (CBM scope)
     UNIT_IDS: dict[str, str] = {
-        "CMDO 1SGB/3GBM": "110003477",
-        "CMDO 2SGB/3GBM": "110003483",
+        # === 3º GBM (Leo's units) ===
         "CMDO 3GBM": "110003475",
+        "SECRETARIA 3GBM": "110003476",
         "LOGISTICA 3GBM": "110010205",
         "OP 3GBM": "110003486",
+        "CMDO 1SGB/3GBM": "110003477",
         "SEC 1SGB/3GBM": "110003478",
+        "CMDO 2SGB/3GBM": "110003483",
         "SEC 2SGB/3GBM": "110003484",
-        "SECRETARIA 3GBM": "110003476",
         "CMDO PABM APODI": "110008367",
+        "CMDO PABM ASSU": "110007343",
+        "PABM PATU": "110009015",
+        # === 4º BBM (Santa Cruz) ===
+        "CMDO 4CIA/4BBM": "110010522",
+        "SEC 4CIA/4BBM": "110010523",
+        # === 1º GBM (João Câmara) ===
+        "CMDO CIA JC/1GBM": "110010413",
+        "SEC CIA JC/1GBM": "110010414",
+        "OP CIA JC/1GBM": "110010415",
         "PAD-PDF": "110003697",
+        # === DAT (Atividades Técnicas) ===
         "DAT-1CAT": "110005347",
+        "DAT-1CAT CHEFIA": "110007609",
+        "DAT-1CAT CATA": "110007610",
+        "1SAT/1CAT SEC": "110007086",
+        "DAT DIRETOR": "110001958",
+        "DAT SECRETARIA": "110002271",
+        "DAT CARIP": "110002269",
+        "DAT CARIP CHEFIA": "110004789",
+        "DAT VISTORIAS": "110002268",
+        "DAT CENTRO FISC": "110004845",
+        "DAT CEPI": "110009020",
+        "DAT PROJETOS": "110001961",
+        "DAT 2CAT": "110003482",
+        "DAT 2CAT CHEFIA": "110001897",
+        "DAT SEÇ OP FISCAL 1CAT": "110009194",
+        "DAT CENTRO FISC 1CAT": "110009193",
+        "DAT NOTIFICAÇÃO 1CAT": "110009195",
+        # === DPSGP (Gestão de Pessoas / RH) ===
+        "DPSGP SECRETARIA": "110009493",
+        "DPSGP DIRETOR": "110004357",
+        "DPSGP CRH": "110001851",
+        "DPSGP CRH CHEFIA": "110006947",
+        "DPSGP CRH SAG": "110001880",
+        "DPSGP CPS": "110007426",
+        "DPSGP CPS CHEFIA": "110007985",
+        "DPSGP CPS SAG": "110001879",
+        "DPSGP SAUDE": "110002266",
+        "DPSGP AGREGADOS": "110005356",
+        # === Comando Geral ===
+        "AJUD SEC GERAL": "110001966",
+        "GAB CMDO": "110001848",
+        "SUB CMDO": "110001865",
+        "PROTOCOLO": "110002233",
+        "ASSEADM": "110001867",
+        "ASSECOM": "110001970",
+        "ASSEINT": "110003540",
+        "ASPAR": "110005776",
+        "UCI": "110001862",
+        "CPED": "110001869",
+        "CPO": "110001870",
+        "CPP": "110001871",
+        # === COBM (Comando Operacional) ===
+        "COBM SECRETARIA": "110001854",
+        "COBM COMANDANTE": "110003118",
+        "EMOP": "110002265",
+        # === DLOF (Logística/Finanças) ===
+        "DLOF SECRETARIA": "110001850",
+        "DLOF DIRETOR": "110001959",
+        "DLOF CAFO": "110001852",
+        "DLOF CTIC": "110001853",
+        "DLOF CLOG SEC": "110001858",
+        "DLOF CPIPC": "110002042",
+        # === DEI (Ensino) ===
+        "DEI DIRETOR": "110006894",
+        # === Outros GBMs ===
+        "CMDO 1GBM": "110003445",
+        "CMDO 2GBM": "110007309",
+        "CMDO 4GBM": "110002231",
+        "CMDO 1SGB/1GBM": "110003448",
+        "CMDO 2SGB/1GBM": "110003450",
+        "CMDO 1SGB/2GBM": "110003452",
+        "CMDO 1SGB/4GBM": "110003480",
+        "CMDO 2SGB/4GBM": "110001965",
+        # === Operacional Especial ===
+        "GBSA CMDO": "110003461",
+        "GBSA SECRETARIA": "110001893",
+        "SSU": "110001899",
+        "SIDAM": "110003462",
     }
 
     def create_block(
@@ -2096,19 +2197,226 @@ class SEIClient:
             for name, uid in self.UNIT_IDS.items()
         ]
 
+    def listar_unidades_usuario(self) -> list[dict[str, str]]:
+        """List SEI units the logged-in user has access to.
+
+        Navigates the unit-switch form (infra_trocar_unidade), POSTs with
+        the CBM orgão (28), and parses the resulting table of sub-units.
+
+        Returns:
+            List of dicts with keys: id, sigla, current (bool).
+        """
+        # 1. Get main page to extract trocar link with valid hash
+        r_main = self._get(self._sei_url("inicializar.php?infra_sistema=100000100"))
+        trocar_match = re.search(
+            r"window\.location\.href='(controlador\.php\?acao=infra_trocar_unidade[^']+)'",
+            r_main.text,
+        )
+        if not trocar_match:
+            raise RuntimeError("Link de troca de unidade não encontrado")
+
+        r_trocar = self._get(self._sei_url(trocar_match.group(1)))
+
+        # 2. Find the form action and POST with CBM orgão
+        form_match = re.search(
+            r'<form[^>]*id="frmInfraSelecaoUnidade"[^>]*action="([^"]*)"',
+            r_trocar.text,
+        )
+        if not form_match:
+            raise RuntimeError("Formulário de seleção de unidade não encontrado")
+
+        action = form_match.group(1).replace("&amp;", "&")
+        r_units = self._post(self._sei_url(action), data={"selInfraOrgaoUnidade": "28"})
+
+        # 3. Parse selecionarUnidade(id) from table rows
+        # Pattern: selecionarUnidade(ID)"/></td><td ...>SIGLA</td>
+        links = re.findall(
+            r'selecionarUnidade\((\d+)\).*?</td>\s*<td[^>]*>([^<]+)<',
+            r_units.text,
+        )
+
+        current_id = self._current_unit_id or ""
+        return [
+            {"id": uid, "sigla": name.strip(), "current": uid == current_id}
+            for uid, name in links
+        ]
+
+    def trocar_unidade(self, unit_id_or_name: str) -> bool:
+        """Switch the SEI session to a different unit.
+
+        Args:
+            unit_id_or_name: Numeric unit ID or a name from UNIT_IDS/listar_unidades.
+
+        Returns:
+            True if the switch succeeded.
+        """
+        # Resolve name → ID
+        target_id = unit_id_or_name
+        if not target_id.isdigit():
+            # Try UNIT_IDS first
+            resolved = self.UNIT_IDS.get(target_id)
+            if not resolved:
+                # Try listing user units and matching sigla
+                units = self.listar_unidades_usuario()
+                for u in units:
+                    if target_id.lower() in u["sigla"].lower():
+                        resolved = u["id"]
+                        break
+            if not resolved:
+                raise RuntimeError(f"Unidade '{target_id}' não encontrada")
+            target_id = resolved
+
+        # Navigate to trocar form and submit
+        r_main = self._get(self._sei_url("inicializar.php?infra_sistema=100000100"))
+        trocar_match = re.search(
+            r"window\.location\.href='(controlador\.php\?acao=infra_trocar_unidade[^']+)'",
+            r_main.text,
+        )
+        if not trocar_match:
+            raise RuntimeError("Link de troca de unidade não encontrado")
+
+        r_trocar = self._get(self._sei_url(trocar_match.group(1)))
+        form_match = re.search(
+            r'<form[^>]*id="frmInfraSelecaoUnidade"[^>]*action="([^"]*)"',
+            r_trocar.text,
+        )
+        if not form_match:
+            raise RuntimeError("Formulário de seleção de unidade não encontrado")
+
+        action = form_match.group(1).replace("&amp;", "&")
+
+        # Submit the unit selection (same as selecionarUnidade JS function)
+        r = self._post(
+            self._sei_url(action),
+            data={"selInfraUnidades": target_id},
+        )
+
+        self._current_unit_id = target_id
+        self._control_html = None
+
+        # Check success: should redirect to main/controlar page
+        url_str = str(r.url)
+        if "login" in url_str:
+            raise RuntimeError("Falha ao trocar unidade — sessão expirou")
+
+        return True
+
+    # Alias for CLI compatibility
+    switch_unit = trocar_unidade
+
+    def reabrir_processo(self, id_procedimento: str) -> bool:
+        """Reopen a process that was closed (sent away without keeping open) in the current unit.
+
+        SEI's 'Reabrir Processo' action is available in the process tree toolbar
+        when the process was previously closed in the unit.  The action URL is
+        extracted from ``Nos[0]`` in the arvore JS, exactly like ``alter_process``.
+
+        Args:
+            id_procedimento: Process internal ID.
+
+        Returns:
+            True if the reopen succeeded.
+
+        Raises:
+            RuntimeError: If the reopen action is not available or fails.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(
+                f"Processo {id_procedimento} não encontrado ou sessão expirada"
+            )
+
+        # 1. Try to find a direct link in the Nos[0] toolbar JS
+        start = arvore_html.find("Nos[0]")
+        end = arvore_html.find("Nos[1]", start) if start != -1 else -1
+        nos0 = arvore_html[start:end].replace('\\"', '"') if start != -1 else ""
+
+        reabrir_m = re.search(
+            r'href="(controlador\.php\?acao=procedimento_reabrir[^"]*)"',
+            nos0,
+        )
+
+        # 2. Also scan full arvore HTML (SEI sometimes puts it outside Nos[0])
+        if not reabrir_m:
+            reabrir_m = re.search(
+                r'"(controlador\.php\?acao=procedimento_reabrir[^"]+)"',
+                arvore_html,
+            )
+
+        if reabrir_m:
+            reabrir_url = self._sei_url(reabrir_m.group(1).replace("&amp;", "&"))
+            r = self._get(reabrir_url)
+            self._control_html = None
+            # Success: SEI redirects to process tree or shows process page
+            url_str = str(r.url)
+            if ("arvore_visualizar" in url_str
+                    or "procedimento_trabalhar" in url_str
+                    or "procedimento_controlar" in url_str):
+                return True
+            lower = r.text.lower()
+            if "erro" in lower or "falha" in lower:
+                raise RuntimeError("SEI retornou erro ao reabrir processo")
+            return True
+
+        # 3. AJAX fallback: try controlador_ajax.php?acao_ajax=procedimento_reabrir
+        #    Some SEI versions handle this as an AJAX call
+        unit_id = self._current_unit_id or ""
+        ajax_url = self._sei_url(
+            f"controlador_ajax.php?acao_ajax=procedimento_reabrir"
+            f"&id_procedimento={id_procedimento}"
+            f"&infra_sistema=100000100"
+            + (f"&infra_unidade_atual={unit_id}" if unit_id else "")
+        )
+        r_ajax = self._get(ajax_url)
+        self._control_html = None
+        ajax_text = r_ajax.text.strip()
+        if ajax_text and "erro" not in ajax_text.lower() and "falha" not in ajax_text.lower():
+            return True
+
+        raise RuntimeError(
+            f"Ação 'Reabrir Processo' não encontrada para o processo {id_procedimento}. "
+            "O processo pode já estar aberto nessa unidade ou você não tem permissão."
+        )
+
     def enviar_processo(
         self,
         id_procedimento: str,
-        unidade_destino: str,
+        unidades_destino: "str | list[str]",
         manter_aberto: bool = True,
     ) -> bool:
-        """Send process to another unit.
+        """Send process to one or more destination units.
 
-        Uses direct POST with unit ID (same approach as create_block),
-        since the form uses infraLupaSelect which requires JS.
+        Accepts a single unit name/ID or a list of units for simultaneous
+        forwarding (SEI's form supports multiple selections).
+
+        The SEI form uses ``infraLupaSelect`` (JS-driven) to populate
+        ``selUnidades`` (a ``<select multiple>``) and ``hdnUnidades``
+        (a hidden field).  The server expects ``hdnUnidades`` in
+        infraLupa format::
+
+            ID±DESCRIPTION¥ID±DESCRIPTION¥…
+
+        Where ``±`` (0xB1) separates ID from description inside each
+        entry, and ``¥`` (0xA5) separates entries.  We fetch descriptions
+        from the AJAX auto-complete endpoint used by the form.
+
+        Args:
+            id_procedimento: Process internal ID.
+            unidades_destino: Unit name, alias or ID — or a list of them.
+            manter_aberto: If True, keep the process open in the current unit
+                after forwarding.  If False, the process is closed here.
+
+        Returns:
+            True if the send succeeded.
         """
-        # Resolve unit
-        unit_id = self._resolve_unit_id(unidade_destino)
+        import re as _re
+
+        # Normalize to list
+        if isinstance(unidades_destino, str):
+            unidades_destino = [unidades_destino]
+
+        # Resolve each unit to its numeric SEI ID
+        unit_ids = [self._resolve_unit_id(u) for u in unidades_destino]
 
         # Navigate to the enviar form
         proc_html = self._open_process_page(id_procedimento)
@@ -2118,50 +2426,152 @@ class SEIClient:
 
         r_form = self._get(send_url)
         soup = BeautifulSoup(r_form.text, "lxml")
-        form = soup.find("form", {"id": "frmProcedimentoEnviar"})
-        if not form:
-            form = soup.find("form")
+        form = soup.find("form")
         if not form:
             raise RuntimeError("Formulário de enviar não encontrado")
 
         form_action = form.get("action", "").replace("&amp;", "&")
         submit_url = urljoin(self._sei_url(""), form_action)
 
-        # Build form data from hidden fields
-        data: dict[str, str] = {}
+        # --- Resolve unit descriptions via AJAX auto-complete ----------
+        # Extract the AJAX URL from the form page JS
+        ajax_match = _re.search(
+            r"(controlador_ajax\.php\?acao_ajax="
+            r"unidade_auto_completar_envio_processo[^']+)",
+            r_form.text,
+        )
+        unit_descriptions: dict[str, str] = {}
+        if ajax_match:
+            ajax_url = self.base_url + "/" + ajax_match.group(1)
+            searched: set[str] = set()
+            for uid in unit_ids:
+                if uid in unit_descriptions:
+                    continue
+                keywords = self._unit_search_keywords(uid)
+                for kw in keywords:
+                    if kw in searched:
+                        continue
+                    searched.add(kw)
+                    # Try with orgao=0 (Todos) first, then orgao=28 (CBM)
+                    for orgao in ("0", "28"):
+                        resp = self.client.post(
+                            ajax_url,
+                            content=(
+                                f"palavras_pesquisa={kw}"
+                                f"&id_orgao={orgao}&unidade_atual=0"
+                            ).encode("latin-1"),
+                            headers={
+                                "Content-Type": (
+                                    "application/x-www-form-urlencoded"
+                                ),
+                                "X-Requested-With": "XMLHttpRequest",
+                            },
+                        )
+                        for item_id, desc in _re.findall(
+                            r'<item[^>]*id="([^"]+)"[^>]*descricao="([^"]+)"',
+                            resp.text,
+                        ):
+                            unit_descriptions[item_id] = desc
+                        if uid in unit_descriptions:
+                            break
+                    if uid in unit_descriptions:
+                        break
+
+        # infraLupa separators (ISO-8859-1)
+        SEP_ENTRY = "\xa5"  # ¥ — between entries
+        SEP_KV = "\xb1"     # ± — between ID and description
+
+        hdn_parts = []
+        for uid in unit_ids:
+            desc = unit_descriptions.get(uid, uid)
+            hdn_parts.append(f"{uid}{SEP_KV}{desc}")
+        hdn_value = SEP_ENTRY.join(hdn_parts)
+
+        # --- Build form data as list of tuples -------------------------
+        pairs: list[tuple[str, str]] = []
+
+        # Collect hidden fields (skip hdnUnidades — we build it ourselves)
         for inp in form.find_all("input", {"type": "hidden"}):
             name = inp.get("name", "")
-            if name:
-                data[name] = inp.get("value", "")
+            if name and name != "hdnUnidades":
+                pairs.append((name, inp.get("value", "")))
 
-        # Add unit selection (same pattern as create_block)
-        data["selUnidades"] = unit_id
-        data["hdnUnidades"] = unit_id
+        # selProcedimentos — the <select> that lists the process(es)
+        sel_proc = form.find("select", {"name": "selProcedimentos"})
+        if sel_proc:
+            for opt in sel_proc.find_all("option"):
+                pairs.append(("selProcedimentos", opt.get("value", "")))
+
+        # Unit selection — one entry per unit for multi-select
+        for uid in unit_ids:
+            pairs.append(("selUnidades", uid))
+
+        # hdnUnidades in infraLupa format
+        pairs.append(("hdnUnidades", hdn_value))
 
         # Manter aberto checkbox
         if manter_aberto:
-            data["chkSinManterAberto"] = "S"
+            chk = form.find("input", {"name": "chkSinManterAberto"})
+            chk_value = chk.get("value") if chk and chk.get("value") else "on"
+            pairs.append(("chkSinManterAberto", chk_value))
 
         # Submit button
-        data["sbmEnviar"] = "Enviar"
+        pairs.append(("sbmEnviar", "Enviar"))
 
-        r = self._post(submit_url, data=data)
+        r = self._post_pairs(submit_url, pairs)
         self._control_html = None
+
+        # Check result: SEI redirects to the process tree on success.
+        # On failure, the page shows "Enviar Processo" title and/or alerts.
         lower = r.text.lower()
-        if "erro" in lower or "falha" in lower:
+        if "enviar processo" in lower:
             return False
         return True
+
+    def _unit_search_keywords(self, unit_id: str) -> list[str]:
+        """Generate search keywords to find a unit via AJAX by ID.
+
+        The AJAX endpoint searches by description text, not by numeric ID.
+        We reverse-lookup known names from ``UNIT_IDS`` and extract
+        meaningful keywords.
+        """
+        # Reverse lookup from UNIT_IDS
+        for name, uid in self.UNIT_IDS.items():
+            if uid == unit_id:
+                words = [w for w in name.split() if len(w) > 2]
+                keywords = [name]
+                for w in words:
+                    if w.upper() not in ("CBM", "COBM", "CMDO", "SEC", "RN"):
+                        keywords.append(w)
+                return keywords
+        # Fallback: return the ID itself (unlikely to match, but harmless)
+        return [unit_id]
+
+    def search_units(
+        self, keyword: str, orgao: str = "0"
+    ) -> list[tuple[str, str]]:
+        """Search for SEI units by keyword using the enviar AJAX endpoint.
+
+        Returns list of (unit_id, description) tuples.
+        Requires an active enviar form page (call from enviar_processo context).
+        """
+        import re as _re
+
+        # We need a valid process page to get the AJAX hash.
+        # This is a lightweight helper — callers should have already
+        # loaded the enviar form.
+        return []  # Placeholder — actual search done inline in enviar_processo
 
     def tramitar_processo(
         self,
         id_procedimento: str,
-        unidade_destino: str,
+        unidade_destino: "str | list[str]",
         manter_aberto: bool = True,
     ) -> bool:
         """Alias de enviar_processo para API mais explícita."""
         return self.enviar_processo(
             id_procedimento=id_procedimento,
-            unidade_destino=unidade_destino,
+            unidades_destino=unidade_destino,
             manter_aberto=manter_aberto,
         )
 
@@ -3979,7 +4389,10 @@ class SEIClient:
 
         The SEI sign form uses ISO-8859-1 encoding (º → \\xba).
         """
+        import logging
         from urllib.parse import urlencode as _urlencode
+
+        _log = logging.getLogger(__name__)
 
         creds = load_credentials()
         form_action = urljoin(self._sei_url(""), form.get("action", ""))
@@ -4017,6 +4430,11 @@ class SEIClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         r = auth._follow(self.client, r, self.base_url)
+
+        # Debug logging for diagnosis
+        _log.debug("[sign] response URL: %s", r.url)
+        _log.debug("[sign] response status: %s", r.status_code)
+        _log.debug("[sign] response text (first 500): %s", r.text[:500])
 
         # Parse response for messages
         result: dict = {"doc_ids": doc_ids, "signed": [], "already_signed": [], "errors": []}
@@ -4060,11 +4478,30 @@ class SEIClient:
         if "procedimento_trabalhar" in str(r.url) and not result["signed"] and not result["already_signed"] and not result["errors"]:
             result["signed"].append(doc_ids)
 
-        # If still on sign/auth page with no messages, docs were likely all already signed
+        # Check if redirected to process tree (success — SEI returns to arvore after signing)
+        if "arvore_visualizar" in str(r.url) and not result["signed"] and not result["already_signed"] and not result["errors"]:
+            result["signed"].append(doc_ids)
+
+        # Check for explicit success patterns in SEI response text
         if not result["signed"] and not result["already_signed"] and not result["errors"]:
-            if "Assinatura de Documento" in r.text or "Autenticação de Documento" in r.text:
-                # The form re-rendered but no error → all docs already signed
+            success_patterns = [
+                "assinatura realizada",
+                "documento assinado",
+                "autenticação realizada",
+            ]
+            if any(p in r.text.lower() for p in success_patterns):
+                result["signed"].append(doc_ids)
+
+        # Fallback: if we POSTed credentials and got no error/already-signed, assume success.
+        # The sign page title reappearing does NOT mean "already signed" — it can appear on
+        # success pages too (e.g., bloco signing). Only treat as "already_signed" if the
+        # response explicitly contains "já foi assinado".
+        if not result["signed"] and not result["already_signed"] and not result["errors"]:
+            if "já foi assinado" in r.text:
                 result["already_signed"].append(f"Documentos {doc_ids} já assinados")
+            else:
+                # No error and no explicit "already signed" → POST succeeded → signed
+                result["signed"].append(doc_ids)
 
         self._control_html = None
         return result

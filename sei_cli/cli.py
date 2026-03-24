@@ -308,15 +308,21 @@ def goto_cmd(numero: str, as_json: bool, do_read: bool, unit: str | None) -> Non
 
 @cli.command("encaminhar")
 @click.argument("processo")
-@click.argument("destino")
+@click.argument("destinos", nargs=-1, required=True)
 @click.option("--unit", default=None, help="Unidade SEI atual (trocar antes de encaminhar)")
 @click.option("--fechar", is_flag=True, help="Fechar processo na unidade atual após envio")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
-def encaminhar_cmd(processo: str, destino: str, unit: str | None, fechar: bool, as_json: bool) -> None:
-    """Encaminhar processo para outra unidade.
+def encaminhar_cmd(processo: str, destinos: tuple[str, ...], unit: str | None, fechar: bool, as_json: bool) -> None:
+    """Encaminhar processo para uma ou mais unidades.
 
     PROCESSO: id_procedimento ou número do processo (ex: 08810254.000081/2026-17)
-    DESTINO: sigla ou nome parcial da unidade destino (ex: "3ºGBM", "PABM APODI")
+    DESTINOS: sigla(s) ou nome(s) parcial(is) das unidades destino (aceita múltiplas)
+
+    Exemplos:
+
+      sei encaminhar 48145432 "DPSGP SECRETARIA"
+
+      sei encaminhar 48145432 "DPSGP SECRETARIA" "AJUD SEC GERAL"
     """
     with SEIClient() as client:
         if unit:
@@ -335,17 +341,62 @@ def encaminhar_cmd(processo: str, destino: str, unit: str | None, fechar: bool, 
                 return
 
         manter_aberto = not fechar
+        destinos_list = list(destinos)
         try:
-            ok = client.enviar_processo(id_proc, destino, manter_aberto=manter_aberto)
+            ok = client.enviar_processo(id_proc, destinos_list, manter_aberto=manter_aberto)
             if ok:
+                destinos_str = ", ".join(destinos_list)
                 if as_json:
-                    _emit({"status": "ok", "processo": processo, "destino": destino, "mantido_aberto": manter_aberto}, True)
+                    _emit({
+                        "status": "ok",
+                        "processo": processo,
+                        "destinos": destinos_list,
+                        "mantido_aberto": manter_aberto,
+                    }, True)
                 else:
-                    console.print(f"[green]✅ Processo {processo} encaminhado para {destino}[/green]")
+                    console.print(f"[green]✅ Processo {processo} encaminhado para: {destinos_str}[/green]")
                     if manter_aberto:
                         console.print("  (mantido aberto na unidade atual)")
             else:
                 console.print(f"[red]❌ Falha ao encaminhar processo[/red]")
+        except RuntimeError as e:
+            console.print(f"[red]❌ {e}[/red]")
+
+
+@cli.command("reabrir")
+@click.argument("processo")
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes de reabrir)")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def reabrir_cmd(processo: str, unit: str | None, as_json: bool) -> None:
+    """Reabrir um processo que foi fechado (enviado sem manter aberto) na unidade.
+
+    PROCESSO: id_procedimento (ex: 48145432)
+    """
+    import re as _re
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+
+        # Resolve formatted process numbers → id_procedimento
+        id_proc = processo
+        if "." in processo or "/" in processo:
+            html = client.search(processo)
+            m = _re.search(r"id_procedimento=(\d+)", html)
+            if m:
+                id_proc = m.group(1)
+            else:
+                console.print(f"[red]❌ Processo {processo} não encontrado[/red]")
+                return
+
+        try:
+            ok = client.reabrir_processo(id_proc)
+            if ok:
+                if as_json:
+                    _emit({"status": "ok", "processo": processo}, True)
+                else:
+                    console.print(f"[green]✅ Processo {processo} reaberto na unidade atual[/green]")
+            else:
+                console.print(f"[red]❌ Falha ao reabrir processo[/red]")
         except RuntimeError as e:
             console.print(f"[red]❌ {e}[/red]")
 

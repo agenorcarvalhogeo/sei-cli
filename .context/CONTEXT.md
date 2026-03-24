@@ -26,6 +26,9 @@
 - Para editar/assinar/encaminhar: DEVE estar no ambiente correto
 - `sei switch <unidade>` ou `--unit` no goto
 - Pesquisa rápida funciona de qualquer ambiente
+- `trocar_unidade(id_or_name)` / `switch_unit()` — troca sessão SEI programaticamente
+- `listar_unidades_usuario()` — navega form `infra_trocar_unidade`, POSTs com orgão CBM (28), parseia `selecionarUnidade(id)` do resultado
+- **Form parsing:** O SEI usa `selecionarUnidade(ID)"/>` + `<td>SIGLA</td>` (input, não anchor)
 
 ### Comando `goto`
 - SEMPRE usar `sei goto <numero>` para navegar (aceita doc ou processo)
@@ -48,5 +51,9 @@
 
 - SEI muda `infra_hash` entre requests — nunca cachear hashes entre sessões
 - Blocos disponibilizados: cancelar antes de editar/assinar docs neles
+- **`chkSinManterAberto`:** Checkbox de "manter aberto" no enviar processo usa valor `"on"`, NÃO `"S"`. Confirmado no código-fonte SEI (sei-ev/sei.js)
+- **`enviar_processo`:** Aceita lista de unidades. `selUnidades` = primeira, `hdnUnidades` = comma-separated IDs
+- **`reabrir_processo`:** 3-tier strategy (Nos[0] href → full HTML search → AJAX). O JS `reabrirProcesso()` é gerado inline SOMENTE quando o processo está fechado na unidade atual — não existe em JS externo
+- **Troca de unidade:** Form `frmInfraSelecaoUnidade` com POST `selInfraOrgaoUnidade=28` (CBM) lista sub-unidades, depois POST `selInfraUnidades=ID` efetua a troca
 - O login form usa campo `hdnToken` que muda a cada request
 - Rate limiting informal: não fazer mais de ~5 req/s ou a sessão cai
