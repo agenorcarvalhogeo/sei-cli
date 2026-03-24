@@ -46,9 +46,22 @@ sei block-remove <id_doc> <bloco>                      # Retirar doc do bloco
 sei block-devolver <bloco>                             # Devolver bloco recebido
 ```
 
-### Tramitação
+### Tramitação / Encaminhamento
 ```bash
-sei tramitar <id_proc> <unidade>   # Tramitar processo para unidade
+sei encaminhar <id_proc> "DPSGP SECRETARIA"                        # Enviar para 1 unidade
+sei encaminhar <id_proc> "CMDO 4CIA/4BBM" "SEC 4CIA/4BBM"          # Enviar para múltiplas
+sei encaminhar <id_proc> "COBM SECRETARIA" --fechar                # Enviar e fechar na unidade atual
+sei encaminhar 08810254.000108/2026-71 "CMDO 3GBM"                 # Aceita número do processo
+```
+
+> **Nota:** Por padrão, o processo é mantido aberto na unidade atual.
+> Use `--fechar` para fechá-lo após o envio.
+
+### Assinatura
+```bash
+sei assinar <id_doc> <id_proc>     # Assinar documento
+sei assinar-lote <id_proc> <id1> <id2> ...  # Assinar múltiplos docs
+sei dar-ciencia <id_doc> <id_proc> # Dar ciência em documento
 ```
 
 ### Marcadores
@@ -90,8 +103,15 @@ with SEIClient() as c:
     c.remove_document_from_block("48218774", "871303")
     c.devolver_block("869251")
     
-    # Tramitação
-    c.tramitar_processo("48218772", "CMDO 3ºGBM")
+    # Encaminhar (1 ou múltiplas unidades, manter aberto por padrão)
+    c.enviar_processo("48218772", "CMDO 3GBM")
+    c.enviar_processo("48218772", ["CMDO 4CIA/4BBM", "SEC 4CIA/4BBM"], manter_aberto=True)
+    
+    # Assinar documentos
+    c.assinar_documento("48568466", "48568435")
+    
+    # Dar ciência
+    c.dar_ciencia("48568466", "48568435")
     
     # Marcadores
     c.set_marcador("48218772", "123", "texto opcional")
