@@ -2962,11 +2962,36 @@ class SEIClient:
         Args:
             save_url: The editor_salvar URL (from get_editor_sections).
             sections: List of EditorSection with modified content.
-                **Important:** section content must be raw HTML (e.g.
-                ``<p class="Texto_Justificado">text</p>``).
-                Do NOT html.escape() the content — the HTTP POST handles
-                URL-encoding automatically. Double-escaping causes the
-                SEI editor to render raw ``&lt;p&gt;`` tags as text.
+
+        **ESCAPE RULES (critical):**
+
+        Section content must be **1-level HTML-escaped** — exactly as
+        returned by ``get_editor_sections()``. This means tags appear as
+        ``&lt;p&gt;`` not ``<p>``, and attributes use ``&quot;``.
+
+        The SEI editor textarea stores content in this 1-level escaped form.
+        ``save_document`` posts it as-is; httpx handles URL-encoding
+        transparently (transport layer, not HTML escaping).
+
+        **Common mistakes:**
+
+        - ❌ Passing raw HTML (``<p>text</p>``) → SEI may misparse tags
+        - ❌ Passing content from ``get_editor_sections`` through
+          ``html.escape()`` → double-escaping (``&amp;lt;p&amp;gt;``)
+        - ❌ Building new content with ``html.escape(html.escape(x))``
+        - ✅ Passing content from ``get_editor_sections`` as-is (already
+          1x escaped)
+        - ✅ Building new content with ONE ``html.escape()`` call on raw HTML
+
+        **Workflow for editing a section:**
+
+        1. ``save_url, sections = get_editor_sections(doc_id, proc_id)``
+        2. Content arrives 1x escaped. To modify:
+           a. ``html.unescape(section.content)`` → raw HTML
+           b. Edit the raw HTML
+           c. ``html.escape(edited_html, quote=True)`` → 1x escaped
+           d. Or build new raw HTML and escape once
+        3. ``save_document(save_url, sections)``
 
         Returns:
             True if save succeeded.
@@ -2991,6 +3016,104 @@ class SEIClient:
             return False
 
         return True
+
+    @staticmethod
+    def escape_for_sei(raw_html: str) -> str:
+        """Escape raw HTML for SEI editor textarea (1-level escape).
+
+        SEI uses ISO-8859-1 encoding for form submissions. Characters
+        outside Latin-1 (e.g. ``—``, ``'``, ``"``) must be preserved
+        as HTML entities (``&mdash;``, ``&rsquo;``), not as literal
+        Unicode characters, or the POST will fail with encoding errors.
+
+        This method:
+        1. Converts non-Latin-1 characters to HTML numeric entities
+        2. Escapes HTML structural characters (``<``, ``>``, ``&``, ``"``)
+           to 1-level escape (``&lt;``, ``&gt;``, ``&amp;``, ``&quot;``)
+
+        The result is safe for ``save_document()`` and will render
+        correctly in the SEI editor.
+
+        Args:
+            raw_html: HTML with literal tags (``<p>text</p>``).
+                May contain HTML entities like ``&mdash;`` — these are
+                preserved correctly.
+
+        Returns:
+            1-level escaped string ready for save_document.
+        """
+        from html import escape as _escape
+
+        # Step 1: Escape HTML structure (< > & ") — standard 1-level
+        escaped = _escape(raw_html, quote=True)
+
+        # Step 2: Replace non-Latin-1 characters with numeric entities.
+        # After step 1, all & are now &amp;, so new &#nnn; entities
+        # won't be double-escaped. We need to produce &amp;#nnn; so that
+        # when SEI unescapes once, it gets &#nnn; which renders correctly.
+        #
+        # Actually: the textarea content IS the 1-level escaped form.
+        # SEI stores "&lt;p&gt;" and renders it as "<p>" in the editor.
+        # For entities like &#8212; (em-dash), the stored form must be
+        # "&amp;#8212;" so that after one unescape it becomes "&#8212;"
+        # and the browser renders "—".
+        result = []
+        for ch in escaped:
+            try:
+                ch.encode("iso-8859-1")
+                result.append(ch)
+            except UnicodeEncodeError:
+                # Character not in Latin-1 — use numeric entity
+                # Must be &amp;#nnn; because we're at 1-level escape
+                result.append(f"&amp;#{ord(ch)};")
+        return "".join(result)
+
+    def edit_document_section(
+        self,
+        id_documento: str,
+        id_procedimento: str,
+        section_id: str,
+        new_raw_html: str,
+    ) -> bool:
+        """High-level helper: replace one editor section with new content.
+
+        Handles the full workflow:
+        1. Opens editor (get_editor_sections)
+        2. Finds the target section by section_id
+        3. Escapes new_raw_html via ``escape_for_sei`` (handles Latin-1)
+        4. Replaces only the target section, preserving all others
+        5. Saves via save_document
+
+        Args:
+            id_documento: SEI document ID.
+            id_procedimento: SEI process ID.
+            section_id: Numeric section ID (e.g. '422' for body).
+            new_raw_html: Raw HTML content (``<p>text</p>``). Will be
+                escaped for SEI (1-level + Latin-1 entity conversion).
+
+        Returns:
+            True if save succeeded.
+
+        Raises:
+            RuntimeError: If section not found or editor unavailable.
+        """
+        save_url, sections = self.get_editor_sections(id_documento, id_procedimento)
+
+        target = None
+        for sec in sections:
+            if sec.section_id == section_id:
+                target = sec
+                break
+
+        if target is None:
+            available = [s.section_id for s in sections]
+            raise RuntimeError(
+                f"Section '{section_id}' not found. Available: {available}"
+            )
+
+        target.content = self.escape_for_sei(new_raw_html)
+
+        return self.save_document(save_url, sections)
 
     def _view_document_html_core(
         self, id_documento: str, arvore_html: str,
