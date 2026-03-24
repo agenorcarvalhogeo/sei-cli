@@ -2299,6 +2299,18 @@ class SEIClient:
         if "login" in url_str:
             raise RuntimeError("Falha ao trocar unidade — sessão expirou")
 
+        # Load the control page for the new unit.
+        # After unit switch the infra_hash changes, so we use
+        # inicializar.php to get a valid redirect with fresh hashes.
+        html = self._try_inicializar()
+        if html and "tblProcessosRecebidos" in html:
+            self._control_html = html
+            self._menu_links = parse_menu_links(html, self._sei_url(""))
+            self._persist_session()
+        else:
+            # Fallback: full re-login (gets control page with correct unit)
+            self.login()
+
         return True
 
     # Alias for CLI compatibility

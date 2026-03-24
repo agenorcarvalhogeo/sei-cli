@@ -121,6 +121,24 @@ def _parse_process_row(row: html.HtmlElement, caixa: str, base_url: str) -> Proc
 
 def parse_processes(content: str, base_url: str) -> ProcessList:
     page = _tree(content)
+
+    # Validate we're actually on the control page
+    tables_found = 0
+    for table_id in ("tblProcessosRecebidos", "tblProcessosGerados"):
+        if page.xpath(f"//table[@id='{table_id}']"):
+            tables_found += 1
+
+    if tables_found == 0:
+        # Not on the control page — likely a login page or error page
+        if "login" in content.lower() or "txtUsuario" in content:
+            raise RuntimeError(
+                "Sessão expirada — página de login retornada em vez do controle de processos"
+            )
+        raise RuntimeError(
+            "Página de controle de processos não encontrada (tabelas ausentes). "
+            "Verifique se a sessão está ativa e na unidade correta."
+        )
+
     recebidos, gerados = [], []
     for table_id, caixa, dest in [
         ("tblProcessosRecebidos", "recebidos", recebidos),
