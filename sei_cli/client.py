@@ -2950,19 +2950,11 @@ class SEIClient:
         r_list = self._get(marcadores_url)
         self._control_html = None
         
-        soup = BeautifulSoup(r_list.text, "lxml")
-        table = soup.find("table", id="tblMarcador")
-        if not table:
-            return []
-            
+        # Fallback: extract from checkbox title + value attributes
+        # Pattern: title="NAME" type="checkbox" value="ID"
         result = []
-        for row in table.find_all("tr")[1:]:
-            tds = row.find_all("td")
-            if len(tds) >= 4:
-                nome = tds[2].get_text(strip=True)
-                marcador_id = tds[3].get_text(strip=True)
-                if marcador_id:
-                    result.append({"id": marcador_id, "nome": nome})
+        for m in re.finditer(r'title="([^"]+)"\s+type="checkbox"\s+value="(\d+)"', r_list.text):
+            result.append({"id": m.group(2), "nome": m.group(1)})
                     
         return result
 
