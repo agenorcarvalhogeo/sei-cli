@@ -53,6 +53,46 @@ A correção lida com ambos os casos.
 
 ---
 
+---
+
+## Fix: `edit_document_section` causa double-escape no editor SEI
+
+**Data:** 2026-03-25
+**Arquivo:** `sei_cli/client.py` — método `edit_document_section`
+
+### Problema
+
+Ao usar `edit_document_section(id_doc, id_proc, section_id, raw_html)`, o conteúdo salvo no SEI aparecia com escape duplo: os tags HTML apareciam como texto literal (`&lt;p class=...&gt;`) em vez de renderizarem normalmente.
+
+### Causa raiz
+
+`edit_document_section` chama `self.escape_for_sei(new_raw_html)` antes de atribuir ao `target.content`. O `escape_for_sei` converte `<p>` em `&lt;p&gt;`. Em seguida, `save_document` usa `_post` → `urlencode`, que URL-codifica o `&` de `&lt;p&gt;` para `%26lt%3Bp`, fazendo o servidor armazenar `&lt;p` como valor da textarea — em vez de `<p>` (HTML cru).
+
+Resultado: CKEditor lê `&lt;p` como texto, exibindo literalmente `<p class="X">` no documento.
+
+### Correção
+
+Passar HTML **cru** (sem nenhum `html.escape()`) diretamente ao `save_document`, acessando as sections manualmente:
+
+```python
+save_url, sections = client.get_editor_sections(id_documento, id_procedimento)
+for s in sections:
+    if s.section_id == section_id:
+        s.content = raw_html  # HTML cru — sem escape
+        break
+client.save_document(save_url, sections)
+```
+
+### Regra geral
+
+- ✅ `s.content = raw_html` — HTML com tags reais (`<p>`, `<strong>`)
+- ❌ `s.content = html.escape(raw_html)` — gera double-escape
+- ❌ `edit_document_section(...)` com `escape_for_sei` — mesmo problema
+
+Ao **ler** conteúdo existente de uma section use `html.unescape(s.content)` para obter o HTML cru.
+
+---
+
 ## Observação: `_current_unit_id` não persiste entre processos
 
 **Data:** 2026-03-25
