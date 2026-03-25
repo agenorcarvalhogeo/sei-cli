@@ -401,6 +401,53 @@ def reabrir_cmd(processo: str, unit: str | None, as_json: bool) -> None:
             console.print(f"[red]❌ {e}[/red]")
 
 
+@cli.command("concluir")
+@click.argument("processos", nargs=-1, required=True)
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes de concluir)")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def concluir_cmd(processos: tuple[str, ...], unit: str | None, as_json: bool) -> None:
+    """Concluir um ou mais processos na unidade atual.
+
+    PROCESSOS: ids ou números SEI (ex: 47162626 ou 08810198.000286/2024-52)
+    """
+    import re as _re
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+
+        # Resolve formatted process numbers → id_procedimento
+        ids = []
+        for p in processos:
+            if "." in p or "/" in p:
+                html = client.search(p)
+                m = _re.search(r"id_procedimento=(\d+)", html)
+                if m:
+                    ids.append(m.group(1))
+                else:
+                    console.print(f"[yellow]⚠️ Processo {p} não encontrado, pulando[/yellow]")
+            else:
+                ids.append(p)
+
+        if not ids:
+            console.print("[red]❌ Nenhum processo válido[/red]")
+            return
+
+        result = client.concluir_processos(ids)
+
+        if as_json:
+            _emit(result, True)
+            return
+
+        for pid in result["concluded"]:
+            console.print(f"[green]✅ {pid} concluído[/green]")
+        for pid in result["failed"]:
+            err = result["errors"].get(pid, "?")
+            console.print(f"[red]❌ {pid}: {err}[/red]")
+
+        total = len(result["concluded"])
+        console.print(f"\n[bold]{total}/{len(ids)} processos concluídos[/bold]")
+
+
 @cli.command("units")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
 def units_cmd(as_json: bool) -> None:

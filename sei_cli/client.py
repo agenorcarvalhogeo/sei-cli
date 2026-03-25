@@ -1112,145 +1112,192 @@ class SEIClient:
 
         return procs
 
-    def list_grupos_acompanhamento(self) -> list[tuple[str, str]]:
-        """List available Acompanhamento Especial groups for current unit.
-
-        Returns list of (group_id, group_name) tuples.
+    def listar_grupos_acompanhamento(self) -> list[dict]:
+        """Lists all grupos de acompanhamento in current unit.
+        
+        Returns:
+            List of {"id": str, "nome": str}.
         """
         html = self._ensure_control()
-
-        # Navigate to acompanhamento_cadastrar to access the grupo select
+        
+        acomp_list = self._extract_action_url(html, "acompanhamento_listar")
+        if not acomp_list:
+            acomp_match = re.search(r'(controlador\.php\?acao=acompanhamento_listar[^"\']+)', html)
+            if acomp_match:
+                acomp_list = self._sei_url(acomp_match.group(1).replace("&amp;", "&"))
+            else:
+                return []
+                
+        r_list = self._get(acomp_list)
+        
         cad = re.search(
-            r'(controlador\.php\?acao=acompanhamento_cadastrar[^"\']+)', html
+            r'(controlador\.php\?acao=acompanhamento_cadastrar[^"\']+)', r_list.text
         )
         if not cad:
+            cad = re.search(
+                r'(controlador\.php\?acao=acompanhamento_cadastrar[^"\']+)', html
+            )
+        
+        if not cad:
             return []
-
-        r = self._get(self._sei_url(cad.group(1).replace("&amp;", "&")))
-        soup = BeautifulSoup(r.text, "lxml")
+            
+        r_cad = self._get(self._sei_url(cad.group(1).replace("&amp;", "&")))
+        soup = BeautifulSoup(r_cad.text, "lxml")
         sel = soup.find("select", {"name": "selGrupoAcompanhamento"})
         if not sel:
             return []
-
+            
         result = []
         for opt in sel.find_all("option"):
             val = opt.get("value", "")
             name = opt.get_text(strip=True)
             if val and val != "null" and name:
-                result.append((val, name))
+                result.append({"id": val, "nome": name})
         return result
 
-    def create_grupo_acompanhamento(self, nome: str) -> bool:
-        """Create a new Acompanhamento Especial group in the current unit.
+    def list_grupos_acompanhamento(self) -> list[tuple[str, str]]:
+        """Legacy alias."""
+        return [(g["id"], g["nome"]) for g in self.listar_grupos_acompanhamento()]
 
+    def criar_grupo_acompanhamento(self, nome: str) -> str:
+        """Creates a new grupo de acompanhamento especial in the current unit.
+        
         Args:
-            nome: Group name (e.g. 'Pessoal', 'Operacional').
-
+            nome: Group name.
+            
         Returns:
-            True if created successfully.
+            The new group ID.
         """
+        from urllib.parse import urljoin
         html = self._ensure_control()
+        
+        acomp_list = self._extract_action_url(html, "acompanhamento_listar")
+        if not acomp_list:
+            acomp_match = re.search(r'(controlador\.php\?acao=acompanhamento_listar[^"\']+)', html)
+            if acomp_match:
+                acomp_list = self._sei_url(acomp_match.group(1).replace("&amp;", "&"))
+            else:
+                raise RuntimeError("Link acompanhamento_listar não encontrado")
 
-        cad = re.search(
-            r'(controlador\.php\?acao=acompanhamento_cadastrar[^"\']+)', html
+        r_list = self._get(acomp_list)
+        
+        grupo_list_match = re.search(
+            r'(controlador\.php\?acao=grupo_acompanhamento_listar[^"\']+)', r_list.text
         )
-        if not cad:
-            raise RuntimeError("Link acompanhamento_cadastrar not found")
-
-        r_cad = self._get(self._sei_url(cad.group(1).replace("&amp;", "&")))
-        grupo_url = re.search(
-            r'(controlador\.php\?acao=grupo_acompanhamento_cadastrar[^"\']+)',
-            r_cad.text,
+        if not grupo_list_match:
+            raise RuntimeError("Link grupo_acompanhamento_listar não encontrado")
+            
+        r_grupo_list = self._get(self._sei_url(grupo_list_match.group(1).replace("&amp;", "&")))
+        
+        cad_match = re.search(
+            r"location\.href='([^']+grupo_acompanhamento_cadastrar[^']+)'", r_grupo_list.text
         )
-        if not grupo_url:
-            raise RuntimeError("Link grupo_acompanhamento_cadastrar not found")
-
-        r_form = self._get(
-            self._sei_url(grupo_url.group(1).replace("&amp;", "&"))
-        )
+        if not cad_match:
+            raise RuntimeError("Link grupo_acompanhamento_cadastrar não encontrado")
+            
+        r_form = self._get(self._sei_url(cad_match.group(1).replace("&amp;", "&")))
         soup = BeautifulSoup(r_form.text, "lxml")
         form = soup.find("form", id="frmGrupoAcompanhamentoCadastro")
         if not form:
-            raise RuntimeError("Grupo cadastro form not found")
-
-        action = self._sei_url(form["action"])
+            raise RuntimeError("Formulário frmGrupoAcompanhamentoCadastro não encontrado")
+            
+        action = urljoin(self._sei_url(""), form.get("action", "").replace("&amp;", "&"))
         data = {
-            "hdnInfraTipoPagina": "2",
+            "hdnInfraTipoPagina": "1",
             "txtNome": nome,
             "hdnIdGrupoAcompanhamento": "",
             "sbmCadastrarGrupoAcompanhamento": "Salvar",
         }
-        self._post(action, data)
+        
+        before_groups = {g["id"] for g in self.listar_grupos_acompanhamento()}
+        
+        r_save = self._post(action, data)
         self._control_html = None
-        return True
+        
+        if "grupo_acompanhamento_listar" not in str(r_save.url):
+            raise RuntimeError("Falha ao criar grupo, redirecionamento inesperado")
+            
+        after_groups = self.listar_grupos_acompanhamento()
+        for g in after_groups:
+            if g["id"] not in before_groups:
+                return g["id"]
+                
+        for g in after_groups:
+            if g["nome"] == nome:
+                return g["id"]
+                
+        raise RuntimeError("Grupo criado mas ID não pôde ser identificado")
+
+    def create_grupo_acompanhamento(self, nome: str) -> bool:
+        """Legacy alias."""
+        try:
+            self.criar_grupo_acompanhamento(nome)
+            return True
+        except Exception:
+            return False
 
     def add_acompanhamento_especial(
         self, id_procedimento: str, grupo_id: str, observacao: str
     ) -> bool:
         """Add a process to Acompanhamento Especial.
-
-        Flow: procedimento_trabalhar → ifrVisualizacao → acompanhamento_gerenciar → POST
-
-        Args:
-            id_procedimento: Process ID.
-            grupo_id: Group ID from list_grupos_acompanhamento().
-            observacao: Description text (required by SEI).
-
-        Returns:
-            True if added successfully.
+        
+        New approach: Uses acompanhamento_cadastrar from control page and POSTs
+        directly with hdnIdProtocolo. Falls back to arvore navigation if needed.
         """
+        from urllib.parse import urljoin
         html = self._ensure_control()
-
-        # Navigate to process
-        proc_link = re.search(
-            rf'(controlador\.php\?acao=procedimento_trabalhar[^"]*'
-            rf'id_procedimento={id_procedimento}[^"]*)',
-            html,
+        
+        # --- NEW APPROACH (Direct POST) ---
+        cad_match = re.search(
+            r'(controlador\.php\?acao=acompanhamento_cadastrar[^"\']+)', html
         )
-        if not proc_link:
-            raise RuntimeError(
-                f"Process {id_procedimento} not found in control page"
-            )
+        if cad_match:
+            cad_url = self._sei_url(cad_match.group(1).replace("&amp;", "&"))
+            r_cad = self._get(cad_url)
+            
+            soup = BeautifulSoup(r_cad.text, "lxml")
+            form = soup.find("form", id="frmAcompanhamentoCadastro")
+            if form:
+                action = urljoin(self._sei_url(""), form.get("action", "").replace("&amp;", "&"))
+                data = {
+                    "hdnInfraTipoPagina": "1",
+                    "selGrupoAcompanhamento": str(grupo_id),
+                    "txaObservacao": observacao,
+                    "hdnIdAcompanhamento": "",
+                    "hdnIdProtocolo": str(id_procedimento),
+                    "sbmCadastrarAcompanhamento": "Salvar",
+                }
+                
+                r_add = self._post(action, data)
+                self._control_html = None
+                
+                if "procedimento_controlar" in str(r_add.url) or "Controle de Processos" in r_add.text:
+                    return True
 
-        r = self._get(
-            self._sei_url(proc_link.group(1).replace("&amp;", "&"))
-        )
-
-        # Get visualization iframe
-        vis = re.search(
-            r'src="(controlador\.php\?acao=procedimento_visualizar[^"]+)"',
-            r.text,
-        )
-        if not vis:
-            raise RuntimeError("Visualization iframe not found")
-
-        r_vis = self._get(
-            self._sei_url(vis.group(1).replace("&amp;", "&"))
-        )
-
-        # Get acompanhamento_gerenciar URL
+        # --- FALLBACK (Old approach via tree) ---
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(f"Processo {id_procedimento} não encontrado ou sessão expirada")
+            
+        start = arvore_html.find('Nos[0]')
+        end = arvore_html.find('Nos[1]', start) if start != -1 else -1
+        nos0 = arvore_html[start:end].replace('\\"', '"') if start != -1 else ""
+        
         acomp = re.search(
-            r'(controlador\.php\?acao=acompanhamento_gerenciar[^"\\]+)',
-            r_vis.text,
+            r'href="(controlador\.php\?acao=acompanhamento_gerenciar[^"]*)"',
+            nos0,
         )
         if not acomp:
-            raise RuntimeError("acompanhamento_gerenciar link not found")
-
-        r_ger = self._get(
-            self._sei_url(
-                acomp.group(1).replace("&amp;", "&").replace("\\", "")
-            )
-        )
+            raise RuntimeError("Link acompanhamento_gerenciar não encontrado na barra de ferramentas")
+        
+        r_ger = self._get(self._sei_url(acomp.group(1).replace("&amp;", "&")))
 
         soup = BeautifulSoup(r_ger.text, "lxml")
         form = soup.find("form", id="frmAcompanhamentoCadastro")
         if not form:
-            raise RuntimeError(
-                "Cadastro form not found (process may already be in "
-                "Acompanhamento Especial)"
-            )
+            raise RuntimeError("Formulário frmAcompanhamentoCadastro não encontrado (processo pode já estar em acompanhamento)")
 
-        action = self._sei_url(form["action"])
+        action = urljoin(self._sei_url(""), form.get("action", "").replace("&amp;", "&"))
         data = {
             "hdnInfraTipoPagina": "2",
             "selGrupoAcompanhamento": str(grupo_id),
@@ -1263,12 +1310,79 @@ class SEIClient:
         r_add = self._post(action, data)
         self._control_html = None
 
-        if (
-            "Lista de Acompanhamentos" in r_add.text
-            or "Acompanhamentos Especiais" in r_add.text
-        ):
+        if "Lista de Acompanhamentos" in r_add.text or "Acompanhamentos Especiais" in r_add.text or "procedimento_controlar" in str(r_add.url):
             return True
 
+        return False
+
+    def alterar_acompanhamento_especial(
+        self, id_procedimento: str, grupo_id: str, observacao: str
+    ) -> bool:
+        """Alters an existing acompanhamento (change group and/or observation).
+        
+        Args:
+            id_procedimento: Process ID.
+            grupo_id: New group ID.
+            observacao: New observation text.
+            
+        Returns:
+            True if altered successfully.
+        """
+        from urllib.parse import urljoin
+        
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(f"Processo {id_procedimento} não encontrado ou sessão expirada")
+            
+        start = arvore_html.find('Nos[0]')
+        end = arvore_html.find('Nos[1]', start) if start != -1 else -1
+        nos0 = arvore_html[start:end].replace('\\"', '"') if start != -1 else ""
+        
+        acomp = re.search(
+            r'href="(controlador\.php\?acao=acompanhamento_gerenciar[^"]*)"',
+            nos0,
+        )
+        if not acomp:
+            raise RuntimeError("Link acompanhamento_gerenciar não encontrado na barra de ferramentas")
+        
+        r_ger = self._get(self._sei_url(acomp.group(1).replace("&amp;", "&")))
+        
+        # In gerenciar page, look for existing acompanhamento to alter
+        alterar_match = re.search(
+            r'(controlador\.php\?acao=acompanhamento_alterar[^"\']+)',
+            r_ger.text,
+        )
+        if not alterar_match:
+            raise RuntimeError("Link acompanhamento_alterar não encontrado. O processo está em acompanhamento?")
+            
+        r_alt = self._get(self._sei_url(alterar_match.group(1).replace("&amp;", "&")))
+        
+        soup = BeautifulSoup(r_alt.text, "lxml")
+        form = soup.find("form", id="frmAcompanhamentoCadastro")
+        if not form:
+            raise RuntimeError("Formulário de alteração não encontrado")
+            
+        action = urljoin(self._sei_url(""), form.get("action", "").replace("&amp;", "&"))
+        
+        # Get existing hdnIdAcompanhamento
+        id_acomp_input = form.find("input", {"name": "hdnIdAcompanhamento"})
+        id_acomp = id_acomp_input.get("value", "") if id_acomp_input else ""
+        
+        data = {
+            "hdnInfraTipoPagina": "2",
+            "selGrupoAcompanhamento": str(grupo_id),
+            "txaObservacao": observacao,
+            "hdnIdAcompanhamento": id_acomp,
+            "sbmAlterarAcompanhamento": "Salvar",
+        }
+        
+        r_save = self._post(action, data)
+        self._control_html = None
+        
+        # POST returns 302 redirect to acompanhamento_gerenciar
+        if "acompanhamento_gerenciar" in str(r_save.url) or r_save.status_code == 200:
+            return True
+            
         return False
 
     # --- Blocks ---
@@ -2390,6 +2504,162 @@ class SEIClient:
             "O processo pode já estar aberto nessa unidade ou você não tem permissão."
         )
 
+    # ------------------------------------------------------------------
+    # Concluir Processo
+    # ------------------------------------------------------------------
+
+    def concluir_processos(
+        self,
+        id_procedimentos: "str | list[str]",
+    ) -> dict:
+        """Conclude one or more processes in the current unit.
+
+        Uses the Controle de Processos form to select processes and
+        POST to ``procedimento_concluir``, then confirms via the
+        ``frmDesentranharDocumento`` form (rdoConcluir=S).
+
+        Args:
+            id_procedimentos: Single process ID or list of process IDs.
+
+        Returns:
+            dict with keys: concluded (list), failed (list), errors (dict).
+        """
+        if isinstance(id_procedimentos, str):
+            id_procedimentos = [id_procedimentos]
+
+        result: dict = {"concluded": [], "failed": [], "errors": {}}
+
+        # Work in batches — control page only shows ~50 processes per section
+        remaining = set(id_procedimentos)
+
+        while remaining:
+            # Try cached control first, fall back to fresh login
+            html = self._ensure_control()
+            soup = BeautifulSoup(html, "lxml")
+            form = soup.find("form", id="frmProcedimentoControlar")
+            if not form:
+                # Session stale — re-login to get fresh control page
+                self.login()
+                html = self._ensure_control()
+                soup = BeautifulSoup(html, "lxml")
+                form = soup.find("form", id="frmProcedimentoControlar")
+            if not form:
+                for pid in remaining:
+                    result["failed"].append(pid)
+                    result["errors"][pid] = "Control form not found"
+                break
+
+            # Build form data from hidden fields
+            data: dict[str, str] = {}
+            for inp in form.find_all("input", type="hidden"):
+                name = inp.get("name", "")
+                val = inp.get("value", "")
+                if name:
+                    data[name] = val
+
+            # Determine which processes are on this page (recebidos + gerados)
+            recebidos = set(
+                data.get("hdnRecebidosItens", "").split(",")
+            ) - {""}
+            gerados = set(
+                data.get("hdnGeradosItens", "").split(",")
+            ) - {""}
+
+            # Select processes that are on this page
+            batch_recebidos = remaining & recebidos
+            batch_gerados = remaining & gerados
+            batch = batch_recebidos | batch_gerados
+
+            if not batch:
+                # None of the remaining processes are on page 1
+                for pid in remaining:
+                    result["failed"].append(pid)
+                    result["errors"][pid] = "Process not on control page"
+                break
+
+            data["hdnRecebidosItensSelecionados"] = ",".join(batch_recebidos)
+            data["hdnGeradosItensSelecionados"] = ",".join(batch_gerados)
+
+            # Find the procedimento_concluir URL (has valid infra_hash)
+            concluir_m = re.search(
+                r"controlador\.php\?acao=procedimento_concluir[^'\"]+", html
+            )
+            if not concluir_m:
+                for pid in batch:
+                    result["failed"].append(pid)
+                    result["errors"][pid] = "Concluir URL not found"
+                remaining -= batch
+                continue
+
+            concluir_url = concluir_m.group().replace("&amp;", "&")
+
+            # POST to concluir — should return confirmation page
+            r_confirm = self._post(self._sei_url(concluir_url), data)
+
+            if "frmDesentranharDocumento" not in r_confirm.text:
+                for pid in batch:
+                    result["failed"].append(pid)
+                    result["errors"][pid] = "Confirmation page not received"
+                remaining -= batch
+                continue
+
+            # Parse confirmation form
+            soup2 = BeautifulSoup(r_confirm.text, "lxml")
+            form2 = soup2.find("form", id="frmDesentranharDocumento")
+            if not form2:
+                for pid in batch:
+                    result["failed"].append(pid)
+                    result["errors"][pid] = "Confirmation form not found"
+                remaining -= batch
+                continue
+
+            confirm_action = form2["action"].replace("&amp;", "&")
+            confirm_data: dict[str, str] = {}
+            for inp in form2.find_all("input"):
+                name = inp.get("name", "")
+                val = inp.get("value", "")
+                if name and name not in confirm_data:
+                    confirm_data[name] = val
+
+            # Set conclusion type (S = definitive, V = with scheduled reopening)
+            confirm_data["rdoConcluir"] = "S"
+            confirm_data["sbmSalvar"] = "Salvar"
+
+            # Submit confirmation
+            r_save = self._post(self._sei_url(confirm_action), confirm_data)
+            self._control_html = None
+
+            # Check success — redirect or no error
+            if r_save.status_code in (200, 302):
+                for pid in batch:
+                    result["concluded"].append(pid)
+            else:
+                for pid in batch:
+                    result["failed"].append(pid)
+                    result["errors"][pid] = f"HTTP {r_save.status_code}"
+
+            remaining -= batch
+
+        return result
+
+    def concluir_processo(self, id_procedimento: str) -> bool:
+        """Conclude a single process. Convenience wrapper around concluir_processos.
+
+        Args:
+            id_procedimento: Process ID.
+
+        Returns:
+            True if concluded successfully.
+
+        Raises:
+            RuntimeError: If conclusion failed.
+        """
+        result = self.concluir_processos(id_procedimento)
+        if id_procedimento in result["concluded"]:
+            return True
+        error = result["errors"].get(id_procedimento, "Unknown error")
+        raise RuntimeError(f"Failed to conclude process {id_procedimento}: {error}")
+
     def enviar_processo(
         self,
         id_procedimento: str,
@@ -2601,6 +2871,101 @@ class SEIClient:
         r = self._get(marcadores_url)
         self._control_html = None
         return parse_marcadores_list(r.text, self._sei_url(""))
+    def criar_marcador(self, nome: str, icone: str = "4") -> str:
+        """Creates a new marcador in the current unit.
+        
+        Args:
+            nome: Name of the marker.
+            icone: Icon ID (e.g. '4' for Amarelo).
+        
+        Returns:
+            The new marcador ID.
+        """
+        html = self._ensure_control()
+        
+        marcadores_url = self._menu_links.get("marcadores")
+        if not marcadores_url:
+            marcadores_url = self._extract_action_url(html, "marcador_listar")
+        if not marcadores_url:
+            raise RuntimeError("Link marcador_listar não encontrado")
+
+        r_list = self._get(marcadores_url)
+        
+        cad_match = re.search(r"location\.href='([^']+marcador_cadastrar[^']+)'", r_list.text)
+        if not cad_match:
+            raise RuntimeError("Link marcador_cadastrar não encontrado")
+            
+        from urllib.parse import urljoin
+        cad_url = self._sei_url(cad_match.group(1).replace("&amp;", "&"))
+        r_cad = self._get(cad_url)
+        
+        soup = BeautifulSoup(r_cad.text, "lxml")
+        form = soup.find("form", id="frmMarcadorCadastro")
+        if not form:
+            raise RuntimeError("Formulário frmMarcadorCadastro não encontrado")
+            
+        action = urljoin(self._sei_url(""), form.get("action", "").replace("&amp;", "&"))
+        
+        data = {
+            "hdnInfraTipoPagina": "1",
+            "selStaIcone": icone,
+            "hdnStaIcone": icone,
+            "txtNome": nome,
+            "hdnIdMarcador": "",
+            "sbmCadastrarMarcador": "Salvar",
+        }
+        
+        before_ids = {m["id"] for m in self.listar_marcadores()} if hasattr(self, "listar_marcadores") else set()
+        
+        r_save = self._post(action, data)
+        self._control_html = None
+        
+        if "marcador_listar" not in str(r_save.url):
+            raise RuntimeError("Falha ao criar marcador, redirecionamento inesperado.")
+            
+        after_list = self.listar_marcadores()
+        for m in after_list:
+            if m["id"] not in before_ids:
+                return m["id"]
+                
+        for m in after_list:
+            if m["nome"] == nome:
+                return m["id"]
+                
+        raise RuntimeError("Marcador criado, mas ID não pôde ser verificado.")
+
+    def listar_marcadores(self) -> list[dict]:
+        """Lists all marcadores in current unit.
+        
+        Returns:
+            List of {"id": str, "nome": str}.
+        """
+        html = self._ensure_control()
+        marcadores_url = self._menu_links.get("marcadores")
+        if not marcadores_url:
+            marcadores_url = self._extract_action_url(html, "marcador_listar")
+        if not marcadores_url:
+            return []
+            
+        r_list = self._get(marcadores_url)
+        self._control_html = None
+        
+        soup = BeautifulSoup(r_list.text, "lxml")
+        table = soup.find("table", id="tblMarcador")
+        if not table:
+            return []
+            
+        result = []
+        for row in table.find_all("tr")[1:]:
+            tds = row.find_all("td")
+            if len(tds) >= 4:
+                nome = tds[2].get_text(strip=True)
+                marcador_id = tds[3].get_text(strip=True)
+                if marcador_id:
+                    result.append({"id": marcador_id, "nome": nome})
+                    
+        return result
+
 
     def set_marcador(self, id_procedimento: str, marcador_id: str, texto: str = "") -> bool:
         """Apply marker to a process.
