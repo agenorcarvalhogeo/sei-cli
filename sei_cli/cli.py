@@ -479,6 +479,213 @@ def switch_cmd(sigla: str, as_json: bool) -> None:
     _print_status(status)
 
 
+# ------------------------------------------------------------------
+# Marcadores
+# ------------------------------------------------------------------
+
+@cli.command("marcadores")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def marcadores_cmd(unit: str | None, as_json: bool) -> None:
+    """Listar marcadores da unidade atual."""
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        marcadores = client.listar_marcadores()
+
+    if as_json:
+        _emit(marcadores, True)
+        return
+
+    if not marcadores:
+        console.print("[yellow]Nenhum marcador encontrado[/yellow]")
+        return
+
+    table = Table(title="Marcadores")
+    table.add_column("ID")
+    table.add_column("Nome")
+    for m in sorted(marcadores, key=lambda x: x.get("nome", "")):
+        table.add_row(str(m.get("id", "")), m.get("nome", ""))
+    console.print(table)
+
+
+@cli.command("marcador-criar")
+@click.argument("nome")
+@click.option("--icone", default=None, help="Ícone (CSS class)")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def marcador_criar_cmd(nome: str, icone: str | None, unit: str | None, as_json: bool) -> None:
+    """Criar um novo marcador."""
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        mid = client.criar_marcador(nome, icone)
+
+    if as_json:
+        _emit({"id": mid, "nome": nome}, True)
+    else:
+        console.print(f"[green]✅ Marcador criado: {nome} (ID {mid})[/green]")
+
+
+@cli.command("marcador-set")
+@click.argument("processo")
+@click.argument("marcador_id")
+@click.option("--texto", "-t", default="", help="Texto descritivo do marcador")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def marcador_set_cmd(processo: str, marcador_id: str, texto: str, unit: str | None, as_json: bool) -> None:
+    """Definir/atualizar marcador em um processo."""
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        ok = client.set_marcador(processo, marcador_id, texto)
+
+    if as_json:
+        _emit({"status": "ok" if ok else "failed", "processo": processo, "marcador_id": marcador_id}, True)
+    elif ok:
+        console.print(f"[green]✅ Marcador {marcador_id} definido no processo {processo}[/green]")
+    else:
+        console.print(f"[red]❌ Falha ao definir marcador[/red]")
+
+
+@cli.command("marcador-remove")
+@click.argument("processo")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def marcador_remove_cmd(processo: str, unit: str | None, as_json: bool) -> None:
+    """Remover marcador de um processo."""
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        ok = client.remove_marcador(processo)
+
+    if as_json:
+        _emit({"status": "ok" if ok else "failed", "processo": processo}, True)
+    elif ok:
+        console.print(f"[green]✅ Marcador removido do processo {processo}[/green]")
+    else:
+        console.print(f"[red]❌ Falha ao remover marcador[/red]")
+
+
+# ------------------------------------------------------------------
+# Acompanhamento Especial / Grupos
+# ------------------------------------------------------------------
+
+@cli.command("grupos")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def grupos_cmd(unit: str | None, as_json: bool) -> None:
+    """Listar grupos de acompanhamento especial."""
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        grupos = client.listar_grupos_acompanhamento()
+
+    if as_json:
+        _emit(grupos, True)
+        return
+
+    if not grupos:
+        console.print("[yellow]Nenhum grupo encontrado[/yellow]")
+        return
+
+    table = Table(title="Grupos de Acompanhamento")
+    table.add_column("ID")
+    table.add_column("Nome")
+    for g in sorted(grupos, key=lambda x: x.get("nome", "")):
+        table.add_row(str(g.get("id", "")), g.get("nome", ""))
+    console.print(table)
+
+
+@cli.command("grupo-criar")
+@click.argument("nome")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def grupo_criar_cmd(nome: str, unit: str | None, as_json: bool) -> None:
+    """Criar um novo grupo de acompanhamento especial."""
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        gid = client.criar_grupo_acompanhamento(nome)
+
+    if as_json:
+        _emit({"id": gid, "nome": nome}, True)
+    else:
+        console.print(f"[green]✅ Grupo criado: {nome} (ID {gid})[/green]")
+
+
+@cli.command("acompanhamento-add")
+@click.argument("processo")
+@click.argument("grupo_id")
+@click.option("--obs", "-o", default="", help="Observação")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def acompanhamento_add_cmd(processo: str, grupo_id: str, obs: str, unit: str | None, as_json: bool) -> None:
+    """Adicionar processo a grupo de acompanhamento especial."""
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        ok = client.add_acompanhamento_especial(processo, grupo_id, obs)
+
+    if as_json:
+        _emit({"status": "ok" if ok else "failed", "processo": processo, "grupo_id": grupo_id}, True)
+    elif ok:
+        console.print(f"[green]✅ Processo {processo} adicionado ao grupo {grupo_id}[/green]")
+    else:
+        console.print(f"[red]❌ Falha[/red]")
+
+
+@cli.command("acompanhamento-alterar")
+@click.argument("processo")
+@click.argument("grupo_id")
+@click.option("--obs", "-o", default="", help="Nova observação")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def acompanhamento_alterar_cmd(processo: str, grupo_id: str, obs: str, unit: str | None, as_json: bool) -> None:
+    """Alterar acompanhamento especial de um processo."""
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        ok = client.alterar_acompanhamento_especial(processo, grupo_id, obs)
+
+    if as_json:
+        _emit({"status": "ok" if ok else "failed", "processo": processo, "grupo_id": grupo_id}, True)
+    elif ok:
+        console.print(f"[green]✅ Acompanhamento alterado no processo {processo}[/green]")
+    else:
+        console.print(f"[red]❌ Falha[/red]")
+
+
+@cli.command("acompanhamentos")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def acompanhamentos_cmd(unit: str | None, as_json: bool) -> None:
+    """Listar processos em acompanhamento especial."""
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        procs = client.list_acompanhamento_especial()
+
+    if as_json:
+        _emit([asdict(p) for p in procs], True)
+        return
+
+    if not procs:
+        console.print("[yellow]Nenhum processo em acompanhamento especial[/yellow]")
+        return
+
+    table = Table(title="Processos em Acompanhamento Especial")
+    table.add_column("Processo")
+    table.add_column("ID")
+    for p in procs:
+        table.add_row(p.numero, p.id_procedimento)
+    console.print(table)
+
+
+# ------------------------------------------------------------------
+# Blocos
+# ------------------------------------------------------------------
+
 @cli.command("block-create")
 @click.argument("descricao")
 @click.argument("unidade_destino")
