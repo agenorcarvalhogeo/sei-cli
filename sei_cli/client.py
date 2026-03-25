@@ -2874,14 +2874,15 @@ class SEIClient:
     def list_marcadores(self) -> list[Marcador]:
         """List marker catalog available to current unit."""
         html = self._ensure_control()
-        marcadores_url = self._menu_links.get("marcadores")
+        # Always prefer _extract_action_url — _menu_links may have truncated URL (no hash)
+        marcadores_url = self._extract_action_url(html, "marcador_listar")
         if not marcadores_url:
-            marcadores_url = self._extract_action_url(html, "marcador_listar")
+            marcadores_url = self._menu_links.get("marcadores")
         if not marcadores_url:
             return []
 
         r = self._get(marcadores_url)
-        self._control_html = None
+        # Do NOT clear _control_html here — callers may need it after listing
         return parse_marcadores_list(r.text, self._sei_url(""))
     def criar_marcador(self, nome: str, icone: str = "4") -> str:
         """Creates a new marcador in the current unit.
@@ -2895,9 +2896,10 @@ class SEIClient:
         """
         html = self._ensure_control()
         
-        marcadores_url = self._menu_links.get("marcadores")
+        # Always prefer _extract_action_url — _menu_links may have truncated URL (no hash)
+        marcadores_url = self._extract_action_url(html, "marcador_listar")
         if not marcadores_url:
-            marcadores_url = self._extract_action_url(html, "marcador_listar")
+            marcadores_url = self._menu_links.get("marcadores")
         if not marcadores_url:
             raise RuntimeError("Link marcador_listar não encontrado")
 
@@ -2927,7 +2929,7 @@ class SEIClient:
             "sbmCadastrarMarcador": "Salvar",
         }
         
-        before_ids = {m["id"] for m in self.listar_marcadores()} if hasattr(self, "listar_marcadores") else set()
+        before_ids = {m["id"] for m in self.listar_marcadores()}
         
         r_save = self._post(action, data)
         self._control_html = None
@@ -2953,16 +2955,17 @@ class SEIClient:
             List of {"id": str, "nome": str}.
         """
         html = self._ensure_control()
-        marcadores_url = self._menu_links.get("marcadores")
+        # Always prefer _extract_action_url — _menu_links may have truncated URL (no hash)
+        marcadores_url = self._extract_action_url(html, "marcador_listar")
         if not marcadores_url:
-            marcadores_url = self._extract_action_url(html, "marcador_listar")
+            marcadores_url = self._menu_links.get("marcadores")
         if not marcadores_url:
             return []
             
         r_list = self._get(marcadores_url)
-        self._control_html = None
+        # Do NOT clear _control_html — callers may need it after listing
         
-        # Fallback: extract from checkbox title + value attributes
+        # Extract from checkbox title + value attributes
         # Pattern: title="NAME" type="checkbox" value="ID"
         result = []
         for m in re.finditer(r'title="([^"]+)"\s+type="checkbox"\s+value="(\d+)"', r_list.text):
