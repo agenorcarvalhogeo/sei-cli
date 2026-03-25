@@ -232,9 +232,21 @@ class SEIClient:
         # Resolve relative URL
         full_url = urljoin(self._sei_url("inicializar.php"), location)
         r2 = self.client.get(full_url)
-        if r2.status_code == 200 and "Controle de Processos" in r2.text:
-            return r2.text
-        return None
+        if r2.status_code != 200 or "Controle de Processos" not in r2.text:
+            return None
+        # inicializar.php may redirect to acao=principal (frameset) instead of
+        # acao=procedimento_controlar (process table). Navigate one step further.
+        if "acao=principal" in str(r2.url) or "tblProcessosRecebidos" not in r2.text:
+            unit_id = self._current_unit_id or ""
+            ctrl_url = self._sei_url(
+                f"controlador.php?acao=procedimento_controlar&infra_sistema=100000100"
+                + (f"&infra_unidade_atual={unit_id}" if unit_id else "")
+            )
+            r3 = self.client.get(ctrl_url)
+            if r3.status_code == 200 and "tblProcessosRecebidos" in r3.text:
+                return r3.text
+            return None
+        return r2.text
 
     def _ensure_session(self) -> str:
         """Restore session with minimal overhead.
