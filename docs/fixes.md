@@ -93,6 +93,46 @@ Ao **ler** conteúdo existente de uma section use `html.unescape(s.content)` par
 
 ---
 
+## Fix: `_execute_sign_form` usa credenciais hardcoded do desenvolvedor
+
+**Data:** 2026-03-25
+**Arquivo:** `sei_cli/client.py` — método `_execute_sign_form`
+
+### Problema
+
+O método `_execute_sign_form` tinha `txtUsuario = "LEO ZENON TASSI"` e `hdnIdUsuario = "100066959"` hardcoded — credenciais do desenvolvedor original. A tentativa de assinatura falhava silenciosamente: o SEI retornava o formulário novamente (erro de autenticação) mas a lógica de fallback interpretava isso como sucesso.
+
+Além disso, `selCargoFuncao` era hardcoded como `"2\xba Tenente QOEM BM"` e não havia como configurar o cargo do usuário.
+
+### Correção
+
+1. Remover o override de `txtUsuario` e `hdnIdUsuario` — o SEI pré-preenche esses campos no formulário com os dados do usuário logado na sessão.
+2. Adicionar campos `cargo` e `id_usuario` ao `credentials.json` (opcionais).
+3. O `selCargoFuncao` agora vem de `creds.cargo` (lido do `credentials.json`).
+4. O `selOrgao` agora usa `orgao_to_value(creds.orgao)` em vez de `"28"` hardcoded.
+5. Adicionado comando `sei sign <id_procedimento> <doc1> ...` ao CLI.
+
+### Configuração necessária
+
+Adicionar ao `~/.config/sei/credentials.json`:
+
+```json
+{
+  "cargo": "Tenente-Coronel QOEM BM",
+  "id_usuario": "100039182"
+}
+```
+
+O valor de `cargo` deve corresponder exatamente a uma das opções do `<select name="selCargoFuncao">` no formulário de assinatura do SEI. Caractere `º` deve ser o ordinal latin1 correto (não precisa de escape — Python codifica como ISO-8859-1 no POST).
+
+### Regra geral
+
+- `txtUsuario` e `hdnIdUsuario` vêm do formulário (pré-preenchidos pelo SEI com o usuário da sessão ativa) — **não sobrescrever**.
+- `selCargoFuncao` configurar em `credentials.json` (campo `"cargo"`).
+- O POST é enviado com `encoding="iso-8859-1"` para suportar o caractere `º`.
+
+---
+
 ## Observação: `_current_unit_id` não persiste entre processos
 
 **Data:** 2026-03-25

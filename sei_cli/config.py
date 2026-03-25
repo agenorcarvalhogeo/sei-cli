@@ -48,6 +48,8 @@ def load_credentials(path: Path = CREDENTIALS_PATH) -> Credentials:
             senha=str(data["senha"]),
             orgao=str(data["orgao"]),
             login_url=str(data["login_url"]),
+            cargo=str(data.get("cargo", "")),
+            id_usuario=str(data.get("id_usuario", "")),
         )
     except KeyError as exc:
         raise ConfigError(f"Campo obrigatório ausente no arquivo de credenciais: {exc}") from exc

@@ -26,7 +26,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from sei_cli import auth
-from sei_cli.config import load_credentials, SESSION_PATH
+from sei_cli.config import load_credentials, orgao_to_value, SESSION_PATH
 from sei_cli.models import (
     Block, BlockDocument, Document, DocumentCreated, DocumentType,
     EditorSection, Marcador, Process, ProcessList, SystemStatus,
@@ -4901,21 +4901,22 @@ class SEIClient:
         creds = load_credentials()
         form_action = urljoin(self._sei_url(""), form.get("action", ""))
 
-        # Collect hidden fields
+        # Collect all form fields (SEI pre-populates txtUsuario and hdnIdUsuario
+        # with the logged-in user — do NOT override these)
         sign_data = {}
         for inp in form.find_all("input"):
             n = inp.get("name", "")
             if n:
                 sign_data[n] = inp.get("value", "")
 
-        # The cargo is "2º Tenente QOEM BM" — must use latin1 º (\xba)
-        cargo = "2\xba Tenente QOEM BM"
+        # selCargoFuncao: use value from credentials.json (campo "cargo").
+        # Must be encoded as ISO-8859-1 (º → \xba).
+        # Example: "Tenente-Coronel QOEM BM"
+        cargo = creds.cargo if creds.cargo else sign_data.get("selCargoFuncao", "")
 
         sign_data.update({
-            "txtUsuario": "LEO ZENON TASSI",
-            "hdnIdUsuario": sign_data.get("hdnIdUsuario", "100066959"),
             "pwdSenha": creds.senha,
-            "selOrgao": "28",
+            "selOrgao": orgao_to_value(creds.orgao),
             "selCargoFuncao": cargo,
             "hdnFormaAutenticacao": "S",
         })

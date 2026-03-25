@@ -10,6 +10,8 @@ class Credentials:
     senha: str
     orgao: str
     login_url: str
+    cargo: str = ""
+    id_usuario: str = ""
 
 
 @dataclass(slots=True)

@@ -918,6 +918,50 @@ def authenticate_cmd(
             console.print(f"⚠️  Doc {doc_id}: resultado indefinido — {r}")
 
 
+@cli.command("sign")
+@click.argument("id_procedimento")
+@click.argument("id_documentos", nargs=-1, required=True)
+@click.option("--unit", default=None, help="Unidade SEI (trocar antes)")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def sign_cmd(
+    id_procedimento: str,
+    id_documentos: tuple[str, ...],
+    unit: str | None,
+    as_json: bool,
+) -> None:
+    """Assinar documentos internos em um processo.
+
+    Usage: sei sign <id_procedimento> <doc1> <doc2> ...
+
+    Requer que o campo 'cargo' esteja configurado em ~/.config/sei/credentials.json
+    (ex: "cargo": "Tenente-Coronel QOEM BM").
+    """
+    with SEIClient() as client:
+        client.login()
+        if unit:
+            client.switch_unit(unit)
+        results = []
+        for doc_id in id_documentos:
+            r = client.sign_document(doc_id, id_procedimento)
+            r["id_documento"] = doc_id
+            results.append(r)
+
+    if as_json:
+        click.echo(json.dumps(results, ensure_ascii=False, indent=2))
+        return
+
+    for r in results:
+        doc_id = r.get("id_documento", "?")
+        if r.get("error"):
+            console.print(f"[red]❌ Doc {doc_id}: {r['error']}[/red]")
+        elif r.get("already_signed"):
+            console.print(f"[yellow]⚠️  Doc {doc_id}: já assinado[/yellow]")
+        elif r.get("signed"):
+            console.print(f"[green]✅ Doc {doc_id}: assinado com sucesso[/green]")
+        else:
+            console.print(f"[yellow]⚠️  Doc {doc_id}: resultado indefinido — {r}[/yellow]")
+
+
 @cli.command("download-pdf")
 @click.argument("id_procedimento")
 @click.option("-o", "--output", default=None, help="Output PDF path")
