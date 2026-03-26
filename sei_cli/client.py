@@ -2443,11 +2443,16 @@ class SEIClient:
     switch_unit = trocar_unidade
 
     def reabrir_processo(self, id_procedimento: str) -> bool:
-        """Reopen a process that was closed (sent away without keeping open) in the current unit.
+        """Reopen a process that was closed/concluded in the current unit.
 
-        SEI's 'Reabrir Processo' action is available in the process tree toolbar
-        when the process was previously closed in the unit.  The action URL is
-        extracted from ``Nos[0]`` in the arvore JS, exactly like ``alter_process``.
+        SEI's 'Reabrir Processo' button uses ``onclick="reabrirProcesso();"``
+        which reads a JS variable ``linkReabrirProcesso`` defined inline in the
+        ``arvore_visualizar`` page (loaded in ``ifrConteudoVisualizacao``).
+
+        The method tries three strategies:
+        1. Extract ``var linkReabrirProcesso = '...'`` from ``arvore_visualizar``
+        2. Scan ``Nos[0]`` toolbar in ``ifrArvore`` for href fallback
+        3. AJAX fallback via ``controlador_ajax.php``
 
         Args:
             id_procedimento: Process internal ID.
@@ -2458,34 +2463,77 @@ class SEIClient:
         Raises:
             RuntimeError: If the reopen action is not available or fails.
         """
-        arvore_html = self._navigate_to_arvore(id_procedimento)
-        if not arvore_html:
+        self._ensure_session()
+
+        # Navigate to the process wrapper page (procedimento_trabalhar)
+        wrapper_url = self._sei_url(
+            f"controlador.php?acao=procedimento_trabalhar"
+            f"&id_procedimento={id_procedimento}"
+        )
+        rw = self._get(wrapper_url)
+        if "login.php" in str(rw.url) or "pwdSenha" in rw.text:
             raise RuntimeError(
                 f"Processo {id_procedimento} não encontrado ou sessão expirada"
             )
 
-        # 1. Try to find a direct link in the Nos[0] toolbar JS
-        start = arvore_html.find("Nos[0]")
-        end = arvore_html.find("Nos[1]", start) if start != -1 else -1
-        nos0 = arvore_html[start:end].replace('\\"', '"') if start != -1 else ""
+        # --- Strategy 1: Extract linkReabrirProcesso from arvore_visualizar ---
+        # The wrapper page (procedimento_trabalhar) has two iframes:
+        #   ifrArvore -> procedimento_visualizar (tree JS with Nos[])
+        #   ifrConteudoVisualizacao -> arvore_visualizar (toolbar with JS vars)
+        # ifrConteudoVisualizacao starts as about:blank and is loaded via JS,
+        # so we must follow the chain: wrapper -> ifrArvore -> find
+        # arvore_visualizar URL -> fetch it -> extract linkReabrirProcesso.
+        wsoup = BeautifulSoup(rw.text, "lxml")
+        arvore_iframe = wsoup.find("iframe", {"name": "ifrArvore"})
 
-        reabrir_m = re.search(
-            r'href="(controlador\.php\?acao=procedimento_reabrir[^"]*)"',
-            nos0,
-        )
+        reabrir_url = None
+        arvore_html = ""
+        if arvore_iframe and arvore_iframe.get("src"):
+            arv_url = urljoin(self._sei_url(""), arvore_iframe["src"])
+            ra = self._get(arv_url)
+            arvore_html = ra.text
 
-        # 2. Also scan full arvore HTML (SEI sometimes puts it outside Nos[0])
-        if not reabrir_m:
-            reabrir_m = re.search(
-                r'"(controlador\.php\?acao=procedimento_reabrir[^"]+)"',
+            # The procedimento_visualizar page references arvore_visualizar
+            vis_m = re.search(
+                r'(controlador\.php\?acao=arvore_visualizar[^"\'\\]+)',
                 arvore_html,
             )
+            if vis_m:
+                vis_url = urljoin(
+                    self._sei_url(""),
+                    vis_m.group(1).replace("&amp;", "&"),
+                )
+                rv = self._get(vis_url)
+                # Match: var linkReabrirProcesso = 'controlador.php?...';
+                link_m = re.search(
+                    r"var\s+linkReabrirProcesso\s*=\s*'([^']+)'",
+                    rv.text,
+                )
+                if link_m:
+                    reabrir_url = link_m.group(1).replace("&amp;", "&")
 
-        if reabrir_m:
-            reabrir_url = self._sei_url(reabrir_m.group(1).replace("&amp;", "&"))
-            r = self._get(reabrir_url)
+        # --- Strategy 2: Scan Nos[0] in ifrArvore (legacy fallback) ---
+        if not reabrir_url and arvore_html:
+            start = arvore_html.find("Nos[0]")
+            end = arvore_html.find("Nos[1]", start) if start != -1 else -1
+            nos0 = arvore_html[start:end].replace('\\"', '"') if start != -1 else ""
+
+            reabrir_m = re.search(
+                r'href="(controlador\.php\?acao=procedimento_reabrir[^"]*)"',
+                nos0,
+            )
+            if not reabrir_m:
+                reabrir_m = re.search(
+                    r'"(controlador\.php\?acao=procedimento_reabrir[^"]+)"',
+                    arvore_html,
+                )
+            if reabrir_m:
+                reabrir_url = reabrir_m.group(1).replace("&amp;", "&")
+
+        # Execute the reopen if we found a URL
+        if reabrir_url:
+            r = self._get(self._sei_url(reabrir_url))
             self._control_html = None
-            # Success: SEI redirects to process tree or shows process page
             url_str = str(r.url)
             if ("arvore_visualizar" in url_str
                     or "procedimento_trabalhar" in url_str
@@ -2496,8 +2544,7 @@ class SEIClient:
                 raise RuntimeError("SEI retornou erro ao reabrir processo")
             return True
 
-        # 3. AJAX fallback: try controlador_ajax.php?acao_ajax=procedimento_reabrir
-        #    Some SEI versions handle this as an AJAX call
+        # --- Strategy 3: AJAX fallback ---
         unit_id = self._current_unit_id or ""
         ajax_url = self._sei_url(
             f"controlador_ajax.php?acao_ajax=procedimento_reabrir"
