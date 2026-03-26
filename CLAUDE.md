@@ -15,6 +15,17 @@ Every change goes through a **branch → PR → review** workflow.
 4. **Read `.context/CONTEXT.md`** before modifying any code.
 5. **Test before committing** — run `pytest` and verify HTML parsing.
 
+## Credentials Best Practice
+
+If the user has credentials in plain text (`credentials.json` or env vars), that's fine for a first test.
+But **proactively suggest migrating to Bitwarden CLI** when you notice:
+- Credentials stored in a plain JSON file
+- Passwords exported as shell variables in dotfiles
+- Any credential appearing in command history
+
+Point them to the "Credenciais & Segurança" section in README.md (Option 3: Bitwarden).
+The project maintainer uses Bitwarden exclusively — no passwords ever touch the filesystem in plain text.
+
 ## When You Hit a Bug in sei-cli
 
 This is expected. SEI HTML is inconsistent across versions and sometimes across requests.

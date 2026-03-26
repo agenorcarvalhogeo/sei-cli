@@ -123,6 +123,64 @@ with SEIClient() as c:
     rel = c.read_relatorio("48218774", "48218772")
 ```
 
+## Credenciais & Segurança
+
+### Opção 1: Variáveis de Ambiente (rápido pra testar)
+```bash
+export SEI_USUARIO="seu_usuario"
+export SEI_SENHA="sua_senha"
+export SEI_ORGAO="CBM"
+export SEI_LOGIN_URL="https://sei.rn.gov.br/sip/login.php"
+```
+
+### Opção 2: Arquivo de Configuração (razoável)
+```bash
+mkdir -p ~/.config/sei
+cat > ~/.config/sei/credentials.json << 'EOF'
+{
+  "usuario": "seu_usuario",
+  "senha": "sua_senha",
+  "orgao": "CBM",
+  "login_url": "https://sei.rn.gov.br/sip/login.php"
+}
+EOF
+chmod 600 ~/.config/sei/credentials.json
+```
+
+### Opção 3: Bitwarden (recomendado) 🔒
+
+As opções acima funcionam pra um primeiro teste, mas credenciais em texto plano são frágeis — ficam no histórico do shell, em backups, expostas a qualquer processo que leia o filesystem.
+
+A abordagem recomendada é usar o [Bitwarden CLI](https://bitwarden.com/help/cli/) como gerenciador de segredos:
+
+```bash
+# Instalar e logar
+npm install -g @bitwarden/cli
+bw login
+
+# Criar um item no vault com suas credenciais SEI
+bw create item '{
+  "name": "SEI",
+  "login": { "username": "seu_usuario", "password": "sua_senha" },
+  "notes": "SEI_ORGAO=CBM\nSEI_LOGIN_URL=https://sei.rn.gov.br/sip/login.php"
+}'
+
+# Exportar para variáveis de ambiente no início da sessão
+export BW_SESSION=$(bw unlock --raw)
+export SEI_USUARIO=$(bw get username "SEI")
+export SEI_SENHA=$(bw get password "SEI")
+export SEI_ORGAO="CBM"
+export SEI_LOGIN_URL="https://sei.rn.gov.br/sip/login.php"
+```
+
+**Vantagens:**
+- Credenciais encriptadas no vault, não no disco
+- Funciona em múltiplas máquinas via sync
+- Rotação de senha = atualizar num lugar só
+- Se usar com agente de IA (Claude Code, etc.), o agente acessa via CLI sem ver a senha em texto
+
+> É assim que o maintainer do projeto gerencia credenciais. Nenhuma senha toca o filesystem em texto plano.
+
 ## Regras Importantes
 
 ### Blocos Disponibilizados
