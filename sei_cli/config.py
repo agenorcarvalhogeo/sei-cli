@@ -22,6 +22,58 @@ def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+_BW_ITEM_NAME = "SEI SISBOM RN CBMRN"
+_DEFAULT_ORGAO = "CBM"
+_DEFAULT_LOGIN_URL = "https://sei.rn.gov.br/sip/login.php?sigla_orgao_sistema=SEAD&sigla_sistema=SEI"
+
+
+def _load_from_bitwarden() -> Credentials | None:
+    """Try to read SEI credentials from Bitwarden vault.
+
+    Requires BW_SESSION to be set (either as env var or in ~/.openclaw/.bw_session).
+    Returns None if Bitwarden is unavailable or item not found.
+    """
+    import subprocess
+
+    bw_session = os.getenv("BW_SESSION")
+    if not bw_session:
+        bw_session_file = Path("~/.openclaw/.bw_session").expanduser()
+        if bw_session_file.exists():
+            bw_session = bw_session_file.read_text().strip()
+
+    if not bw_session:
+        return None
+
+    env = {**os.environ, "BW_SESSION": bw_session}
+    try:
+        result = subprocess.run(
+            ["bw", "get", "item", _BW_ITEM_NAME],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+
+        item = json.loads(result.stdout)
+        login = item.get("login", {})
+        usuario = login.get("username", "")
+        senha = login.get("password", "")
+
+        if not usuario or not senha:
+            return None
+
+        return Credentials(
+            usuario=usuario,
+            senha=senha,
+            orgao=_DEFAULT_ORGAO,
+            login_url=_DEFAULT_LOGIN_URL,
+        )
+    except Exception:
+        return None
+
+
 def load_credentials(path: Path = CREDENTIALS_PATH) -> Credentials:
     env_usuario = os.getenv("SEI_USUARIO")
     env_senha = os.getenv("SEI_SENHA")
@@ -36,9 +88,16 @@ def load_credentials(path: Path = CREDENTIALS_PATH) -> Credentials:
             login_url=env_login_url,
         )
 
+    # Try Bitwarden first
+    bw_creds = _load_from_bitwarden()
+    if bw_creds is not None:
+        return bw_creds
+
+    # Fallback: local credentials file (backward compatibility)
     if not path.exists():
         raise ConfigError(
-            f"Credenciais não encontradas em {path}. Configure o arquivo ou variáveis de ambiente SEI_*"
+            f"Credenciais não encontradas em {path} e Bitwarden indisponível. "
+            f"Configure o arquivo ou variáveis de ambiente SEI_*"
         )
 
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -46,8 +105,8 @@ def load_credentials(path: Path = CREDENTIALS_PATH) -> Credentials:
         return Credentials(
             usuario=str(data["usuario"]),
             senha=str(data["senha"]),
-            orgao=str(data["orgao"]),
-            login_url=str(data["login_url"]),
+            orgao=str(data.get("orgao", _DEFAULT_ORGAO)),
+            login_url=str(data.get("login_url", _DEFAULT_LOGIN_URL)),
             cargo=str(data.get("cargo", "")),
             id_usuario=str(data.get("id_usuario", "")),
         )
