@@ -1,2 +1,21 @@
 __pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
 patch.diff
+
+# User profile (local, never commit)
+profile.yaml
+.sei/
+
+# Session data
+session.json
+
+# Claude Code / spec-kit agent state
+.claude/settings.local.json
+
+# IDE
+.vscode/
+.idea/

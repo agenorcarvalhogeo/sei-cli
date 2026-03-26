@@ -1,0 +1,56 @@
+# Reaprazamento de Férias — CBMRN
+# Fluxo completo do requerimento até publicação em BG
+
+nome: Reaprazamento de Férias
+orgao: cbmrn
+tipo_processo: "Pessoal: Férias"
+descricao: >
+  Militar solicita alteração de período de férias.
+  Requer aprovação do comandante, acostamento pela secretaria,
+  publicação em Boletim Geral, e notificação às partes.
+
+etapas:
+  - ordem: 1
+    ator: solicitante
+    funcao: Militar requerente
+    acao: criar_processo
+    documento: Requerimento
+    descricao: Cria processo e anexa requerimento de reaprazamento
+    destino: comandante
+
+  - ordem: 2
+    ator: comandante
+    funcao: Comandante da Unidade
+    acao: despachar
+    documento: Despacho
+    decisao:
+      aprovar:
+        destino: secretaria
+      indeferir:
+        destino: solicitante
+        notificar: true
+    descricao: Analisa e decide sobre o reaprazamento
+
+  - ordem: 3
+    ator: secretaria
+    funcao: Secretaria Administrativa
+    acao: acostar_autos
+    descricao: Acosta o despacho aos autos e prepara para publicação
+    destino: bg
+
+  - ordem: 4
+    ator: bg
+    funcao: Seção de Pessoal / BG
+    acao: publicar
+    documento: Publicação em BGCB
+    descricao: Publica o ato no Boletim Geral do Corpo de Bombeiros
+    notificar:
+      - comandante
+      - solicitante
+
+  - ordem: 5
+    ator: solicitante
+    funcao: Militar requerente
+    acao: ciencia
+    descricao: Toma ciência da publicação
+    fim: true
