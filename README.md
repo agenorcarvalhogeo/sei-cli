@@ -2,6 +2,8 @@
 
 CLI Python para interagir com o SEI (RN) por HTTP puro (httpx, sem browser).
 
+> **🤝 Colaboradores:** Push direto na `main` está bloqueado. Leia o [CONTRIBUTING.md](CONTRIBUTING.md) antes de começar. Bugs e sugestões → **Issue primeiro**, fix via **branch + PR**.
+
 ## Instalação
 
 ```bash
