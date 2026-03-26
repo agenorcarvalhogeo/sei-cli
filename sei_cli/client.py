@@ -2871,6 +2871,61 @@ class SEIClient:
 
     # --- Marcadores ---
 
+    MARCADOR_CORES = {
+        "preto": "0",
+        "branco": "1",
+        "cinza": "2",
+        "vermelho": "3",
+        "amarelo": "4",
+        "verde": "5",
+        "azul": "6",
+        "rosa": "7",
+        "roxo": "8",
+        "ciano": "9",
+        "bege": "10",
+        "champagne": "11",
+        "cinza_escuro": "12",
+        "laranja": "13",
+        "lilas": "14",
+        "marrom": "15",
+        "ouro": "16",
+        "prata": "17",
+        "rosa_claro": "18",
+        "tijolo": "19",
+        "verde_agua": "20",
+        "verde_escuro": "21",
+        "verde_amazonas": "22",
+        "azul_ceu": "23",
+        "bronze": "24",
+        "amarelo_ouro": "25",
+        "vinho": "26",
+        "azul_riviera": "27",
+        "verde_abacate": "28",
+        "amarelo_claro": "29",
+        "verde_turquesa": "30",
+        "azul_marinho": "31",
+    }
+
+    def _resolve_cor(self, cor: str | None) -> str:
+        """Resolve a color name or numeric ID to SEI's selStaIcone value.
+
+        Args:
+            cor: Color name (e.g. 'vermelho', 'azul_ceu') or numeric string ID. None → amarelo (4).
+
+        Returns:
+            Numeric string ID for selStaIcone.
+        """
+        if cor is None:
+            return "4"
+        if cor.isdigit():
+            return cor
+        key = cor.lower().replace(" ", "_").replace("-", "_")
+        if key in self.MARCADOR_CORES:
+            return self.MARCADOR_CORES[key]
+        raise ValueError(
+            f"Cor desconhecida: {cor}. Válidas: {', '.join(self.MARCADOR_CORES.keys())}"
+        )
+
     def list_marcadores(self) -> list[Marcador]:
         """List marker catalog available to current unit."""
         html = self._ensure_control()
@@ -2884,18 +2939,21 @@ class SEIClient:
         r = self._get(marcadores_url)
         # Do NOT clear _control_html here — callers may need it after listing
         return parse_marcadores_list(r.text, self._sei_url(""))
-    def criar_marcador(self, nome: str, icone: str = "4") -> str:
+    def criar_marcador(self, nome: str, cor: str | None = "amarelo", icone: str | None = None) -> str:
         """Creates a new marcador in the current unit.
-        
+
         Args:
             nome: Name of the marker.
-            icone: Icon ID (e.g. '4' for Amarelo).
-        
+            cor: Color name (e.g. 'vermelho', 'azul') or numeric ID string. Defaults to 'amarelo'.
+            icone: Legacy numeric icon ID — takes precedence over cor if provided.
+
         Returns:
             The new marcador ID.
         """
+        icon_id = icone if icone is not None else self._resolve_cor(cor)
+
         html = self._ensure_control()
-        
+
         # Always prefer _extract_action_url — _menu_links may have truncated URL (no hash)
         marcadores_url = self._extract_action_url(html, "marcador_listar")
         if not marcadores_url:
@@ -2904,26 +2962,26 @@ class SEIClient:
             raise RuntimeError("Link marcador_listar não encontrado")
 
         r_list = self._get(marcadores_url)
-        
+
         cad_match = re.search(r"location\.href='([^']+marcador_cadastrar[^']+)'", r_list.text)
         if not cad_match:
             raise RuntimeError("Link marcador_cadastrar não encontrado")
-            
+
         from urllib.parse import urljoin
         cad_url = self._sei_url(cad_match.group(1).replace("&amp;", "&"))
         r_cad = self._get(cad_url)
-        
+
         soup = BeautifulSoup(r_cad.text, "lxml")
         form = soup.find("form", id="frmMarcadorCadastro")
         if not form:
             raise RuntimeError("Formulário frmMarcadorCadastro não encontrado")
-            
+
         action = urljoin(self._sei_url(""), form.get("action", "").replace("&amp;", "&"))
-        
+
         data = {
             "hdnInfraTipoPagina": "1",
-            "selStaIcone": icone,
-            "hdnStaIcone": icone,
+            "selStaIcone": icon_id,
+            "hdnStaIcone": icon_id,
             "txtNome": nome,
             "hdnIdMarcador": "",
             "sbmCadastrarMarcador": "Salvar",
@@ -2973,6 +3031,79 @@ class SEIClient:
                     
         return result
 
+    def editar_marcador(
+        self,
+        marcador_id: str,
+        nome: str | None = None,
+        cor: str | None = None,
+    ) -> bool:
+        """Edit an existing marcador (name and/or color).
+
+        Args:
+            marcador_id: The numeric ID of the marcador to edit.
+            nome: New name (if None, keeps current name).
+            cor: New color name or numeric ID (if None, keeps current color).
+
+        Returns:
+            True if saved successfully (redirected to marcador_listar).
+        """
+        from urllib.parse import urljoin
+
+        html = self._ensure_control()
+
+        marcadores_url = self._extract_action_url(html, "marcador_listar")
+        if not marcadores_url:
+            marcadores_url = self._menu_links.get("marcadores")
+        if not marcadores_url:
+            raise RuntimeError("Link marcador_listar não encontrado")
+
+        r_list = self._get(marcadores_url)
+
+        # Find the edit link for this marcador_id (href="..." with double quotes)
+        alt_match = re.search(
+            r'href="([^"]*marcador_alterar[^"]*id_marcador=' + re.escape(marcador_id) + r'[^"]*)"',
+            r_list.text,
+        )
+        if not alt_match:
+            raise RuntimeError(f"Link marcador_alterar não encontrado para id={marcador_id}")
+
+        alt_url = self._sei_url(alt_match.group(1).replace("&amp;", "&"))
+        r_form = self._get(alt_url)
+
+        soup = BeautifulSoup(r_form.text, "lxml")
+        form = soup.find("form", id="frmMarcadorCadastro")
+        if not form:
+            raise RuntimeError("Formulário frmMarcadorCadastro não encontrado")
+
+        action = urljoin(self._sei_url(""), form.get("action", "").replace("&amp;", "&"))
+
+        # Parse current values
+        txt_nome_tag = form.find(id="txtNome") or form.find(attrs={"name": "txtNome"})
+        current_nome = txt_nome_tag["value"] if txt_nome_tag and txt_nome_tag.get("value") else ""
+
+        hdn_icone_tag = form.find(attrs={"name": "hdnStaIcone"})
+        current_icone = hdn_icone_tag["value"] if hdn_icone_tag and hdn_icone_tag.get("value") else "4"
+
+        desc_tag = form.find(attrs={"name": "txaDescricao"})
+        current_desc = desc_tag.get_text() if desc_tag else ""
+
+        resolved_nome = nome if nome is not None else current_nome
+        resolved_icone = self._resolve_cor(cor) if cor is not None else current_icone
+
+        data = {
+            "hdnInfraTipoPagina": "1",
+            "selStaIcone": resolved_icone,
+            "hdnStaIcone": resolved_icone,
+            "txtNome": resolved_nome,
+            "txaDescricao": current_desc,
+            "hdnIdMarcador": marcador_id,
+            "sbmAlterarMarcador": "Salvar",
+        }
+
+        r_save = self._post(action, data)
+        self._control_html = None
+
+        return "marcador_listar" in str(r_save.url) or "marcador_alterar" in str(r_save.url)
 
     def set_marcador(self, id_procedimento: str, marcador_id: str, texto: str = "") -> bool:
         """Apply marker to a process.

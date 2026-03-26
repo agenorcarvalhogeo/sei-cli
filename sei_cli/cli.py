@@ -511,20 +511,46 @@ def marcadores_cmd(unit: str | None, as_json: bool) -> None:
 
 @cli.command("marcador-criar")
 @click.argument("nome")
-@click.option("--icone", default=None, help="Ícone (CSS class)")
+@click.option("--cor", default="amarelo", show_default=True, help="Cor do marcador (nome ou ID numérico)")
 @click.option("--unit", default=None, help="Unidade SEI")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
-def marcador_criar_cmd(nome: str, icone: str | None, unit: str | None, as_json: bool) -> None:
+def marcador_criar_cmd(nome: str, cor: str, unit: str | None, as_json: bool) -> None:
     """Criar um novo marcador."""
     with SEIClient() as client:
         if unit:
             client.switch_unit(unit)
-        mid = client.criar_marcador(nome, icone)
+        mid = client.criar_marcador(nome, cor=cor)
 
     if as_json:
-        _emit({"id": mid, "nome": nome}, True)
+        _emit({"id": mid, "nome": nome, "cor": cor}, True)
     else:
-        console.print(f"[green]✅ Marcador criado: {nome} (ID {mid})[/green]")
+        console.print(f"[green]✅ Marcador criado: {nome} (ID {mid}, cor: {cor})[/green]")
+
+
+@cli.command("marcador-editar")
+@click.argument("marcador_id")
+@click.option("--nome", default=None, help="Novo nome")
+@click.option("--cor", default=None, help="Nova cor (nome ou ID numérico)")
+@click.option("--unit", default=None, help="Unidade SEI")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def marcador_editar_cmd(marcador_id: str, nome: str | None, cor: str | None, unit: str | None, as_json: bool) -> None:
+    """Editar nome e/ou cor de um marcador existente."""
+    if nome is None and cor is None:
+        console.print("[yellow]⚠️  Nenhuma alteração especificada (use --nome e/ou --cor)[/yellow]")
+        return
+
+    with SEIClient() as client:
+        if unit:
+            client.switch_unit(unit)
+        ok = client.editar_marcador(marcador_id, nome=nome, cor=cor)
+
+    if as_json:
+        _emit({"id": marcador_id, "ok": ok}, True)
+    else:
+        if ok:
+            console.print(f"[green]✅ Marcador {marcador_id} atualizado[/green]")
+        else:
+            console.print(f"[red]❌ Falha ao atualizar marcador {marcador_id}[/red]")
 
 
 @cli.command("marcador-set")
