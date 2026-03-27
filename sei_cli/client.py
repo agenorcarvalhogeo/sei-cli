@@ -3626,6 +3626,38 @@ class SEIClient:
                 result.append(f"&amp;#{ord(ch)};")
         return "".join(result)
 
+    @staticmethod
+    def _prepare_free_section(raw_html: str) -> str:
+        """Prepare raw HTML for posting to SEI editor (free/editable sections).
+
+        SEI stores the textarea value literally on the server — what you POST
+        is what gets saved and rendered. Therefore:
+        - Raw HTML tags (<p>, <strong>, etc.) must be posted as-is.
+        - urlencode (done by _post) handles transport encoding (%3C, etc.).
+        - The server receives <p> and stores/renders it as HTML.
+
+        The ONLY transformation needed: non-Latin-1 characters must be
+        converted to numeric HTML entities (&#nnn;) because _post encodes
+        the body as ISO-8859-1 and would fail on codepoints > 255.
+
+        NOTE: Do NOT use html.escape() here — that would post &lt;p&gt;
+        which the server stores literally and renders as text, not HTML.
+
+        Args:
+            raw_html: Raw HTML with literal tags and literal Unicode chars.
+
+        Returns:
+            HTML with non-Latin-1 chars replaced by &#nnn; entities.
+        """
+        result = []
+        for ch in raw_html:
+            try:
+                ch.encode("iso-8859-1")
+                result.append(ch)
+            except UnicodeEncodeError:
+                result.append(f"&#{ord(ch)};")
+        return "".join(result)
+
     def edit_document_section(
         self,
         id_documento: str,
@@ -3669,7 +3701,7 @@ class SEIClient:
                 f"Section '{section_id}' not found. Available: {available}"
             )
 
-        target.content = self.escape_for_sei(new_raw_html)
+        target.content = self._prepare_free_section(new_raw_html)
 
         return self.save_document(save_url, sections)
 
