@@ -266,8 +266,13 @@ class TestUploadExternalDocument:
     @patch.object(SEIClient, '_post')
     @patch.object(SEIClient, '_get')
     @patch.object(SEIClient, '_navigate_to_arvore')
-    def test_rdoformato_set_to_E(self, mock_arvore, mock_get, mock_post, mock_follow):
-        """Verify rdoFormato is set to 'E' (Externo) in form submission."""
+    def test_rdoformato_set_to_D(self, mock_arvore, mock_get, mock_post, mock_follow):
+        """Verify rdoFormato is set to 'D' (Digitalizado) in the cadastro form.
+
+        For external documents the type-selection step uses id_serie=-1 (Externo),
+        but the cadastro form (documento_receber) only accepts N or D for rdoFormato.
+        We use D=Digitalizado because we are uploading a scanned/digital file.
+        """
         mock_arvore.return_value = ARVORE_HTML
         mock_get.return_value = _mock_response(DOC_TYPE_CHOOSER)
 
@@ -289,17 +294,23 @@ class TestUploadExternalDocument:
             self.client.upload_external_document(
                 "55555",
                 self.tmpfile.name,
-                "externo",
+                "boletim",
                 data_elaboracao="08/03/2026",
             )
         except RuntimeError:
             pass  # May fail at the final step; we just want to check the POST data
 
-        # The second POST (cadastro submission) should have rdoFormato='E'
+        # The first POST (type selection) should use id_serie=-1 (Externo path)
+        if len(captured_posts) >= 1:
+            type_sel_data = captured_posts[0][1]
+            assert type_sel_data.get('hdnInfraItensSelecionados') == '-1', (
+                f"Type selection must use -1 (Externo), got: {type_sel_data.get('hdnInfraItensSelecionados')}"
+            )
+        # The second POST (cadastro submission) should have rdoFormato='D'
         if len(captured_posts) >= 2:
             form_data = captured_posts[1][1]
-            assert form_data.get('rdoFormato') == 'E', (
-                f"rdoFormato should be 'E' for external documents, got: {form_data.get('rdoFormato')}"
+            assert form_data.get('rdoFormato') == 'D', (
+                f"rdoFormato should be 'D' for external docs, got: {form_data.get('rdoFormato')}"
             )
 
 

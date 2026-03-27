@@ -3257,6 +3257,10 @@ class SEIClient:
     # Maps friendly name → SEI id_serie (from frmDocumentoEscolherTipo)
     DOC_TYPES: dict[str, str] = {
         "externo": "-1",
+        "anexo": "263",
+        "boletim": "34",
+        "laudo": "54",
+        "laudo_medico": "435",
         "analise_riscos": "220",
         "autorizacao": "305",
         "declaracao": "83",
@@ -4740,7 +4744,7 @@ class SEIClient:
         self,
         id_procedimento: str,
         file_path: str,
-        tipo: str = "externo",
+        tipo: str = "boletim",
         *,
         nivel_acesso: str = "0",
         descricao: str = "",
@@ -4752,27 +4756,39 @@ class SEIClient:
 
         Flow:
           1. Navigate to arvore → get "Incluir Documento" URL
-          2. Submit type selection with rdoFormato=E (Externo)
-          3. Fill the cadastro form (date, description, access level, etc.)
-          4. Upload file via multipart POST to controlador_ajax.php?acao_ajax=upload_arquivo
-          5. Build hdnAnexos string with ± separator in Latin-1 encoding
+          2. Submit the type-selection form with id_serie=-1 (Externo path)
+             + hdnInfraItensSelecionados/-1 so SEI opens documento_receber form
+          3. Fill the documento_receber form (date, description, access level, etc.)
+             with the ACTUAL document type (tipo arg, e.g. 'boletim'=34, 'anexo'=263)
+          4. Upload file via multipart POST to documento_upload_anexo
+             (field name: filArquivo)
+          5. Build hdnAnexos string with ± (Latin-1 \\xb1) separator
           6. Submit the cadastro form with hdnAnexos
 
         CRITICAL: The ± separator (U+00B1) MUST be encoded as Latin-1 \\xb1.
         The SEI server uses ISO-8859-1 throughout.
 
+        NOTE on tipo:
+            The 'Externo' choice (-1) only opens the upload form; the actual
+            document type must be a real id_serie from the selSerie dropdown
+            (e.g. 'boletim'=34, 'anexo'=263, 'laudo'=54, 'relatorio'=408).
+            The default changed from 'externo' to 'boletim' because -1 is not
+            a valid selSerie value in the cadastro form.
+
         Args:
             id_procedimento: Process ID.
             file_path: Path to the PDF file to upload.
-            tipo: Document type key or id_serie. Defaults to 'externo' (-1).
+            tipo: Document type key or numeric id_serie string.
+                  Defaults to 'boletim' (34). Other useful values:
+                  'anexo'=263, 'laudo'=54, 'relatorio'=408, 'oficio'=11.
             nivel_acesso: '0' (Público), '1' (Restrito), '2' (Sigiloso).
             descricao: Document description.
             data_elaboracao: Date in DD/MM/YYYY format. Defaults to today.
             tipo_conferencia: Type of copy:
-                '1' = Cópia Simples
-                '2' = Cópia Autenticada Administrativamente
-                '3' = Cópia Autenticada por Cartório
-                '4' = Documento Original (default)
+                '1' = Documento Original (default)
+                '3' = Cópia Autenticada Administrativamente
+                '2' = Cópia Autenticada por Cartório
+                '4' = Cópia Simples
             numero: Optional document number.
 
         Returns:
@@ -4792,8 +4808,12 @@ class SEIClient:
             from datetime import date
             data_elaboracao = date.today().strftime('%d/%m/%Y')
 
-        # Resolve tipo to id_serie
+        # Resolve tipo to id_serie (actual document type for selSerie)
+        # 'externo' (-1) is NOT a valid selSerie — it only triggers the upload path.
         id_serie = self.DOC_TYPES.get(tipo.lower().replace(' ', '_'), tipo)
+        if id_serie == '-1':
+            # Legacy: if caller passes tipo='externo', default to 'boletim'
+            id_serie = self.DOC_TYPES.get('boletim', '34')
 
         # Step 1: Navigate to arvore, find "Incluir Documento" URL
         arvore_html = self._navigate_to_arvore(id_procedimento)
@@ -4824,7 +4844,12 @@ class SEIClient:
             n = inp.get('name', '')
             if n:
                 fdata[n] = inp.get('value', '')
-        fdata['hdnIdSerie'] = id_serie
+        # The type-selection form uses a checkbox list (chkInfraItem*).
+        # For external documents we ALWAYS select item -1 ("Externo") here —
+        # the actual document type (id_serie) is set later in the cadastro form.
+        fdata['hdnInfraItensSelecionados'] = '-1'
+        fdata['hdnInfraItemId'] = '-1'
+        fdata['hdnIdSerie'] = '-1'
 
         rcadastro = self._post(form_action, fdata)
         csoup = BeautifulSoup(rcadastro.text, 'lxml')
@@ -4859,8 +4884,12 @@ class SEIClient:
 
         # Override with our values
         cdata['hdnFlagDocumentoCadastro'] = '2'
-        cdata['rdoFormato'] = 'E'              # Externo (not N=Nato-digital)
+        # For external docs the form (documento_receber) only offers D=Digitalizado
+        # or N=Nato-digital. 'E' (Externo) is not a valid rdoFormato here.
+        cdata['rdoFormato'] = 'D'              # Digitalizado (escaneado/uploaded)
         cdata['rdoNivelAcesso'] = nivel_acesso
+        # selSerie and hdnIdSerie must be the actual document type (e.g. 34=Boletim)
+        # NOT -1 (which is only valid in the type-selection step, not here).
         cdata['selSerie'] = id_serie
         cdata['hdnIdSerie'] = id_serie
         cdata['txtDataElaboracao'] = data_elaboracao
@@ -4873,14 +4902,23 @@ class SEIClient:
             cdata['txtNumero'] = numero
 
         # Step 4: Upload file via AJAX multipart POST
-        upload_url = self._sei_url(
-            'controlador_ajax.php?acao_ajax=upload_arquivo'
-            f'&infra_sistema=100000100'
+        # The actual upload endpoint is documento_upload_anexo (NOT upload_arquivo).
+        # The URL with its infra_hash is embedded in the JS of the cadastro page:
+        #   new infraUpload('frmAnexos','controlador.php?acao=documento_upload_anexo&...&infra_hash=XXX', ...)
+        upload_url_match = re.search(
+            r"new infraUpload\([^,]+,'([^']+documento_upload_anexo[^']+)'",
+            rcadastro.text,
         )
-        # Add infra_hash if available
-        if 'upload_arquivo' in self._hash_pool:
-            h = self._hash_pool['upload_arquivo'][-1]
-            upload_url = upload_url + f'&infra_hash={h}'
+        if upload_url_match:
+            upload_url = urljoin(self._sei_url(""), upload_url_match.group(1))
+        else:
+            # Fallback: build URL manually (will likely fail with "Hash inválido")
+            upload_url = self._sei_url(
+                'controlador.php?acao=documento_upload_anexo'
+                f'&arvore=1&id_procedimento={id_procedimento}'
+                f'&id_serie={id_serie}'
+                f'&infra_sistema=100000100'
+            )
 
         file_name = os.path.basename(file_path)
         mime_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
@@ -4889,10 +4927,9 @@ class SEIClient:
             file_content = f.read()
 
         # Build multipart form data
-        # SEI uses field name 'hdnAnexoNome' but the actual file upload field
-        # may vary. Try standard multipart with 'file' and 'Filedata'.
+        # SEI uses field name 'filArquivo' for the file upload input.
         import httpx as _httpx
-        files = {'Filedata': (file_name, file_content, mime_type)}
+        files = {'filArquivo': (file_name, file_content, mime_type)}
         r_upload = self.client.post(upload_url, files=files)
         r_upload = self._follow_upload(r_upload)
 
