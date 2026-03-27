@@ -470,3 +470,20 @@ c.add_acompanhamento_especial(
 
 **As needed — Escalas de serviço**:
 Sign via block → download PDF → process with `processar_escala.py`
+
+### 4. Assinatura é Ato Jurídico ⚠️
+Nunca assinar um documento sem um pedido **explícito e inequívoco** do usuário (ex: "assine o relatório", "pode assinar"). Assinatura no SEI tem valor jurídico.
+Sempre chame `get_block_documents()` (ou `get_full_document_tree` e inspecione `assinado`) **antes** de assinar para checar se já está assinado. O POST de assinatura *sempre* executa sem erro mesmo se já assinado.
+
+### 5. Edição de Documentos e Escape HTML
+Ao usar funções que injetam ou editam HTML no SEI (ex: `edit_document_section`), o framework já resolve a maioria dos escapes por causa do *url-encoding* do form POST. **Nunca** aplique escape HTML duplo (ex: `html.escape()`) se a função não pedir expressamente, senão as tags `<b>`, `<p>` aparecerão cruas para o usuário no SEI.
+
+### 6. Troca Redundante de Unidade (`switch_unit`)
+Nunca chame `switch_unit('UNIDADE')` se já estiver nela. O SEI pode corromper a sua sessão, fazendo operações subsequentes apontarem para a árvore de outro processo. Antes de trocar, confira em qual unidade você está ou confie no `sei-cli`, que já tem guard rails, mas evite no script.
+> Dica de Ouro: `id_procedimento` e `id_documento` são numéricos e **imutáveis**. Apenas `infra_hash` muda por navegação. Se os IDs de um documento sumiram ou trocaram totalmente do nada, sua sessão corrompeu. Não invente que o ID "mudou".
+
+### 7. Classificar Processos (Marcadores/Acompanhamento) "No Escuro"
+**Nunca classifique ou adicione marcadores** a um processo lendo apenas o assunto ou a "especificação" da tabela. A especificação costuma ser genérica (ex: "Processos transferidos PARA o PABM" quando eram "DO PABM"). Sempre extraia a árvore de documentos (`get_full_document_tree`) e leia o conteúdo de pelo menos 1 documento (ex: ofício ou requerimento inicial) antes de decidir onde encaixar o processo.
+
+### 8. Acompanhamento Especial: Alterar vs Delete+Re-Add
+Para mudar o grupo ou a observação de um processo que **já está** em Acompanhamento Especial, use SEMPRE `c.alterar_acompanhamento_especial()`. Nunca tente remover o processo do acompanhamento para adicionar de novo, pois o formulário de adição depende de comportamentos em JS que quebram o fluxo puramente HTTP.
