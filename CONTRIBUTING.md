@@ -103,3 +103,17 @@ Ou via arquivo `~/.config/sei/credentials.json`:
 3. Abra PR com descrição clara
 4. Aguarde review do maintainer
 5. Merge após aprovação
+## 🤖 Agentes OpenClaw / ACP
+
+O `sei-cli` mantém uma skill oficial no diretório `skills/openclaw/SKILL.md` atualizada junto com o código-fonte.
+
+**Para instalar/atualizar na sua máquina local:**
+
+```bash
+# Link simbólico para manter a skill sempre sincronizada com o repositório
+mkdir -p ~/.openclaw/workspace/skills/sei
+ln -sf ~/Projects/sei-cli/skills/openclaw/SKILL.md ~/.openclaw/workspace/skills/sei/SKILL.md
+```
+
+Ao fazer modificações em métodos públicos da API ou adicionar funcionalidades, **sempre atualize o arquivo `skills/openclaw/SKILL.md`** correspondente.
+

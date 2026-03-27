@@ -14,6 +14,7 @@ Every change goes through a **branch → PR → review** workflow.
 3. **Never include personal data** (CPFs, real names, process numbers) in commits or Issues.
 4. **Read `.context/CONTEXT.md`** before modifying any code.
 5. **Test before committing** — run `pytest` and verify HTML parsing.
+6. **Keep SKILL.md up to date** — if you change public methods, update `skills/openclaw/SKILL.md`.
 
 ## Credentials Best Practice
 
