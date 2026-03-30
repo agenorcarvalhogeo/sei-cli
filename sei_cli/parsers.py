@@ -371,9 +371,15 @@ def parse_blocks(content: str, base_url: str) -> list[Block]:
         
         estado = _norm(tds[4].text_content())
         unidade_origem = _norm(tds[5].text_content())
-        # Column 6 may contain "Aguardando Devolução <unit>" for disponibilizado blocks
-        raw_dest = _norm(tds[6].text_content())
-        unidade_destino = raw_dest.replace("Aguardando Devolução", "").strip() if raw_dest else ""
+        dest_units = [
+            label
+            for div in tds[6].xpath('.//div[contains(@class,"divUnidadeRotulo")]')
+            if (label := _norm(div.text_content()))
+        ]
+        if not dest_units:
+            raw_dest = _norm(tds[6].text_content()).replace("Aguardando Devolução", "").strip()
+            dest_units = [raw_dest] if raw_dest else []
+        unidade_destino = "; ".join(dest_units)
         descricao = _norm(tds[8].text_content()) if len(tds) > 8 else ""
         
         # Link to bloco detail
@@ -385,6 +391,7 @@ def parse_blocks(content: str, base_url: str) -> list[Block]:
             estado=estado,
             unidade_origem=unidade_origem,
             unidade_destino=unidade_destino,
+            unidades_destino=dest_units,
             descricao=descricao,
             link=link,
         ))
@@ -410,7 +417,17 @@ def parse_block_documents(content: str, base_url: str) -> list[BlockDocument]:
         processo = _norm(tds[2].text_content()) if len(tds) > 2 else ""
         doc_id = _norm(tds[3].text_content()) if len(tds) > 3 else ""
         tipo_doc = _norm(tds[4].text_content()) if len(tds) > 4 else ""
-        assinante = _norm(tds[5].text_content()) if len(tds) > 5 else ""
+        assinantes: list[str] = []
+        if len(tds) > 5:
+            assinantes = [
+                label
+                for div in tds[5].xpath('.//div[contains(@class,"divRotuloItemCelula")]')
+                if (label := _norm(div.text_content()))
+            ]
+            if not assinantes:
+                raw = _norm(tds[5].text_content())
+                assinantes = [raw] if raw else []
+        assinante = "; ".join(assinantes)
         
         # Check if signed (look for 'Assinatura' img with specific title)
         imgs = row.xpath(".//img[@title]")
@@ -422,6 +439,7 @@ def parse_block_documents(content: str, base_url: str) -> list[BlockDocument]:
             documento_id=doc_id,
             tipo_documento=tipo_doc,
             assinante=assinante,
+            assinantes=assinantes,
             assinado=assinado,
         ))
     

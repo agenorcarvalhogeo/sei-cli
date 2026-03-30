@@ -5,6 +5,8 @@ from sei_cli.parsers import (
     parse_marcador_form,
     parse_marcadores_list,
     parse_menu_links,
+    parse_block_documents,
+    parse_blocks,
     parse_processes,
     parse_system_status,
     parse_tramitar_form,
@@ -100,3 +102,104 @@ def test_parse_marcador_form() -> None:
     assert form.marcador_field == "selMarcador"
     assert form.texto_field == "txaTexto"
     assert len(form.marcadores) == 2
+
+
+def test_parse_blocks_extracts_div_based_destination_units() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr class="infraTrClara">
+          <td><input type="checkbox"/></td>
+          <td><a href="controlador.php?acao=rel_bloco_protocolo_listar&id_bloco=773617">773617</a></td>
+          <td></td>
+          <td></td>
+          <td>Disponibilizado</td>
+          <td>CBM - COBM - GAB CMDO</td>
+          <td class="d-none d-md-table-cell" align="center">
+            <div class="divUnidade"><div class="divUnidadeIcone"><img src="svg/bloco_aguardando_devolucao.svg?18" height="16" width="16" title="Aguardando Devolução"></div><div class="divUnidadeRotulo"><a href="javascript:void(0);" class="ancoraSigla">CBM - COBM - CMDO PABM APODI</a></div></div>
+            <div class="divUnidade"><div class="divUnidadeIcone"><img src="svg/bloco_aguardando_devolucao.svg?18" height="16" width="16" title="Aguardando Devolução"></div><div class="divUnidadeRotulo"><a href="javascript:void(0);" class="ancoraSigla">CBM - COBM - CMDO 2ºSGB/3ºGBM</a></div></div>
+          </td>
+          <td></td>
+          <td>Bloco de teste</td>
+          <td></td>
+        </tr>
+      </table>
+    </body></html>
+    """
+
+    blocks = parse_blocks(html, BASE)
+
+    assert len(blocks) == 1
+    assert blocks[0].numero == "773617"
+    assert blocks[0].unidades_destino == [
+        "CBM - COBM - CMDO PABM APODI",
+        "CBM - COBM - CMDO 2ºSGB/3ºGBM",
+    ]
+    assert blocks[0].unidade_destino == (
+        "CBM - COBM - CMDO PABM APODI; CBM - COBM - CMDO 2ºSGB/3ºGBM"
+    )
+
+
+def test_parse_block_documents_extracts_div_based_signers() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr class="infraTrClara">
+          <td><input type="checkbox"/></td>
+          <td>1</td>
+          <td>08810058.000128/2026-69</td>
+          <td>48568466</td>
+          <td>Relatório do Fiscal</td>
+          <td align="justified">
+            <div class="divItemCelula"><div class="divIconeItemCelula"><img src="svg/tabela_item_celula.svg?18" height="16" width="16" title="Assinatura"></div><div class="divRotuloItemCelula">EDUARDO DOS SANTOS PEDROSA / Soldado QPBM</div></div>
+            <div class="divItemCelula"><div class="divIconeItemCelula"><img src="svg/tabela_item_celula.svg?18" height="16" width="16" title="Assinatura"></div><div class="divRotuloItemCelula">LEO ZENON TASSI / 2º Tenente QOEM BM</div></div>
+            <div class="divItemCelula"><div class="divIconeItemCelula"><img src="svg/tabela_item_celula.svg?18" height="16" width="16" title="Assinatura"></div><div class="divRotuloItemCelula">JEDSON RAFAEL ALMEIDA MENEZES / Soldado QPBM</div></div>
+            <div class="divItemCelula"><div class="divIconeItemCelula"><img src="svg/tabela_item_celula.svg?18" height="16" width="16" title="Assinatura"></div><div class="divRotuloItemCelula">RENATO MATOS LEONARDO / Soldado QPBM</div></div>
+          </td>
+          <td><img title="Assinatura"/></td>
+        </tr>
+      </table>
+    </body></html>
+    """
+
+    docs = parse_block_documents(html, BASE)
+
+    assert len(docs) == 1
+    assert docs[0].assinantes == [
+        "EDUARDO DOS SANTOS PEDROSA / Soldado QPBM",
+        "LEO ZENON TASSI / 2º Tenente QOEM BM",
+        "JEDSON RAFAEL ALMEIDA MENEZES / Soldado QPBM",
+        "RENATO MATOS LEONARDO / Soldado QPBM",
+    ]
+    assert docs[0].assinante == (
+        "EDUARDO DOS SANTOS PEDROSA / Soldado QPBM; "
+        "LEO ZENON TASSI / 2º Tenente QOEM BM; "
+        "JEDSON RAFAEL ALMEIDA MENEZES / Soldado QPBM; "
+        "RENATO MATOS LEONARDO / Soldado QPBM"
+    )
+    assert docs[0].assinado is True
+
+
+def test_parse_block_documents_unsigned_row_keeps_empty_signers() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr class="infraTrEscura">
+          <td><input type="checkbox"/></td>
+          <td>1</td>
+          <td>08810058.000128/2026-69</td>
+          <td>48568466</td>
+          <td>Relatório do Fiscal</td>
+          <td align="justified"></td>
+          <td><img title="Pendente"/></td>
+        </tr>
+      </table>
+    </body></html>
+    """
+
+    docs = parse_block_documents(html, BASE)
+
+    assert len(docs) == 1
+    assert docs[0].assinantes == []
+    assert docs[0].assinante == ""
+    assert docs[0].assinado is False

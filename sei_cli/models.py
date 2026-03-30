@@ -77,10 +77,27 @@ class BlockDocument:
     processo: str
     documento_id: str
     tipo_documento: str
-    assinante: str
+    assinante: str = ""
+    assinantes: list[str] = field(default_factory=list)
+    numero_sei: str | None = None
+    numero_documento: str | None = None
+    data_documento: str | None = None
     assinado: bool = False
     link_processo: str | None = None
     link_documento: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.assinantes:
+            self.assinantes = [item.strip() for item in self.assinantes if item and item.strip()]
+            if not self.assinante:
+                self.assinante = "; ".join(self.assinantes)
+        elif self.assinante:
+            self.assinantes = [item.strip() for item in self.assinante.split(";") if item.strip()]
+
+        if self.numero_sei and not self.numero_documento:
+            self.numero_documento = self.numero_sei
+        elif self.numero_documento and not self.numero_sei:
+            self.numero_sei = self.numero_documento
 
 
 @dataclass(slots=True)
@@ -90,8 +107,17 @@ class Block:
     unidade_origem: str
     unidade_destino: str
     descricao: str
+    unidades_destino: list[str] = field(default_factory=list)
     link: str | None = None
     documentos: list[BlockDocument] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.unidades_destino:
+            self.unidades_destino = [item.strip() for item in self.unidades_destino if item and item.strip()]
+            if not self.unidade_destino:
+                self.unidade_destino = "; ".join(self.unidades_destino)
+        elif self.unidade_destino:
+            self.unidades_destino = [item.strip() for item in self.unidade_destino.split(";") if item.strip()]
 
 
 @dataclass(slots=True)
