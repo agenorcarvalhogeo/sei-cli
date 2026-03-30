@@ -113,6 +113,11 @@ class RelatorioServico:
     passagem_para: str = ""
     data_passagem: str = ""
 
+    # Signature
+    assinado: bool = False
+    assinado_por: str = ""
+    assinado_em: str = ""  # DD/MM/YYYY HH:MM
+
 
 def _norm(text: str) -> str:
     """Normalize whitespace and common HTML entities."""
@@ -269,7 +274,7 @@ def _parse_header(soup: BeautifulSoup, r: RelatorioServico) -> None:
         # Fiscal name: "2° SGT BM Vilson - Fiscal de Operações"
         m = re.search(r"(.+?)\s*-?\s*Fiscal de Opera", text)
         if m and not r.fiscal:
-            raw = _norm(m.group(1))
+            raw = _norm(m.group(1)).rstrip(" (")
             r.posto_fiscal, r.fiscal = _parse_rank_name(raw)
 
         # Date: "do dia DD para o dia DD de MÊS de AAAA"
@@ -610,6 +615,12 @@ def summarize(r: RelatorioServico) -> str:
     if r.passagem_para:
         lines.append(f"🔄 Passagem para: {r.passagem_para}")
 
+    # Signature status
+    if r.assinado:
+        lines.append(f"✒️ Assinado por {r.assinado_por} em {r.assinado_em}")
+    else:
+        lines.append("❌ Não assinado eletronicamente")
+
     return "\n".join(lines)
 
 
@@ -624,6 +635,27 @@ def summarize_batch(relatorios: list[RelatorioServico]) -> str:
     )
 
     lines: list[str] = ["# Resumo Semanal", ""]
+
+    # Fiscais and signature status
+    lines.extend(["## Fiscais da Semana", ""])
+    for r in ordered:
+        date_label = r.data_inicio or "sem data"
+        fiscal_name = f"{r.posto_fiscal} {r.fiscal}".strip() or "N/A"
+        # Determine service type from personnel data
+        tipo = "Ordinário"
+        for m in r.militares:
+            if m.nome and r.fiscal and m.nome.upper() in r.fiscal.upper():
+                if m.status == "extraordinario":
+                    tipo = "Extraordinário"
+                elif m.status == "permuta":
+                    tipo = "Permuta"
+                break
+        if r.assinado:
+            sig_icon = "✒️"  # signed
+        else:
+            sig_icon = "❌"  # not signed
+        lines.append(f"- {date_label}: {fiscal_name} — {tipo} {sig_icon}")
+    lines.append("")
 
     lines.extend(["## Escala e Efetivo", ""])
     prev_extra: set[str] | None = None

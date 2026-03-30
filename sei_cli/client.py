@@ -490,30 +490,13 @@ class SEIClient:
 
     # --- Process creation ---
 
-    def create_process(
+    def _load_process_creation_form(
         self,
         tipo_processo_id: str,
-        *,
-        especificacao: str = "",
-        interessados: str = "",
-        observacoes: str = "",
-        nivel_acesso: str = "0",  # 0=Público, 1=Restrito, 2=Sigiloso
-    ) -> dict:
-        """Create a new process (Iniciar Processo).
-
-        Args:
-            tipo_processo_id: The process type ID (e.g. '100000506' for Diárias).
-            especificacao: Description/specification field.
-            interessados: Interested party text.
-            observacoes: Notes for the unit.
-            nivel_acesso: '0' (Público), '1' (Restrito), '2' (Sigiloso).
-
-        Returns:
-            Dict with 'numero' (process number), 'id_procedimento', 'link'.
-        """
+    ) -> tuple[BeautifulSoup, dict[str, str], str]:
+        """Load the process creation form for a specific process type."""
         html = self._ensure_control()
 
-        # Step 1: Navigate to type chooser page
         href_match = re.search(
             r'href="(controlador\.php\?acao=procedimento_escolher_tipo[^"]+)"',
             html,
@@ -525,9 +508,7 @@ class SEIClient:
         r_tipo = self._get(tipo_url)
 
         soup_tipo = BeautifulSoup(r_tipo.text, "lxml")
-        form_tipo = soup_tipo.find(
-            "form", id="frmProcedimentoEscolherTipo"
-        )
+        form_tipo = soup_tipo.find("form", id="frmProcedimentoEscolherTipo")
         if not form_tipo:
             raise RuntimeError("Formulário de escolha de tipo não encontrado")
 
@@ -539,7 +520,6 @@ class SEIClient:
                 data_tipo[n] = inp.get("value", "")
         data_tipo["hdnIdTipoProcedimento"] = tipo_processo_id
 
-        # Step 2: Submit type selection → get cadastro form
         r_cad = self._post(action_tipo, data_tipo)
         soup_cad = BeautifulSoup(r_cad.text, "lxml")
         form_cad = soup_cad.find("form", id="frmProcedimentoCadastro")
@@ -548,14 +528,12 @@ class SEIClient:
 
         action_cad = urljoin(self._sei_url(""), form_cad["action"])
 
-        # Collect all form fields
         data_cad: dict[str, str] = {}
         for inp in form_cad.find_all("input"):
             n = inp.get("name", "")
             if not n:
                 continue
             if inp.get("type") == "radio":
-                # Only include checked radios or set our defaults
                 if inp.get("checked"):
                     data_cad[n] = inp.get("value", "")
             else:
@@ -569,6 +547,298 @@ class SEIClient:
             n = ta.get("name", "")
             if n:
                 data_cad[n] = ta.get_text()
+
+        return soup_cad, data_cad, action_cad
+
+    def _collect_form_defaults(self, form: Any) -> dict[str, str]:
+        data: dict[str, str] = {}
+        for inp in form.find_all("input"):
+            n = inp.get("name", "")
+            if not n:
+                continue
+            if inp.get("type") == "radio":
+                if inp.get("checked"):
+                    data[n] = inp.get("value", "")
+            else:
+                data[n] = inp.get("value", "")
+        for sel in form.find_all("select"):
+            n = sel.get("name", "")
+            if n:
+                selected = sel.find("option", selected=True)
+                data[n] = selected["value"] if selected else ""
+        for ta in form.find_all("textarea"):
+            n = ta.get("name", "")
+            if n:
+                data[n] = ta.get_text()
+        return data
+
+    def _extract_access_hypotheses_from_form(
+        self,
+        soup_cad: BeautifulSoup,
+        data_cad: dict[str, str],
+        *,
+        nivel_acesso: str,
+    ) -> dict[str, Any]:
+        form_cad = soup_cad.find("form")
+        assert form_cad is not None
+
+        def field_label(tag: Any) -> str:
+            tag_id = tag.get("id")
+            if tag_id:
+                label = soup_cad.find("label", attrs={"for": tag_id})
+                if label:
+                    return label.get_text(" ", strip=True)
+            return tag.get("title") or tag.get("aria-label") or tag.get("name") or tag.get("id") or ""
+
+        access_hypotheses: list[dict[str, Any]] = []
+        for sel in form_cad.find_all("select"):
+            name = sel.get("name", "")
+            if not name:
+                continue
+            haystack = " ".join(
+                filter(
+                    None,
+                    [
+                        name,
+                        sel.get("id", ""),
+                        sel.get("title", ""),
+                        sel.get("aria-label", ""),
+                        field_label(sel),
+                    ],
+                )
+            ).lower()
+            if not any(token in haystack for token in ("hipot", "hipót", "motivo", "fundamento", "base legal", "restr", "sigil")):
+                continue
+            options = [
+                {
+                    "value": opt.get("value", ""),
+                    "label": opt.get_text(" ", strip=True),
+                    "selected": bool(opt.get("selected")),
+                }
+                for opt in sel.find_all("option")
+                if opt.get("value")
+            ]
+            if not options:
+                continue
+            hidden_name = None
+            if name.startswith("sel"):
+                candidate_hidden = f"hdn{name[3:]}"
+                if candidate_hidden in data_cad:
+                    hidden_name = candidate_hidden
+            access_hypotheses.append(
+                {
+                    "field_name": name,
+                    "field_id": sel.get("id"),
+                    "field_label": field_label(sel),
+                    "hidden_field_name": hidden_name,
+                    "options": options,
+                }
+            )
+
+        by_level = {
+            "1": {"selHipoteseLegal"},
+            "2": {"selGrauSigilo", "selHipoteseLegal"},
+        }
+        expected_fields = by_level.get(nivel_acesso)
+        warnings: list[str] = []
+        if expected_fields:
+            filtered = [item for item in access_hypotheses if item["field_name"] in expected_fields]
+            if filtered:
+                access_hypotheses = filtered
+
+        for item in access_hypotheses:
+            option_values = [opt["value"] for opt in item["options"]]
+            if item["field_name"] == "selHipoteseLegal" and option_values in ([], ["null"]):
+                ajax_options = self._fetch_hipotese_legal_options(soup_cad, nivel_acesso)
+                if ajax_options:
+                    item["options"] = ajax_options
+                    item["ajax_resolved"] = True
+                else:
+                    warnings.append("Hipóteses legais de acesso parecem ser carregadas via AJAX; preview incompleto.")
+
+        return {
+            "nivel_acesso_field": "rdoNivelAcesso",
+            "access_hypotheses": access_hypotheses,
+            "warnings": warnings,
+        }
+
+    def _parse_select_options_response(self, text: str) -> list[dict[str, Any]]:
+        soup = BeautifulSoup(text, "lxml")
+        options = [
+            {
+                "value": opt.get("value", ""),
+                "label": opt.get_text(" ", strip=True),
+                "selected": bool(opt.get("selected")),
+            }
+            for opt in soup.find_all("option")
+            if opt.get("value") and opt.get("value") != "null"
+        ]
+        if options:
+            return options
+
+        matches = re.findall(
+            r"new\s+Option\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+            text,
+        )
+        return [
+            {"label": label.strip(), "value": value.strip(), "selected": False}
+            for label, value in matches
+            if value.strip() and value.strip() != "null"
+        ]
+
+    def _fetch_hipotese_legal_options(
+        self,
+        soup_cad: BeautifulSoup,
+        nivel_acesso: str,
+    ) -> list[dict[str, Any]]:
+        script_text = "\n".join(
+            script.get_text("\n", strip=False)
+            for script in soup_cad.find_all("script")
+            if "selHipoteseLegal" in script.get_text() and "infraAjaxMontarSelect" in script.get_text()
+        )
+        if not script_text:
+            return []
+
+        ajax_match = re.search(
+            r"new\s+infraAjaxMontarSelect\(\s*'selHipoteseLegal'\s*,\s*'([^']+)'\)",
+            script_text,
+        )
+        if not ajax_match:
+            return []
+
+        ajax_url = self._sei_url(ajax_match.group(1).replace("&amp;", "&"))
+        sugestao = ""
+        hidden = soup_cad.find("input", id="hdnIdHipoteseLegalSugestao")
+        if hidden:
+            sugestao = hidden.get("value", "")
+
+        resp = self.client.post(
+            ajax_url,
+            data={
+                "q": "",
+                "id": "null",
+                "idSugestao": sugestao,
+                "staNivelAcesso": nivel_acesso,
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        return self._parse_select_options_response(resp.text)
+
+    def get_process_creation_metadata(
+        self,
+        tipo_processo_id: str,
+        *,
+        nivel_acesso: str = "0",
+    ) -> dict[str, Any]:
+        """Inspect the creation form and expose relevant access hypotheses."""
+        soup_cad, data_cad, _action_cad = self._load_process_creation_form(tipo_processo_id)
+        access_metadata = self._extract_access_hypotheses_from_form(
+            soup_cad,
+            data_cad,
+            nivel_acesso=nivel_acesso,
+        )
+        return {
+            "tipo_processo_id": tipo_processo_id,
+            **access_metadata,
+        }
+
+    def _load_document_creation_form(
+        self,
+        id_procedimento: str,
+        tipo: str,
+    ) -> tuple[BeautifulSoup, dict[str, str], str, str]:
+        id_serie = self.DOC_TYPES.get(tipo.lower().replace(" ", "_"), tipo)
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError("Não foi possível acessar a árvore do processo")
+
+        href_match = re.search(
+            r'href="([^"]+)"[^>]*>\s*<img\s+[^>]*documento_incluir',
+            arvore_html,
+        )
+        if not href_match:
+            raise RuntimeError("Link 'Incluir Documento' não encontrado na árvore")
+
+        incl_url = urljoin(self._sei_url(""), href_match.group(1))
+        rtype = self._get(incl_url)
+        tsoup = BeautifulSoup(rtype.text, "lxml")
+        form = tsoup.find("form", id="frmDocumentoEscolherTipo")
+        if not form:
+            raise RuntimeError("Formulário de escolha de tipo não encontrado")
+
+        form_action = urljoin(self._sei_url(""), form["action"])
+        fdata: dict[str, str] = {}
+        for inp in form.find_all("input"):
+            n = inp.get("name", "")
+            if n:
+                fdata[n] = inp.get("value", "")
+        fdata["hdnIdSerie"] = id_serie
+
+        rcadastro = self._post(form_action, fdata)
+        csoup = BeautifulSoup(rcadastro.text, "lxml")
+        cform = csoup.find("form", id="frmDocumentoCadastro")
+        if not cform:
+            raise RuntimeError(
+                "Formulário de cadastro não encontrado. "
+                f"Tipo '{tipo}' (id_serie={id_serie}) pode não estar disponível."
+            )
+
+        cform_action = urljoin(self._sei_url(""), cform["action"])
+        cdata = self._collect_form_defaults(cform)
+        return csoup, cdata, cform_action, id_serie
+
+    def get_document_creation_metadata(
+        self,
+        id_procedimento: str,
+        tipo: str,
+        *,
+        nivel_acesso: str | None = None,
+    ) -> dict[str, Any]:
+        soup_cad, data_cad, _action, id_serie = self._load_document_creation_form(id_procedimento, tipo)
+        default_nivel_acesso = data_cad.get("rdoNivelAcesso", "0")
+        access_metadata = self._extract_access_hypotheses_from_form(
+            soup_cad,
+            data_cad,
+            nivel_acesso=nivel_acesso or default_nivel_acesso,
+        )
+        text_options = []
+        for value, label in (("N", "Nenhum"), ("T", "Texto Padrão"), ("D", "Documento Modelo")):
+            text_options.append({"value": value, "label": label})
+        return {
+            "id_procedimento": id_procedimento,
+            "tipo_documento_id": id_serie,
+            "tipo_documento": tipo,
+            "default_nivel_acesso": default_nivel_acesso,
+            "texto_inicial_options": text_options,
+            **access_metadata,
+        }
+
+    def create_process(
+        self,
+        tipo_processo_id: str,
+        *,
+        especificacao: str = "",
+        interessados: str = "",
+        observacoes: str = "",
+        nivel_acesso: str = "0",  # 0=Público, 1=Restrito, 2=Sigiloso
+        extra_fields: dict[str, str] | None = None,
+    ) -> dict:
+        """Create a new process (Iniciar Processo).
+
+        Args:
+            tipo_processo_id: The process type ID (e.g. '100000506' for Diárias).
+            especificacao: Description/specification field.
+            interessados: Interested party text.
+            observacoes: Notes for the unit.
+            nivel_acesso: '0' (Público), '1' (Restrito), '2' (Sigiloso).
+
+        Returns:
+            Dict with 'numero' (process number), 'id_procedimento', 'link'.
+        """
+        soup_cad, data_cad, action_cad = self._load_process_creation_form(tipo_processo_id)
 
         # Set our values
         data_cad["hdnFlagProcedimentoCadastro"] = "2"  # Critical: triggers save
@@ -608,6 +878,9 @@ class SEIClient:
                 ]
                 if vals:
                     data_cad["hdnInteressadosProcedimento"] = "|".join(vals) + "|"
+
+        if extra_fields:
+            data_cad.update(extra_fields)
 
         # Submit creation
         r_create = self._post(action_cad, data_cad)
@@ -3323,10 +3596,11 @@ class SEIClient:
         id_procedimento: str,
         tipo: str,
         *,
-        nivel_acesso: str = "0",  # 0=Público, 1=Restrito, 2=Sigiloso
+        nivel_acesso: str | None = None,  # None = keep form default / process pattern
         texto_inicial: str = "N",  # N=Nenhum, T=Texto Padrão, D=Documento Modelo
         descricao: str = "",
         interessados: str = "",
+        extra_fields: dict[str, str] | None = None,
     ) -> DocumentCreated:
         """Create a new document inside a process.
 
@@ -3341,72 +3615,22 @@ class SEIClient:
         Returns:
             DocumentCreated with id_documento and editor URL.
         """
-        # Resolve tipo to id_serie
-        id_serie = self.DOC_TYPES.get(tipo.lower().replace(" ", "_"), tipo)
-
-        arvore_html = self._navigate_to_arvore(id_procedimento)
-        if not arvore_html:
-            raise RuntimeError("Não foi possível acessar a árvore do processo")
-
-        # Step 1: Get 'Incluir Documento' URL
-        href_match = re.search(
-            r'href="([^"]+)"[^>]*>\s*<img\s+[^>]*documento_incluir',
-            arvore_html,
-        )
-        if not href_match:
-            raise RuntimeError("Link 'Incluir Documento' não encontrado na árvore")
-
-        incl_url = urljoin(self._sei_url(""), href_match.group(1))
-        rtype = self._get(incl_url)
-
-        # Step 2: Submit type selection form (escolher(id_serie))
-        tsoup = BeautifulSoup(rtype.text, "lxml")
-        form = tsoup.find("form", id="frmDocumentoEscolherTipo")
-        if not form:
-            raise RuntimeError("Formulário de escolha de tipo não encontrado")
-
-        form_action = urljoin(self._sei_url(""), form["action"])
-        fdata: dict[str, str] = {}
-        for inp in form.find_all("input"):
-            n = inp.get("name", "")
-            if n:
-                fdata[n] = inp.get("value", "")
-        fdata["hdnIdSerie"] = id_serie
-
-        rcadastro = self._post(form_action, fdata)
-        csoup = BeautifulSoup(rcadastro.text, "lxml")
-
-        # Step 3: Fill creation form (frmDocumentoCadastro)
-        cform = csoup.find("form", id="frmDocumentoCadastro")
-        if not cform:
-            raise RuntimeError(
-                "Formulário de cadastro não encontrado. "
-                f"Tipo '{tipo}' (id_serie={id_serie}) pode não estar disponível."
-            )
-
-        cform_action = urljoin(self._sei_url(""), cform["action"])
-        cdata: dict[str, str] = {}
-        for inp in cform.find_all("input"):
-            n = inp.get("name", "")
-            if n:
-                cdata[n] = inp.get("value", "")
-        for sel in cform.find_all("select"):
-            n = sel.get("name", "")
-            if n:
-                selected = sel.find("option", selected=True)
-                cdata[n] = selected["value"] if selected else ""
+        csoup, cdata, cform_action, id_serie = self._load_document_creation_form(id_procedimento, tipo)
 
         # Set our values
         # CRITICAL: submeter() JS sets hdnFlagDocumentoCadastro='2' before submit.
         # Without this, SEI just re-renders the form instead of creating the doc.
         cdata["hdnFlagDocumentoCadastro"] = "2"
         cdata["rdoTextoInicial"] = texto_inicial
-        cdata["rdoNivelAcesso"] = nivel_acesso
+        if nivel_acesso is not None:
+            cdata["rdoNivelAcesso"] = nivel_acesso
         cdata["rdoFormato"] = "N"  # Nato-digital
         if descricao:
             cdata["txtDescricao"] = descricao
         if interessados:
             cdata["txtInteressado"] = interessados
+        if extra_fields:
+            cdata.update(extra_fields)
 
         # Submit creation
         rcreated = self._post(cform_action, cdata)
@@ -3770,7 +3994,28 @@ class SEIClient:
                     raise RuntimeError(
                         f"Processo {id_procedimento} não acessível na unidade {switched_to}"
                     )
-            return self._view_document_html_core(id_documento, arvore_html)
+            try:
+                return self._view_document_html_core(id_documento, arvore_html)
+            except RuntimeError as exc:
+                if "Link de visualização não encontrado" not in str(exc):
+                    raise
+
+                docs = self.get_full_document_tree(id_procedimento, expand_all=True)
+                target = next(
+                    (doc for doc in docs if doc.id_documento == id_documento and doc.src_url),
+                    None,
+                )
+                if target is None:
+                    raise
+                if target.tipo.lower() == "pdf":
+                    raise RuntimeError("PDF documents have no HTML representation")
+
+                r = self._get(target.src_url)
+                if "login.php" in str(r.url) or "pwdSenha" in r.text:
+                    raise RuntimeError(
+                        "Session expired viewing document. Re-login needed."
+                    )
+                return r.text
 
     def view_document(
         self, id_documento: str, id_procedimento: str
@@ -3880,29 +4125,58 @@ class SEIClient:
         """Read and parse a Relatório de Serviço Operacional.
 
         Returns a structured RelatorioServico with personnel, vehicles,
-        occurrences, etc.
+        occurrences, etc.  Works for both unsigned (editor) and signed
+        (print view) documents.
         """
-        from html import unescape as _unescape
-        save_url, sections = self.get_editor_sections(id_documento, id_procedimento)
-        if not sections:
-            raise RuntimeError(f"Documento {id_documento} não tem conteúdo")
+        body_html: str | None = None
 
-        # The body is typically the section with most content (not timbre/footer)
-        # Find it — exclude very short sections (title, footer)
-        body_candidates = [s for s in sections if len(s.content) > 1000]
-        if not body_candidates:
-            body_candidates = sections
+        # Try editor first (unsigned docs)
+        try:
+            save_url, sections = self.get_editor_sections(id_documento, id_procedimento)
+            if sections:
+                body_candidates = [s for s in sections if len(s.content) > 1000]
+                if not body_candidates:
+                    body_candidates = sections
+                body_sec = None
+                for s in body_candidates:
+                    if "Fiscal" in s.content or "RELAT" in s.content:
+                        body_sec = s
+                        break
+                if not body_sec:
+                    body_sec = max(body_candidates, key=lambda s: len(s.content))
+                body_html = body_sec.content
+        except RuntimeError:
+            pass  # signed doc — fall through to print view
 
-        # Pick the one that contains "RELATÓRIO" or "Fiscal" keywords
-        body_sec = None
-        for s in body_candidates:
-            if "Fiscal" in s.content or "RELAT" in s.content:
-                body_sec = s
-                break
-        if not body_sec:
-            body_sec = max(body_candidates, key=lambda s: len(s.content))
+        # Fallback: use print view (works for signed docs)
+        if body_html is None:
+            body_html = self.view_document_html(id_documento, id_procedimento)
 
-        return parse_relatorio(body_sec.content)
+        relatorio = parse_relatorio(body_html)
+
+        # Check signature status from the print/view HTML
+        try:
+            view_html = self.view_document_html(id_documento, id_procedimento)
+            import re as _re
+            # Strip HTML tags for cleaner regex matching
+            _clean = _re.sub(r'<[^>]+>', '', view_html)
+            _clean = _clean.replace('&ordm;', 'º').replace('&agrave;', 'à')
+            _clean = _clean.replace('&aacute;', 'á').replace('&iacute;', 'í')
+            sig_match = _re.search(
+                r'assinado\s+eletronicamente\s+por\s+'
+                r'(.+?)\s*,\s*[^,]+?,\s*em\s+'
+                r'(\d{2}/\d{2}/\d{4})\s*,\s*[àa]s?\s*(\d{2}:\d{2})',
+                _clean,
+                _re.IGNORECASE,
+            )
+            if sig_match:
+                relatorio.assinado = True
+                relatorio.assinado_por = sig_match.group(1).strip()
+                relatorio.assinado_em = f"{sig_match.group(2)} {sig_match.group(3)}"
+        except Exception:
+            pass  # signature check is best-effort
+
+        return relatorio
 
     def batch_read_relatorios(
         self,
