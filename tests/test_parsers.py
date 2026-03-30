@@ -203,3 +203,94 @@ def test_parse_block_documents_unsigned_row_keeps_empty_signers() -> None:
     assert docs[0].assinantes == []
     assert docs[0].assinante == ""
     assert docs[0].assinado is False
+
+
+def test_parse_block_documents_extracts_div_based_document_metadata() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr class="infraTrClara">
+          <td><input type="checkbox"/></td>
+          <td>1</td>
+          <td>08810058.000128/2026-69</td>
+          <td>
+            <div class="divItemCelula"><div class="divRotuloItemCelula">40365904</div></div>
+            <div class="divItemCelula"><div class="divRotuloItemCelula">33920087</div></div>
+            <div class="divItemCelula"><div class="divRotuloItemCelula">30/03/2026</div></div>
+          </td>
+          <td>Despacho</td>
+          <td align="justified"><div class="divItemCelula"><div class="divRotuloItemCelula">Fulano / 2º Ten BM</div></div></td>
+          <td><img title="Assinatura"/></td>
+        </tr>
+      </table>
+    </body></html>
+    """
+
+    docs = parse_block_documents(html, BASE)
+
+    assert len(docs) == 1
+    assert docs[0].documento_id == "40365904"
+    assert docs[0].numero_documento == "33920087"
+    assert docs[0].numero_sei == "33920087"
+    assert docs[0].data_documento == "30/03/2026"
+
+
+def test_parse_block_documents_extracts_metadata_from_attributes() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr class="infraTrClara">
+          <td><input type="checkbox"/></td>
+          <td>1</td>
+          <td>08810058.000128/2026-69</td>
+          <td>
+            <a
+              href="controlador.php?acao=documento_visualizar&id_documento=40365904"
+              title="Documento SEI 33920087 elaborado em 30/03/2026"
+            >40365904</a>
+          </td>
+          <td>Despacho</td>
+          <td align="justified"><div class="divItemCelula"><div class="divRotuloItemCelula">Fulano / 2º Ten BM</div></div></td>
+          <td><img title="Assinatura"/></td>
+        </tr>
+      </table>
+    </body></html>
+    """
+
+    docs = parse_block_documents(html, BASE)
+
+    assert len(docs) == 1
+    assert docs[0].documento_id == "40365904"
+    assert docs[0].numero_documento == "33920087"
+    assert docs[0].numero_sei == "33920087"
+    assert docs[0].data_documento == "30/03/2026"
+
+
+def test_parse_block_documents_ignores_infra_sistema_false_positive() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr class="infraTrClara">
+          <td><input type="checkbox"/></td>
+          <td>1</td>
+          <td>08810058.000128/2026-69</td>
+          <td>
+            <a
+              href="controlador.php?acao=documento_visualizar&id_documento=40365904&infra_sistema=100000100"
+              title="Abrir documento"
+            >40365904</a>
+          </td>
+          <td>Despacho</td>
+          <td align="justified"><div class="divItemCelula"><div class="divRotuloItemCelula">Fulano / 2º Ten BM</div></div></td>
+          <td><img title="Assinatura"/></td>
+        </tr>
+      </table>
+    </body></html>
+    """
+
+    docs = parse_block_documents(html, BASE)
+
+    assert len(docs) == 1
+    assert docs[0].documento_id == "40365904"
+    assert docs[0].numero_documento is None
+    assert docs[0].numero_sei is None

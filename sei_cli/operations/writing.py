@@ -1,0 +1,1671 @@
+from __future__ import annotations
+
+import html
+import re
+from typing import Any
+
+from sei_cli.config import append_created_document_log, append_created_process_log
+
+from .contracts import NextAction
+from .errors import UnsupportedStateError, WorkflowViolationError
+from .reading import (
+    _context,
+    _error_result,
+    _process_unit_preflight,
+    _resolve_document_ids,
+    _resolve_process_id,
+    _result,
+)
+
+
+def _best_effort_switch_to_unit(client: Any, unit_sigla: str | None) -> None:
+    if not unit_sigla:
+        return
+    try:
+        client.switch_unit(unit_sigla)
+    except Exception:
+        pass
+
+
+def _block_document_matches(
+    item: dict[str, Any],
+    *,
+    id_documento: str | None = None,
+    numero_documento: str | None = None,
+) -> bool:
+    expected = {
+        str(value).strip()
+        for value in (id_documento, numero_documento)
+        if value is not None and str(value).strip()
+    }
+    actual = {
+        str(value).strip()
+        for value in (
+            item.get("documento_id"),
+            item.get("numero_sei"),
+            item.get("numero_documento"),
+        )
+        if value is not None and str(value).strip()
+    }
+    return bool(expected and actual and expected & actual)
+
+
+def _normalize_process_type_key(value: str) -> str:
+    return value.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _resolve_process_type(client: Any, tipo_processo: str) -> tuple[str, str]:
+    if tipo_processo.isdigit():
+        return tipo_processo, tipo_processo
+
+    aliases = getattr(client, "PROC_TYPES", {})
+    key = _normalize_process_type_key(tipo_processo)
+    resolved = aliases.get(key)
+    if not resolved:
+        raise WorkflowViolationError(
+            f"Tipo de processo '{tipo_processo}' nao reconhecido.",
+            details={
+                "tipo_processo_informado": tipo_processo,
+                "known_aliases": sorted(aliases.keys()),
+            },
+        )
+    return resolved, key
+
+
+def _resolve_access_level(nivel_acesso: str) -> tuple[str, str, list[str]]:
+    key = nivel_acesso.strip().lower()
+    warnings: list[str] = []
+    mapping = {
+        "0": ("0", "publico"),
+        "publico": ("0", "publico"),
+        "público": ("0", "publico"),
+        "1": ("1", "restrito"),
+        "restrito": ("1", "restrito"),
+        "privado": ("1", "restrito"),
+        "private": ("1", "restrito"),
+        "2": ("2", "sigiloso"),
+        "sigiloso": ("2", "sigiloso"),
+    }
+    resolved = mapping.get(key)
+    if not resolved:
+        raise WorkflowViolationError(
+            f"Nivel de acesso '{nivel_acesso}' nao reconhecido.",
+            details={"nivel_acesso_informado": nivel_acesso},
+        )
+    if key == "privado":
+        warnings.append("SEI usa 'restrito' no formulario. 'privado' foi mapeado para nivel 1.")
+    return resolved[0], resolved[1], warnings
+
+
+def _build_access_policy(
+    *,
+    nivel_acesso: str,
+    motivo_acesso: str,
+) -> tuple[dict[str, Any], list[str]]:
+    nivel_codigo, nivel_label, warnings = _resolve_access_level(nivel_acesso)
+    policy = {
+        "nivel_codigo": nivel_codigo,
+        "nivel_label": nivel_label,
+        "motivo_acesso": motivo_acesso.strip() or None,
+        "requires_hypothesis": nivel_codigo != "0",
+    }
+    return policy, warnings
+
+
+def _resolve_requested_access_level(value: str) -> str | None:
+    normalized = value.strip().lower()
+    if normalized in {"", "inherit", "herdar", "processo"}:
+        return None
+    return value
+
+
+def _prune_access_warnings(
+    warnings: list[str],
+    *,
+    selected_hypothesis: dict[str, Any] | list[dict[str, Any]] | None,
+) -> list[str]:
+    if not selected_hypothesis:
+        return warnings
+    return [
+        warning
+        for warning in warnings
+        if "Hipóteses legais de acesso parecem ser carregadas via AJAX" not in warning
+    ]
+
+
+def _select_access_hypothesis(
+    metadata: dict[str, Any],
+    *,
+    nivel_codigo: str,
+    hipotese_acesso: str,
+    hipotese_campo: str,
+) -> tuple[dict[str, Any] | list[dict[str, Any]] | None, dict[str, str]]:
+    if nivel_codigo == "0":
+        return None, {}
+
+    hypotheses = metadata.get("access_hypotheses", [])
+    if not hypotheses:
+        raise WorkflowViolationError(
+            "Formulario nao expôs hipoteses de acesso para este tipo de processo.",
+            details={"expected_field": "hipotese_acesso"},
+        )
+    if not hipotese_acesso.strip():
+        raise WorkflowViolationError(
+            "Nivel de acesso nao publico exige hipotese de acesso valida do formulario.",
+            details={"expected_field": "hipotese_acesso"},
+        )
+
+    fields_by_name = {item["field_name"]: item for item in hypotheses}
+
+    if nivel_codigo == "2":
+        selected_values = {}
+        for chunk in [part.strip() for part in hipotese_acesso.split(",") if part.strip()]:
+            if "=" not in chunk:
+                raise WorkflowViolationError(
+                    "Para nivel sigiloso, informe hipoteses no formato campo=valor,campo=valor.",
+                    details={"expected_format": "selGrauSigilo=R,selHipoteseLegal=23"},
+                )
+            field_name, value = chunk.split("=", 1)
+            selected_values[field_name.strip()] = value.strip()
+
+        required = {"selGrauSigilo", "selHipoteseLegal"}
+        if not required.issubset(selected_values):
+            raise WorkflowViolationError(
+                "Processo sigiloso exige selGrauSigilo e selHipoteseLegal.",
+                details={"required_fields": sorted(required)},
+            )
+
+        resolved_items: list[dict[str, Any]] = []
+        extra_fields: dict[str, str] = {}
+        for field_name in sorted(required):
+            field = fields_by_name.get(field_name)
+            if field is None:
+                raise WorkflowViolationError(
+                    f"Campo obrigatório '{field_name}' nao disponivel no formulario.",
+                    details={"available_fields": list(fields_by_name)},
+                )
+            value = selected_values[field_name]
+            option = next((opt for opt in field["options"] if opt["value"] == value), None)
+            if option is None:
+                raise WorkflowViolationError(
+                    f"Valor '{value}' nao disponivel no campo '{field_name}'.",
+                    details={
+                        "field_name": field_name,
+                        "available_values": [opt["value"] for opt in field["options"]],
+                    },
+                )
+            extra_fields[field_name] = option["value"]
+            hidden_field = field.get("hidden_field_name")
+            if hidden_field:
+                extra_fields[hidden_field] = option["value"]
+            resolved_items.append(
+                {
+                    "field_name": field_name,
+                    "field_label": field.get("field_label"),
+                    "hidden_field_name": hidden_field,
+                    "value": option["value"],
+                    "label": option["label"],
+                }
+            )
+        return resolved_items, extra_fields
+
+    selected_field = hipotese_campo.strip() or hypotheses[0]["field_name"]
+    if len(hypotheses) > 1 and not hipotese_campo.strip():
+        raise WorkflowViolationError(
+            "Mais de um campo de hipotese encontrado. Informe explicitamente o campo.",
+            details={
+                "expected_field": "hipotese_campo",
+                "available_fields": [item["field_name"] for item in hypotheses],
+            },
+        )
+
+    field = fields_by_name.get(selected_field)
+    if field is None:
+        raise WorkflowViolationError(
+            f"Campo de hipotese '{selected_field}' nao disponivel no formulario.",
+            details={"available_fields": [item["field_name"] for item in hypotheses]},
+        )
+
+    option = next((opt for opt in field["options"] if opt["value"] == hipotese_acesso), None)
+    if option is None:
+        raise WorkflowViolationError(
+            f"Hipotese '{hipotese_acesso}' nao disponivel no campo '{selected_field}'.",
+            details={
+                "field_name": selected_field,
+                "available_values": [opt["value"] for opt in field["options"]],
+            },
+        )
+
+    extra_fields = {field["field_name"]: option["value"]}
+    hidden_field = field.get("hidden_field_name")
+    if hidden_field:
+        extra_fields[hidden_field] = option["value"]
+
+    return (
+        {
+            "field_name": field["field_name"],
+            "field_label": field.get("field_label"),
+            "hidden_field_name": hidden_field,
+            "value": option["value"],
+            "label": option["label"],
+        },
+        extra_fields,
+    )
+
+
+def process_create_preview(
+    client: Any,
+    tipo_processo: str,
+    *,
+    especificacao: str,
+    interessados: str = "",
+    observacoes: str = "",
+    nivel_acesso: str = "0",
+    motivo_acesso: str = "",
+    hipotese_acesso: str = "",
+    hipotese_campo: str = "",
+) -> dict[str, Any]:
+    operation = "process-create-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        tipo_id, tipo_alias = _resolve_process_type(client, tipo_processo)
+        access_policy, warnings = _build_access_policy(
+            nivel_acesso=nivel_acesso,
+            motivo_acesso=motivo_acesso,
+        )
+        form_metadata = client.get_process_creation_metadata(
+            tipo_id,
+            nivel_acesso=access_policy["nivel_codigo"],
+        )
+        selected_hypothesis, _extra_fields = _select_access_hypothesis(
+            form_metadata,
+            nivel_codigo=access_policy["nivel_codigo"],
+            hipotese_acesso=hipotese_acesso,
+            hipotese_campo=hipotese_campo,
+        ) if access_policy["nivel_codigo"] != "0" and hipotese_acesso.strip() else (None, {})
+        resolved_ids = {
+            "tipo_processo_id": tipo_id,
+            "tipo_processo_alias": tipo_alias,
+        }
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": {
+                    "current_unit": context.get("unidade_sigla"),
+                    "current_user": context.get("usuario"),
+                    "will_create_in_current_unit": True,
+                },
+                "process_type": {
+                    "id": tipo_id,
+                    "alias": tipo_alias,
+                },
+                "access_policy": {
+                    **access_policy,
+                    "available_hypotheses": form_metadata.get("access_hypotheses", []),
+                    "selected_hypothesis": selected_hypothesis,
+                },
+                "payload_preview": {
+                    "especificacao": especificacao,
+                    "interessados": interessados,
+                    "observacoes": observacoes,
+                },
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-create-confirm",
+                    label="Criar processo com este payload",
+                    params={
+                        "tipo_processo": tipo_processo,
+                        "especificacao": especificacao,
+                        "interessados": interessados,
+                        "observacoes": observacoes,
+                        "nivel_acesso": access_policy["nivel_codigo"],
+                        "motivo_acesso": access_policy["motivo_acesso"],
+                        "hipotese_acesso": (
+                            ",".join(f"{item['field_name']}={item['value']}" for item in selected_hypothesis)
+                            if isinstance(selected_hypothesis, list)
+                            else (selected_hypothesis["value"] if selected_hypothesis else None)
+                        ),
+                        "hipotese_campo": (
+                            None
+                            if isinstance(selected_hypothesis, list)
+                            else (selected_hypothesis["field_name"] if selected_hypothesis else None)
+                        ),
+                    },
+                )
+            ],
+            warnings=[*warnings, *form_metadata.get("warnings", [])],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_create_confirm(
+    client: Any,
+    tipo_processo: str,
+    *,
+    especificacao: str,
+    interessados: str = "",
+    observacoes: str = "",
+    nivel_acesso: str = "0",
+    motivo_acesso: str = "",
+    hipotese_acesso: str = "",
+    hipotese_campo: str = "",
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-create-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para criar processo.",
+                details={"expected_flag": "--confirm"},
+            )
+        context = _context(client)
+        tipo_id, tipo_alias = _resolve_process_type(client, tipo_processo)
+        access_policy, warnings = _build_access_policy(
+            nivel_acesso=nivel_acesso,
+            motivo_acesso=motivo_acesso,
+        )
+        form_metadata = client.get_process_creation_metadata(
+            tipo_id,
+            nivel_acesso=access_policy["nivel_codigo"],
+        )
+        selected_hypothesis, extra_fields = _select_access_hypothesis(
+            form_metadata,
+            nivel_codigo=access_policy["nivel_codigo"],
+            hipotese_acesso=hipotese_acesso,
+            hipotese_campo=hipotese_campo,
+        )
+        if access_policy["nivel_codigo"] == "2" and selected_hypothesis is None:
+            raise UnsupportedStateError("Processo sigiloso exige hipotese de acesso valida.")
+        created = client.create_process(
+            tipo_id,
+            especificacao=especificacao,
+            interessados=interessados,
+            observacoes=observacoes,
+            nivel_acesso=access_policy["nivel_codigo"],
+            extra_fields=extra_fields,
+        )
+        try:
+            append_created_process_log(
+                {
+                    "numero_processo": created.get("numero"),
+                    "id_procedimento": created.get("id_procedimento"),
+                    "tipo_processo_id": tipo_id,
+                    "tipo_processo_alias": tipo_alias,
+                    "unidade_sigla": context.get("unidade_sigla"),
+                    "usuario": context.get("usuario"),
+                    "access_policy": {**access_policy, "selected_hypothesis": selected_hypothesis},
+                    "especificacao": especificacao,
+                }
+            )
+        except Exception as exc:
+            warnings.append(f"Nao foi possivel registrar o processo criado localmente: {exc}")
+        resolved_ids = {
+            "tipo_processo_id": tipo_id,
+            "tipo_processo_alias": tipo_alias,
+            "id_procedimento": created.get("id_procedimento"),
+            "numero_processo": created.get("numero"),
+        }
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": {
+                    "current_unit": context.get("unidade_sigla"),
+                    "current_user": context.get("usuario"),
+                    "created_in_current_unit": True,
+                },
+                "process_type": {
+                    "id": tipo_id,
+                    "alias": tipo_alias,
+                },
+                "access_policy": {**access_policy, "selected_hypothesis": selected_hypothesis},
+                "created_process": created,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-open",
+                    label="Abrir processo criado",
+                    params={"numero_ou_id": created.get("id_procedimento") or created.get("numero")},
+                )
+            ],
+            warnings=[*warnings, *form_metadata.get("warnings", [])],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def _resolve_document_type(client: Any, id_procedimento: str, tipo_documento: str) -> tuple[str, str, str | None]:
+    normalized = _normalize_process_type_key(tipo_documento)
+    alias_map = getattr(client, "DOC_TYPES", {})
+    tipo_id = alias_map.get(normalized, tipo_documento)
+    available = client.list_document_types(id_procedimento)
+
+    by_id = next((item for item in available if item.id_serie == tipo_id), None)
+    if by_id:
+        return by_id.id_serie, normalized, by_id.nome
+
+    by_name = next((item for item in available if _normalize_process_type_key(item.nome) == normalized), None)
+    if by_name:
+        return by_name.id_serie, normalized, by_name.nome
+
+    if tipo_documento.isdigit():
+        return tipo_documento, tipo_documento, None
+
+    raise WorkflowViolationError(
+        f"Tipo de documento '{tipo_documento}' nao disponivel neste processo.",
+        details={
+            "tipo_documento_informado": tipo_documento,
+            "available_types": [item.nome for item in available],
+        },
+    )
+
+
+def document_create_preview(
+    client: Any,
+    numero_ou_id_processo: str,
+    tipo_documento: str,
+    *,
+    descricao: str = "",
+    interessados: str = "",
+    texto_inicial: str = "N",
+    nivel_acesso: str = "inherit",
+    motivo_acesso: str = "",
+    hipotese_acesso: str = "",
+    hipotese_campo: str = "",
+) -> dict[str, Any]:
+    operation = "document-create-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        original_unit = context.get("unidade_sigla")
+        result_payload: dict[str, Any] | None = None
+        id_procedimento, numero_processo = _resolve_process_id(client, numero_ou_id_processo)
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            tipo_id, tipo_alias, tipo_nome = _resolve_document_type(client, id_procedimento, tipo_documento)
+            requested_access = _resolve_requested_access_level(nivel_acesso)
+            inherited_access = client.get_process_access_metadata(id_procedimento) if requested_access is None else None
+            metadata = client.get_document_creation_metadata(
+                id_procedimento,
+                tipo_documento,
+                nivel_acesso=requested_access or (inherited_access or {}).get("nivel_acesso"),
+            )
+            effective_access = requested_access or (inherited_access or {}).get("nivel_acesso") or metadata.get("default_nivel_acesso", "0")
+            access_policy, warnings = _build_access_policy(
+                nivel_acesso=effective_access,
+                motivo_acesso=motivo_acesso,
+            )
+            if access_policy["nivel_codigo"] != "0":
+                if hipotese_acesso.strip():
+                    selected_hypothesis, _extra_fields = _select_access_hypothesis(
+                        metadata,
+                        nivel_codigo=access_policy["nivel_codigo"],
+                        hipotese_acesso=hipotese_acesso,
+                        hipotese_campo=hipotese_campo,
+                    )
+                else:
+                    selected_hypothesis = (inherited_access or {}).get("selected_hypothesis")
+            else:
+                selected_hypothesis = None
+            metadata_warnings = _prune_access_warnings(
+                metadata.get("warnings", []),
+                selected_hypothesis=selected_hypothesis,
+            )
+            resolved_ids = {
+                "id_procedimento": id_procedimento,
+                "numero_processo": numero_processo or numero_ou_id_processo,
+                "tipo_documento_id": tipo_id,
+                "tipo_documento_alias": tipo_alias,
+            }
+            result_payload = _result(
+                operation=operation,
+                context=context,
+                resolved_ids=resolved_ids,
+                data={
+                    "preflight": {
+                        **preflight,
+                        "current_unit": context.get("unidade_sigla"),
+                        "will_create_in_current_unit": True,
+                    },
+                    "document_type": {
+                        "id": tipo_id,
+                        "alias": tipo_alias,
+                        "nome": tipo_nome or tipo_documento,
+                    },
+                    "access_policy": {
+                        **access_policy,
+                        "inherits_from_process": requested_access is None,
+                        "requested_nivel_acesso": nivel_acesso,
+                        "process_nivel_acesso": (inherited_access or {}).get("nivel_acesso"),
+                        "available_hypotheses": metadata.get("access_hypotheses", []),
+                        "selected_hypothesis": selected_hypothesis,
+                    },
+                    "texto_inicial_options": metadata.get("texto_inicial_options", []),
+                    "payload_preview": {
+                        "descricao": descricao,
+                        "interessados": interessados,
+                        "texto_inicial": texto_inicial,
+                    },
+                    "confirmation_required": True,
+                },
+                next_actions=[
+                    NextAction(
+                        action="document-create-confirm",
+                        label="Criar documento com este payload",
+                        params={
+                            "numero_ou_id_processo": id_procedimento,
+                            "tipo_documento": tipo_documento,
+                            "descricao": descricao,
+                            "interessados": interessados,
+                            "texto_inicial": texto_inicial,
+                            "nivel_acesso": (
+                                "inherit" if requested_access is None else access_policy["nivel_codigo"]
+                            ),
+                            "motivo_acesso": access_policy["motivo_acesso"],
+                            "hipotese_acesso": (
+                                ",".join(f"{item['field_name']}={item['value']}" for item in selected_hypothesis)
+                                if isinstance(selected_hypothesis, list)
+                                else (selected_hypothesis["value"] if selected_hypothesis else None)
+                            ),
+                            "hipotese_campo": (
+                                None if isinstance(selected_hypothesis, list)
+                                else (selected_hypothesis["field_name"] if selected_hypothesis else None)
+                            ),
+                        },
+                    )
+                ],
+                warnings=[*warnings, *metadata_warnings],
+            )
+        _best_effort_switch_to_unit(client, original_unit)
+        if result_payload is not None:
+            result_payload["context"] = _context(client)
+            return result_payload
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def document_create_confirm(
+    client: Any,
+    numero_ou_id_processo: str,
+    tipo_documento: str,
+    *,
+    descricao: str = "",
+    interessados: str = "",
+    texto_inicial: str = "N",
+    nivel_acesso: str = "inherit",
+    motivo_acesso: str = "",
+    hipotese_acesso: str = "",
+    hipotese_campo: str = "",
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "document-create-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para criar documento.",
+                details={"expected_flag": "--confirm"},
+            )
+        context = _context(client)
+        original_unit = context.get("unidade_sigla")
+        result_payload: dict[str, Any] | None = None
+        id_procedimento, numero_processo = _resolve_process_id(client, numero_ou_id_processo)
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            tipo_id, tipo_alias, tipo_nome = _resolve_document_type(client, id_procedimento, tipo_documento)
+            requested_access = _resolve_requested_access_level(nivel_acesso)
+            inherited_access = client.get_process_access_metadata(id_procedimento) if requested_access is None else None
+            metadata = client.get_document_creation_metadata(
+                id_procedimento,
+                tipo_documento,
+                nivel_acesso=requested_access or (inherited_access or {}).get("nivel_acesso"),
+            )
+            effective_access = requested_access or (inherited_access or {}).get("nivel_acesso") or metadata.get("default_nivel_acesso", "0")
+            access_policy, warnings = _build_access_policy(
+                nivel_acesso=effective_access,
+                motivo_acesso=motivo_acesso,
+            )
+            if access_policy["nivel_codigo"] != "0" and hipotese_acesso.strip():
+                selected_hypothesis, extra_fields = _select_access_hypothesis(
+                    metadata,
+                    nivel_codigo=access_policy["nivel_codigo"],
+                    hipotese_acesso=hipotese_acesso,
+                    hipotese_campo=hipotese_campo,
+                )
+            else:
+                selected_hypothesis = (inherited_access or {}).get("selected_hypothesis")
+                extra_fields = dict((inherited_access or {}).get("selected_extra_fields", {}))
+            if access_policy["nivel_codigo"] == "2" and selected_hypothesis is None:
+                raise UnsupportedStateError("Documento sigiloso exige hipotese de acesso valida.")
+            created = client.create_document(
+                id_procedimento,
+                tipo_documento,
+                nivel_acesso=effective_access,
+                texto_inicial=texto_inicial,
+                descricao=descricao,
+                interessados=interessados,
+                extra_fields=extra_fields,
+            )
+            metadata_warnings = _prune_access_warnings(
+                metadata.get("warnings", []),
+                selected_hypothesis=selected_hypothesis,
+            )
+            try:
+                append_created_document_log(
+                    {
+                        "id_procedimento": id_procedimento,
+                        "numero_processo": numero_processo or numero_ou_id_processo,
+                        "id_documento": created.id_documento,
+                        "tipo_documento_id": tipo_id,
+                        "tipo_documento_alias": tipo_alias,
+                        "tipo_documento_nome": tipo_nome or tipo_documento,
+                        "unidade_sigla": context.get("unidade_sigla"),
+                        "usuario": context.get("usuario"),
+                        "access_policy": {
+                            **access_policy,
+                            "inherits_from_process": requested_access is None,
+                            "process_nivel_acesso": (inherited_access or {}).get("nivel_acesso"),
+                            "selected_hypothesis": selected_hypothesis,
+                        },
+                        "descricao": descricao,
+                    }
+                )
+            except Exception as exc:
+                warnings.append(f"Nao foi possivel registrar o documento criado localmente: {exc}")
+            resolved_ids = {
+                "id_procedimento": id_procedimento,
+                "numero_processo": numero_processo or numero_ou_id_processo,
+                "id_documento": created.id_documento,
+                "tipo_documento_id": tipo_id,
+                "tipo_documento_alias": tipo_alias,
+            }
+            result_payload = _result(
+                operation=operation,
+                context=context,
+                resolved_ids=resolved_ids,
+                data={
+                    "preflight": {
+                        **preflight,
+                        "current_unit": context.get("unidade_sigla"),
+                        "created_in_current_unit": True,
+                    },
+                    "document_type": {
+                        "id": tipo_id,
+                        "alias": tipo_alias,
+                        "nome": tipo_nome or tipo_documento,
+                    },
+                    "access_policy": {
+                        **access_policy,
+                        "inherits_from_process": requested_access is None,
+                        "process_nivel_acesso": (inherited_access or {}).get("nivel_acesso"),
+                        "selected_hypothesis": selected_hypothesis,
+                    },
+                    "created_document": {
+                        "id_documento": created.id_documento,
+                        "id_procedimento": created.id_procedimento,
+                        "tipo": created.tipo,
+                        "editor_url": created.editor_url,
+                    },
+                },
+                next_actions=[
+                    NextAction(
+                        action="document-edit-preview",
+                        label="Inspecionar secoes do documento criado",
+                        params={"numero_ou_id": created.id_documento, "process_id": id_procedimento},
+                    )
+                ],
+                warnings=[*warnings, *metadata_warnings],
+            )
+        _best_effort_switch_to_unit(client, original_unit)
+        if result_payload is not None:
+            result_payload["context"] = _context(client)
+            return result_payload
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def _section_preview(section: Any) -> dict[str, Any]:
+    return {
+        "section_id": section.section_id,
+        "name": section.name,
+        "editable": getattr(section, "editable", True),
+        "content_length": len(section.content or ""),
+        "preview": (section.content or "")[:240],
+    }
+
+
+def _pick_default_section(sections: list[Any], requested: str | None) -> Any:
+    if requested:
+        for section in sections:
+            if section.section_id == requested:
+                if not getattr(section, "editable", True):
+                    raise WorkflowViolationError(
+                        f"Secao '{requested}' e somente leitura.",
+                        details={"available_editable_sections": [s.section_id for s in sections if getattr(s, 'editable', True)]},
+                    )
+                return section
+        raise WorkflowViolationError(
+            f"Secao '{requested}' nao encontrada no editor.",
+            details={"available_sections": [section.section_id for section in sections]},
+        )
+    if not sections:
+        raise WorkflowViolationError("Documento nao expôs secoes editaveis.")
+    editable_sections = [section for section in sections if getattr(section, "editable", True)]
+    if editable_sections:
+        return max(editable_sections, key=lambda section: len(section.content or ""))
+    return max(sections, key=lambda section: len(section.content or ""))
+
+
+def _normalize_editor_text(value: str) -> str:
+    normalized = value or ""
+    for _ in range(5):
+        updated = html.unescape(normalized)
+        if updated == normalized:
+            break
+        normalized = updated
+    normalized = re.sub(r"<!--.*?-->", " ", normalized, flags=re.DOTALL)
+    normalized = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", normalized)
+    normalized = re.sub(r"(?i)<br\s*/?>", " ", normalized)
+    normalized = re.sub(r"<[^>]+>", " ", normalized)
+    normalized = (
+        normalized
+        .replace("\xa0", " ")
+        .replace("\u200b", " ")
+        .replace("\u200c", " ")
+        .replace("\u200d", " ")
+        .replace("\ufeff", " ")
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _is_effectively_empty_editor_content(value: str) -> bool:
+    normalized = _normalize_editor_text(value)
+    normalized = re.sub(r"@[a-z0-9_]+@", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"\b[\wÀ-ÿ.-]+/[A-Z]{2}\s*,?\s*data\s+da\s+assinatura\s+eletr[oô]nica\.?",
+        " ",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"[^\wÀ-ÿ]+", "", normalized, flags=re.UNICODE)
+    return not bool(normalized)
+
+
+def _document_quality_check(
+    text: str,
+    signature_status: dict[str, Any],
+    *,
+    semantic_context: dict[str, Any] | None = None,
+    editable_sections_count: int = 0,
+    edited_sections: list[str] | None = None,
+    editable_section_contents: list[str] | None = None,
+) -> dict[str, Any]:
+    normalized = text or ""
+    semantic_context = semantic_context or {}
+    editable_section_contents = editable_section_contents or []
+    suspicious_patterns = [
+        r"\bsgt\b",
+        r"\bsd\b",
+        r"\bcb\b",
+        r"\bmaj\b",
+        r"\bcap\b",
+        r"\bten\b",
+    ]
+    suspicious_terms: list[str] = []
+    lower = normalized.lower()
+    for pattern in suspicious_patterns:
+        for match in re.finditer(pattern, lower, re.IGNORECASE):
+            suspicious_terms.append(match.group(0))
+    all_template_variables = sorted(set(re.findall(r"@[a-z0-9_]+@", normalized, re.IGNORECASE)))
+    standard_template_variables = {
+        "@interessados_virgula_espaco@",
+        "@processo@",
+        "@procedimento@",
+        "@unidade@",
+        "@usuario_nome@",
+        "@usuario@",
+        "@descricao@",
+    }
+    template_variables_remaining = [
+        item for item in all_template_variables if item.lower() not in standard_template_variables
+    ]
+    plain_text = _normalize_editor_text(normalized)
+    editable_plain_text = ""
+    editable_body_empty = False
+    if editable_section_contents:
+        normalized_editable_sections = [
+            _normalize_editor_text(content or "")
+            for content in editable_section_contents
+        ]
+        editable_plain_text = " ".join(normalized_editable_sections).strip()
+        editable_body_empty = all(
+            _is_effectively_empty_editor_content(content or "")
+            for content in editable_section_contents
+        )
+    document_kind = semantic_context.get("document_kind_guess")
+    subject = semantic_context.get("subject") or ""
+    is_despacho = document_kind == "despacho" or "despacho" in subject.lower()
+    dispatch_action_verbs = [
+        "encaminh",
+        "autoriz",
+        "determino",
+        "determinar",
+        "remet",
+        "seguimento",
+        "prosseguimento",
+        "providenc",
+    ]
+    has_dispatch_action = any(token in lower for token in dispatch_action_verbs)
+    destination_markers = semantic_context.get("involved_units") or []
+    has_destination_signal = bool(destination_markers) or bool(
+        re.search(r"\b(ao|aos|à|às|para)\b", lower)
+    )
+    rank_mentions = sorted(
+        set(
+            match.group(0)
+            for match in re.finditer(
+                r"\b(?:maj|cap|ten|asp|sgt|cb|sd)\s*(?:bm)?\b",
+                lower,
+                re.IGNORECASE,
+            )
+        )
+    )
+    rank_mentions_without_bm = sorted(
+        set(
+            match.group(0)
+            for match in re.finditer(
+                r"\b(?:maj|cap|ten|asp|sgt|cb|sd)\b(?!\s*bm)",
+                lower,
+                re.IGNORECASE,
+            )
+        )
+    )
+    return {
+        "char_count": len(normalized),
+        "line_count": len([line for line in normalized.splitlines() if line.strip()]),
+        "editable_sections_count": editable_sections_count,
+        "edited_sections": edited_sections or [],
+        "suspicious_rank_terms": sorted(set(suspicious_terms)),
+        "rank_mentions": rank_mentions,
+        "rank_mentions_without_bm": rank_mentions_without_bm,
+        "template_variables_remaining": template_variables_remaining,
+        "standard_template_variables_remaining": [
+            item for item in all_template_variables if item.lower() in standard_template_variables
+        ],
+        "empty_body_check": (
+            editable_body_empty
+            if editable_section_contents
+            else not bool(plain_text)
+        ),
+        "signature_status": signature_status,
+        "has_signature_marker": "assinado eletronicamente" in lower,
+        "needs_signature_review": bool(signature_status.get("signature_pending")),
+        "document_profile": {
+            "kind": document_kind,
+            "subject": subject,
+            "dispatch_checks": {
+                "applies": is_despacho,
+                "has_action_verb": has_dispatch_action if is_despacho else None,
+                "has_destination_signal": has_destination_signal if is_despacho else None,
+                "signature_expected": is_despacho,
+                "signature_pending": bool(signature_status.get("signature_pending")) if is_despacho else None,
+            },
+        },
+    }
+
+
+def document_edit_preview(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    process_id: str | None = None,
+    section_id: str | None = None,
+) -> dict[str, Any]:
+    operation = "document-edit-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        id_documento, id_procedimento, numero_documento = _resolve_document_ids(
+            client,
+            numero_ou_id,
+            id_procedimento=process_id,
+        )
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            save_url, sections = client.get_editor_sections(id_documento, id_procedimento)
+            target = _pick_default_section(sections, section_id)
+            resolved_ids = {
+                "id_documento": id_documento,
+                "id_procedimento": id_procedimento,
+                "numero_documento": numero_documento or numero_ou_id,
+            }
+            return _result(
+                operation=operation,
+                context=context,
+                resolved_ids=resolved_ids,
+                data={
+                    "preflight": preflight,
+                    "editor": {
+                        "save_url_present": bool(save_url),
+                        "sections_total": len(sections),
+                        "editable_sections_count": len([section for section in sections if getattr(section, "editable", True)]),
+                        "selected_section": _section_preview(target),
+                        "selected_editable_section": _section_preview(target),
+                        "sections": [_section_preview(section) for section in sections],
+                    },
+                    "confirmation_required": True,
+                },
+                next_actions=[
+                    NextAction(
+                        action="document-edit-confirm",
+                        label="Salvar conteudo na secao selecionada",
+                        params={
+                            "numero_ou_id": id_documento,
+                            "process_id": id_procedimento,
+                            "section_id": target.section_id,
+                        },
+                    )
+                ],
+            )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def document_quality_check(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    process_id: str | None = None,
+) -> dict[str, Any]:
+    operation = "document-quality-check"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        result = __import__("sei_cli.operations.reading", fromlist=["document_read"]).document_read(
+            client,
+            numero_ou_id,
+            id_procedimento=process_id,
+        )
+        if not result.get("ok"):
+            return result
+        resolved_ids = result["resolved_ids"]
+        data = result["data"]
+        editable_sections_count = 0
+        editable_section_contents: list[str] = []
+        try:
+            _save_url, sections = client.get_editor_sections(
+                resolved_ids["id_documento"],
+                resolved_ids["id_procedimento"],
+            )
+            editable_sections = [
+                section for section in sections if getattr(section, "editable", True)
+            ]
+            editable_sections_count = len(editable_sections)
+            editable_section_contents = [section.content or "" for section in editable_sections]
+        except Exception:
+            editable_sections_count = 0
+            editable_section_contents = []
+        quality = _document_quality_check(
+            data.get("text", ""),
+            data.get("signature_status") or {},
+            semantic_context=data.get("semantic_context") or {},
+            editable_sections_count=editable_sections_count,
+            edited_sections=[],
+            editable_section_contents=editable_section_contents,
+        )
+        warnings: list[str] = []
+        if quality["suspicious_rank_terms"] or quality["rank_mentions_without_bm"]:
+            warnings.append("Revisar padronizacao de postos/graduações antes de assinatura ou geração de PDF.")
+        if quality["template_variables_remaining"]:
+            warnings.append("Documento ainda contém variáveis de template não substituídas.")
+        if quality["empty_body_check"]:
+            warnings.append("Corpo editável parece vazio.")
+        dispatch_checks = quality["document_profile"]["dispatch_checks"]
+        if dispatch_checks.get("applies") and not dispatch_checks.get("has_action_verb"):
+            warnings.append("Despacho sem verbo de ação claro.")
+        if dispatch_checks.get("applies") and not dispatch_checks.get("has_destination_signal"):
+            warnings.append("Despacho sem indicação clara de destinatário ou unidade.")
+        return _result(
+            operation=operation,
+            context=result["context"],
+            resolved_ids=resolved_ids,
+            data={
+                "quality_check": quality,
+                "document_read": {
+                    "document_kind_guess": data.get("semantic_context", {}).get("document_kind_guess"),
+                    "subject": data.get("semantic_context", {}).get("subject"),
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="document-read",
+                    label="Reler documento completo",
+                    params={"numero_ou_id": resolved_ids.get("id_documento"), "process_id": resolved_ids.get("id_procedimento")},
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def document_edit_confirm(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    content: str,
+    process_id: str | None = None,
+    section_id: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "document-edit-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para editar documento.",
+                details={"expected_flag": "--confirm"},
+            )
+        context = _context(client)
+        id_documento, id_procedimento, numero_documento = _resolve_document_ids(
+            client,
+            numero_ou_id,
+            id_procedimento=process_id,
+        )
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            save_url, sections = client.get_editor_sections(id_documento, id_procedimento)
+            target = _pick_default_section(sections, section_id)
+            ok = client.edit_document_section(
+                id_documento,
+                id_procedimento,
+                target.section_id,
+                content,
+            )
+            if not ok:
+                raise WorkflowViolationError("SEI nao confirmou a gravacao do documento.")
+            resolved_ids = {
+                "id_documento": id_documento,
+                "id_procedimento": id_procedimento,
+                "numero_documento": numero_documento or numero_ou_id,
+                "section_id": target.section_id,
+            }
+            quality_result = document_quality_check(
+                client,
+                id_documento,
+                process_id=id_procedimento,
+            )
+            quality_data = quality_result.get("data", {})
+            quality_payload = quality_data.get("quality_check", {})
+            quality_payload["edited_sections"] = [target.section_id]
+            quality_payload["editable_sections_count"] = len(
+                [section for section in sections if getattr(section, "editable", True)]
+            )
+            quality_warnings = quality_result.get("warnings", [])
+            return _result(
+                operation=operation,
+                context=context,
+                resolved_ids=resolved_ids,
+                data={
+                    "preflight": preflight,
+                    "edited_section": _section_preview(target),
+                    "save_url_present": bool(save_url),
+                    "quality_check": quality_payload,
+                },
+                next_actions=[
+                    NextAction(
+                        action="document-quality-check",
+                        label="Revalidar conteudo salvo",
+                        params={"numero_ou_id": id_documento, "process_id": id_procedimento},
+                    ),
+                    NextAction(
+                        action="document-read",
+                        label="Ler documento salvo",
+                        params={"numero_ou_id": id_documento, "process_id": id_procedimento},
+                    ),
+                ],
+                warnings=quality_warnings,
+            )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def signature_block_add_document_preview(
+    client: Any,
+    block_numero: str,
+    numero_ou_id_documento: str,
+    *,
+    process_id: str | None = None,
+    disponibilizar: bool = False,
+) -> dict[str, Any]:
+    operation = "signature-block-add-document-preview"
+    resolved_ids: dict[str, Any] = {"block_numero": block_numero}
+    try:
+        context = _context(client)
+        block_result = __import__("sei_cli.operations.reading", fromlist=["signature_block_read"]).signature_block_read(
+            client,
+            block_numero,
+        )
+        if not block_result.get("ok"):
+            block_result["operation"] = operation
+            return block_result
+        block_unit = block_result.get("context", {}).get("unidade_sigla") or context.get("unidade_sigla")
+
+        id_documento, id_procedimento, numero_documento = _resolve_document_ids(
+            client,
+            numero_ou_id_documento,
+            id_procedimento=process_id,
+        )
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            doc_result = __import__("sei_cli.operations.reading", fromlist=["document_read"]).document_read(
+                client,
+                id_documento,
+                id_procedimento=id_procedimento,
+            )
+            if not doc_result.get("ok"):
+                doc_result["operation"] = operation
+                return doc_result
+        _best_effort_switch_to_unit(client, block_unit)
+        context = _context(client)
+
+        numero_documento_resolvido = numero_documento or doc_result["resolved_ids"].get("numero_documento")
+        resolved_ids.update(
+            {
+                "id_documento": id_documento,
+                "id_procedimento": id_procedimento,
+                "numero_documento": numero_documento_resolvido,
+            }
+        )
+        warnings: list[str] = []
+        block_state = block_result["data"]["bloco"].get("estado")
+        already_in_block = any(
+            _block_document_matches(
+                item,
+                id_documento=id_documento,
+                numero_documento=numero_documento_resolvido,
+            )
+            for item in block_result["data"].get("documents", [])
+        )
+        normalized_state = str(block_state or "").casefold()
+        if normalized_state == "disponibilizado":
+            warnings.append("Bloco está disponibilizado; pode ser necessário cancelar a disponibilização antes de alterá-lo.")
+        if normalized_state == "recebido":
+            warnings.append("Bloco em estado 'Recebido' normalmente não aceita inclusão de documentos.")
+        if already_in_block:
+            warnings.append("Documento já consta neste bloco.")
+        if doc_result["data"].get("signature_status", {}).get("signed"):
+            warnings.append("Documento já consta como assinado.")
+
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": preflight,
+                "bloco": block_result["data"]["bloco"],
+                "documento": doc_result["data"]["documento"],
+                "document_access": {
+                    "signature_status": doc_result["data"].get("signature_status"),
+                    "action_context": doc_result["data"].get("action_context"),
+                },
+                "mutation_preview": {
+                    "block_numero": block_numero,
+                    "id_documento": id_documento,
+                    "disponibilizar": disponibilizar,
+                    "already_in_block": already_in_block,
+                },
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="signature-block-add-document-confirm",
+                    label="Incluir documento no bloco",
+                    params={
+                        "block_numero": block_numero,
+                        "numero_ou_id_documento": id_documento,
+                        "process_id": id_procedimento,
+                        "disponibilizar": disponibilizar,
+                    },
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def signature_block_add_document_confirm(
+    client: Any,
+    block_numero: str,
+    numero_ou_id_documento: str,
+    *,
+    process_id: str | None = None,
+    disponibilizar: bool = False,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "signature-block-add-document-confirm"
+    resolved_ids: dict[str, Any] = {"block_numero": block_numero}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para incluir documento em bloco.",
+                details={"expected_flag": "--confirm"},
+            )
+
+        context = _context(client)
+        current_block = __import__("sei_cli.operations.reading", fromlist=["signature_block_read"]).signature_block_read(
+            client,
+            block_numero,
+        )
+        if not current_block.get("ok"):
+            current_block["operation"] = operation
+            return current_block
+        block_unit = current_block.get("context", {}).get("unidade_sigla") or context.get("unidade_sigla")
+        id_documento, id_procedimento, numero_documento = _resolve_document_ids(
+            client,
+            numero_ou_id_documento,
+            id_procedimento=process_id,
+        )
+        numero_documento_resolvido = numero_documento or numero_ou_id_documento
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            _best_effort_switch_to_unit(client, block_unit)
+            context = _context(client)
+            already_in_block = any(
+                _block_document_matches(
+                    item,
+                    id_documento=id_documento,
+                    numero_documento=numero_documento_resolvido,
+                )
+                for item in current_block["data"].get("documents", [])
+            )
+            if already_in_block:
+                raise WorkflowViolationError(
+                    "Documento já consta no bloco informado.",
+                    details={"block_numero": block_numero, "id_documento": id_documento},
+                )
+            mutation = client.add_document_to_block(
+                id_procedimento,
+                id_documento,
+                block_numero,
+                disponibilizar=disponibilizar,
+            )
+
+        if not mutation.get("ok"):
+            raise WorkflowViolationError(
+                mutation.get("message", "SEI não confirmou a inclusão do documento no bloco."),
+                details={"block_numero": block_numero, "id_documento": id_documento},
+            )
+        verification = __import__("sei_cli.operations.reading", fromlist=["signature_block_read"]).signature_block_read(
+            client,
+            block_numero,
+        )
+        if not verification.get("ok"):
+            verification["operation"] = operation
+            return verification
+        included = any(
+            _block_document_matches(
+                item,
+                id_documento=id_documento,
+                numero_documento=numero_documento_resolvido,
+            )
+            for item in verification["data"].get("documents", [])
+        )
+        if not included:
+            raise WorkflowViolationError(
+                "SEI retornou sucesso, mas o documento não apareceu no bloco após leitura de conferência.",
+                details={"block_numero": block_numero, "id_documento": id_documento},
+            )
+
+        resolved_ids.update(
+            {
+                "id_documento": id_documento,
+                "id_procedimento": id_procedimento,
+                "numero_documento": numero_documento_resolvido,
+            }
+        )
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": preflight,
+                "mutation": {
+                    "block_numero": block_numero,
+                    "id_documento": id_documento,
+                    "disponibilizar": disponibilizar,
+                    "message": mutation.get("message"),
+                },
+                "verification": {
+                    "included_in_block": True,
+                    "documents_total": verification["data"].get("documents_total"),
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="signature-block-read",
+                    label="Ler bloco atualizado",
+                    params={"block_numero": block_numero},
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def signature_block_sign_preview(
+    client: Any,
+    block_numero: str,
+    *,
+    document_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    operation = "signature-block-sign-preview"
+    resolved_ids: dict[str, Any] = {"block_numero": block_numero}
+    try:
+        context = _context(client)
+        block_result = __import__("sei_cli.operations.reading", fromlist=["signature_block_review"]).signature_block_review(
+            client,
+            block_numero,
+        )
+        if not block_result.get("ok"):
+            block_result["operation"] = operation
+            return block_result
+
+        pending_documents = block_result["data"].get("pending_documents", [])
+        requested_ids = {item.strip() for item in (document_ids or []) if item and item.strip()}
+        selected_documents = [
+            item for item in pending_documents
+            if not requested_ids or item.get("documento_id") in requested_ids or item.get("numero_sei") in requested_ids
+        ]
+        if requested_ids and not selected_documents:
+            raise WorkflowViolationError(
+                "Nenhum documento pendente correspondente foi encontrado no bloco.",
+                details={"block_numero": block_numero, "requested_ids": sorted(requested_ids)},
+            )
+
+        warnings: list[str] = []
+        block_state = str(block_result["data"]["bloco"].get("estado") or "").casefold()
+        if block_state == "recebido":
+            warnings.append("Bloco em estado 'Recebido' normalmente não aceita assinatura pela unidade atual.")
+        if not pending_documents:
+            warnings.append("Bloco sem documentos pendentes de assinatura.")
+
+        normalized_documents: list[dict[str, Any]] = []
+        signable_document_ids: list[str] = []
+        reading_module = __import__("sei_cli.operations.reading", fromlist=["_resolve_document_id_with_process"])
+        for item in selected_documents:
+            process_ref = item.get("processo")
+            doc_ref = item.get("numero_sei") or item.get("numero_documento") or item.get("documento_id")
+            normalized = dict(item)
+            if process_ref and doc_ref:
+                try:
+                    process_id, _ = _resolve_process_id(client, process_ref)
+                    resolved_doc_id, docs = reading_module._resolve_document_id_with_process(
+                        client,
+                        str(doc_ref),
+                        id_procedimento=process_id,
+                    )
+                    matched_doc = next((doc for doc in docs if doc.id_documento == resolved_doc_id), None)
+                    normalized["resolved_id_documento"] = resolved_doc_id
+                    normalized["resolved_id_procedimento"] = process_id
+                    normalized["resolved_numero_documento"] = (
+                        (matched_doc.sei_number if matched_doc else None)
+                        or normalized.get("numero_sei")
+                        or normalized.get("numero_documento")
+                    )
+                    signable_document_ids.append(resolved_doc_id)
+                except Exception:
+                    normalized["resolved_id_documento"] = None
+                    normalized["resolved_id_procedimento"] = None
+            normalized_documents.append(normalized)
+        signable_process_ids = sorted({item.get("processo") for item in selected_documents if item.get("processo")})
+        resolved_ids["document_ids"] = signable_document_ids
+
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "bloco": block_result["data"]["bloco"],
+                "pending_documents_total": len(pending_documents),
+                "selected_documents_total": len(selected_documents),
+                "selected_documents": normalized_documents,
+                "signable_document_ids": signable_document_ids,
+                "processos": signable_process_ids,
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="signature-block-sign-confirm",
+                    label="Assinar documentos selecionados do bloco",
+                    params={"block_numero": block_numero, "document_ids": signable_document_ids},
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def signature_block_sign_confirm(
+    client: Any,
+    block_numero: str,
+    *,
+    document_ids: list[str] | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "signature-block-sign-confirm"
+    resolved_ids: dict[str, Any] = {"block_numero": block_numero}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para assinar documentos do bloco.",
+                details={"expected_flag": "--confirm"},
+            )
+
+        preview = signature_block_sign_preview(client, block_numero, document_ids=document_ids)
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+
+        selected_documents = preview["data"].get("selected_documents", [])
+        if not selected_documents:
+            raise WorkflowViolationError(
+                "Nenhum documento pendente selecionado para assinatura.",
+                details={"block_numero": block_numero},
+            )
+
+        context = preview["context"]
+        results: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for item in selected_documents:
+            doc_id = item.get("resolved_id_documento") or item.get("documento_id")
+            process_ref = item.get("processo")
+            process_id = item.get("resolved_id_procedimento")
+            if not doc_id or not process_ref:
+                errors.append(
+                    {
+                        "documento_id": doc_id,
+                        "processo": process_ref,
+                        "error": "Documento pendente sem identificação suficiente para assinatura.",
+                    }
+                )
+                continue
+            if not process_id:
+                process_id, _numero_processo = _resolve_process_id(client, process_ref)
+            result = client.sign_document(doc_id, process_id)
+            result["documento_id"] = doc_id
+            result["processo"] = process_ref
+            results.append(result)
+            if result.get("already_signed"):
+                # already_signed is a success — the document IS signed, goal achieved
+                pass
+            elif result.get("error") or result.get("errors"):
+                errors.append(result)
+
+        if errors:
+            first_error = next(
+                (
+                    error
+                    for error in errors
+                    if error.get("error") or error.get("errors")
+                ),
+                errors[0],
+            )
+            message = first_error.get("error")
+            if not message and first_error.get("errors"):
+                message = first_error["errors"][0]
+            raise WorkflowViolationError(
+                message or "Falha ao assinar um ou mais documentos do bloco.",
+                details={
+                    "block_numero": block_numero,
+                    "sign_results": results,
+                },
+            )
+
+        verification = __import__("sei_cli.operations.reading", fromlist=["signature_block_review"]).signature_block_review(
+            client,
+            block_numero,
+        )
+        if not verification.get("ok"):
+            verification["operation"] = operation
+            return verification
+
+        pending_items = verification["data"].get("pending_documents", [])
+        requested_ids = [
+            item.get("resolved_id_documento") or item.get("documento_id")
+            for item in selected_documents
+            if item.get("resolved_id_documento") or item.get("documento_id")
+        ]
+        not_signed_after_verification = [
+            (item.get("resolved_id_documento") or item.get("documento_id"))
+            for item in selected_documents
+            if any(
+                _block_document_matches(
+                    pending_item,
+                    id_documento=item.get("resolved_id_documento") or item.get("documento_id"),
+                    numero_documento=item.get("resolved_numero_documento") or item.get("numero_sei") or item.get("numero_documento"),
+                )
+                for pending_item in pending_items
+            )
+        ]
+        if not_signed_after_verification:
+            raise WorkflowViolationError(
+                "Assinatura submetida, mas alguns documentos continuam pendentes após releitura do bloco.",
+                details={
+                    "block_numero": block_numero,
+                    "remaining_pending_document_ids": not_signed_after_verification,
+                },
+            )
+
+        resolved_ids["document_ids"] = requested_ids
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "sign_results": results,
+                "verification": {
+                    "remaining_pending_total": verification["data"].get("pending_total"),
+                    "signed_total": verification["data"].get("signed_total"),
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="signature-block-review",
+                    label="Revisar bloco após assinatura",
+                    params={"block_numero": block_numero},
+                )
+            ],
+            warnings=[item.get("error") for item in errors if item.get("error")],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )

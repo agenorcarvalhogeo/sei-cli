@@ -1,0 +1,2013 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from click.testing import CliRunner
+
+from sei_cli.cli import cli
+from sei_cli.models import Block, BlockDocument, DocumentCreated, DocumentType, Process, ProcessList, SystemStatus, TreeDocument
+from sei_cli.models import EditorSection
+from sei_cli.operations import (
+    block_review,
+    document_create_confirm,
+    document_create_preview,
+    document_edit_confirm,
+    document_edit_preview,
+    document_quality_check,
+    document_read,
+    inbox_snapshot,
+    process_create_confirm,
+    process_create_preview,
+    process_open,
+    process_report,
+    process_read,
+    process_summary,
+    relatorio_read,
+    signature_block_add_document_confirm,
+    signature_block_add_document_preview,
+    signature_block_list,
+    signature_block_read,
+    signature_block_sign_confirm,
+    signature_block_sign_preview,
+    signature_block_review,
+)
+from sei_cli.relatorio_parser import Militar, RelatorioServico
+
+
+class FakeClient:
+    PROC_TYPES = {
+        "ferias": "100000182",
+        "informacao": "100000595",
+        "requerimento": "100000268",
+    }
+    DOC_TYPES = {
+        "despacho": "5",
+        "parte_generica": "292",
+        "solicitacao": "178",
+        "informacao": "92",
+    }
+
+    def __init__(self) -> None:
+        self.switched_to: str | None = None
+        self.last_block_add: dict[str, Any] | None = None
+        self.signed_documents: list[dict[str, Any]] = []
+        self.block_documents_map: dict[str, list[BlockDocument]] = {
+            "774681": [
+                BlockDocument(
+                    seq="1",
+                processo="08810058.000128/2026-69",
+                documento_id="48568466",
+                tipo_documento="Relatório do Fiscal",
+                assinante="Fulano",
+                numero_sei="39860248",
+                numero_documento="39860248",
+                assinado=False,
+            ),
+                BlockDocument(
+                    seq="2",
+                    processo="08810071.000091/2025-10",
+                    documento_id="48568467",
+                    tipo_documento="Despacho",
+                    assinante="Beltrano",
+                    numero_sei="39860248",
+                    numero_documento="39860248",
+                    assinado=True,
+                ),
+            ]
+        }
+
+    def __enter__(self) -> "FakeClient":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def switch_unit(self, keyword: str) -> SystemStatus:
+        self.switched_to = keyword
+        return self.status()
+
+    def status(self) -> SystemStatus:
+        return SystemStatus(
+            valid=True,
+            unidade_sigla="OP 3",
+            unidade_descricao="Operacional 3",
+            usuario="Fulano",
+            ultimo_acesso="29/03/2026 10:00",
+        )
+
+    def list_processes(self, unit: str | None = None) -> ProcessList:
+        recebidos = [
+            Process(
+                numero="08810058.000128/2026-69",
+                tipo="Informações",
+                especificacao="Requisição judicial",
+                id_procedimento="47607237",
+                link="",
+                novo=True,
+                atribuido="Fulano",
+                marcador="LIVROS",
+                caixa="recebidos",
+            )
+        ]
+        gerados = [
+            Process(
+                numero="08810071.000091/2025-10",
+                tipo="Licitação",
+                especificacao="Água mineral",
+                id_procedimento="39613183",
+                link="",
+                novo=False,
+                caixa="gerados",
+            )
+        ]
+        return ProcessList(recebidos=recebidos, gerados=gerados)
+
+    def list_blocks(self) -> list[Block]:
+        return [
+            Block(
+                numero="774681",
+                estado="Recebido",
+                unidade_origem="OP 3",
+                unidade_destino="CMDO",
+                descricao="Assinaturas pendentes",
+            )
+        ]
+
+    def search(self, query: str) -> str:
+        if query == "08810058.000128/2026-69":
+            return '<html><iframe name="ifrArvore"></iframe><a href="x?id_procedimento=47607237"></a></html>'
+        return "<html></html>"
+
+    def get_full_document_tree(self, id_procedimento: str) -> list[TreeDocument]:
+        if id_procedimento != "47607237":
+            return []
+        return [
+            TreeDocument(
+                id_documento="48568466",
+                nome="Solicitação de Reaprazamento",
+                tipo="interno",
+                sei_number="39860248",
+                parent_folder=None,
+                assinado=False,
+            ),
+            TreeDocument(
+                id_documento="48568461",
+                nome="Parte Genérica 10/04/2026",
+                tipo="interno",
+                sei_number="39860241",
+                parent_folder="PASTA1",
+                assinado=False,
+            ),
+            TreeDocument(
+                id_documento="48568462",
+                nome="Despacho Inicial 11/04/2026",
+                tipo="interno",
+                sei_number="39860242",
+                parent_folder="PASTA1",
+                assinado=True,
+            ),
+            TreeDocument(
+                id_documento="48568463",
+                nome="Livro do Fiscal 15/04/2026",
+                tipo="pdf",
+                sei_number="39860243",
+                parent_folder="PASTA1",
+                assinado=False,
+            ),
+            TreeDocument(
+                id_documento="48568467",
+                nome="Despacho 20/04/2026",
+                tipo="interno",
+                sei_number="39860249",
+                parent_folder="PASTA2",
+                assinado=True,
+            ),
+            TreeDocument(
+                id_documento="48568468",
+                nome="Relatório do Fiscal 21/04/2026",
+                tipo="interno",
+                sei_number="39860250",
+                parent_folder="PASTA2",
+                assinado=False,
+            ),
+            TreeDocument(
+                id_documento="48568469",
+                nome="Ofício DPSGP 22/04/2026",
+                tipo="pdf",
+                sei_number="39860251",
+                parent_folder="PASTA2",
+                assinado=True,
+            ),
+            TreeDocument(
+                id_documento="59999999",
+                nome="Despacho recém-criado",
+                tipo="interno",
+                sei_number="39999999",
+                parent_folder="PASTA2",
+                assinado=False,
+            ),
+        ]
+
+    def search_document(self, protocolo: str) -> tuple[str, str] | None:
+        if protocolo == "39860248":
+            return ("48568466", "47607237")
+        if protocolo == "39860243":
+            return ("48568463", "47607237")
+        if protocolo == "39860250":
+            return ("48568468", "47607237")
+        if protocolo == "39999999":
+            return ("59999999", "47607237")
+        return None
+
+    def read_document(self, id_documento: str, id_procedimento: str) -> str:
+        if (id_documento, id_procedimento) == ("48568466", "47607237"):
+            return (
+                "3º SGT BM João Silva solicita reaprazamento de férias de 10/04/2026 para 20/04/2026.\n"
+                "Encaminhar ao CMDO PABM APODI para despacho e posterior envio ao DPSGP.\n"
+                "Justificativa: necessidade de adequação da escala operacional.\n"
+            )
+        if (id_documento, id_procedimento) == ("48568461", "47607237"):
+            return (
+                "Parte genérica referente ao reaprazamento de férias do 3º SGT BM João Silva.\n"
+                "Para ciência do CMDO PABM APODI e registro preliminar.\n"
+            )
+        if (id_documento, id_procedimento) == ("48568462", "47607237"):
+            return (
+                "Despacho inicial autorizando a continuidade da análise do pedido do 3º SGT BM João Silva.\n"
+                "Encaminhar à secretaria competente para prosseguimento.\n"
+            )
+        if (id_documento, id_procedimento) == ("48568463", "47607237"):
+            return (
+                "Anexo com documentos complementares do pedido de férias.\n"
+                "Sem necessidade de resposta imediata.\n"
+            )
+        if (id_documento, id_procedimento) == ("48568467", "47607237"):
+            return (
+                "Despacho autorizando o reaprazamento solicitado pelo 3º SGT BM João Silva.\n"
+                "Encaminhar ao DPSGP e à Ajudância Geral para as providências cabíveis.\n"
+            )
+        if (id_documento, id_procedimento) == ("48568468", "47607237"):
+            return (
+                "Relatório do Fiscal sobre a conferência do processo de reaprazamento de férias.\n"
+                "Sem óbices para continuidade do trâmite.\n"
+            )
+        if (id_documento, id_procedimento) == ("48568469", "47607237"):
+            return (
+                "Ofício DPSGP 22/04/2026.\n"
+                "Para conhecimento e registro do reaprazamento de férias do 3º SGT BM João Silva.\n"
+            )
+        if (id_documento, id_procedimento) == ("59999999", "47607237"):
+            return (
+                "Despacho atualizado do 3º SGT BM João Silva.\n"
+                "Encaminhar ao CMDO PABM APODI para providências.\n"
+            )
+        raise RuntimeError("Documento não encontrado")
+
+    def download_document(self, doc: TreeDocument, output_path: str | None = None) -> bytes | str:
+        payloads: dict[str, str] = {
+            "48568463": (
+                "TEXT:Relatório do Fiscal de Serviço Operacional.\n"
+                "2º SGT BM João Silva - Fiscal de Operações.\n"
+                "Do dia 15 para o dia 16 de abril de 2026.\n"
+                "Ao Comando do OP 3.\n"
+                "SD BM Maria Souza atuou como condutora.\n"
+            ),
+            "48568469": (
+                "TEXT:Ofício DPSGP 22/04/2026.\n"
+                "Para conhecimento e registro do reaprazamento de férias do 3º SGT BM João Silva.\n"
+            ),
+        }
+        if doc.id_documento not in payloads:
+            raise RuntimeError("Download não encontrado")
+        if output_path:
+            raise RuntimeError("output_path não suportado no fake")
+        return payloads[doc.id_documento].encode("utf-8")
+
+    def read_document_content(self, doc: TreeDocument) -> str:
+        payload = self.download_document(doc)
+        if isinstance(payload, bytes):
+            return payload[5:].decode("utf-8").strip()
+        return payload
+
+    def read_relatorio(self, id_documento: str, id_procedimento: str) -> RelatorioServico:
+        if (id_documento, id_procedimento) != ("48568468", "47607237"):
+            raise RuntimeError("Relatório não encontrado")
+        return RelatorioServico(
+            fiscal="João Silva",
+            posto_fiscal="2º SGT BM",
+            data_inicio="29/03/2026",
+            data_fim="30/03/2026",
+            unidade="OP 3",
+            militares=[
+                Militar(nome="João Silva", posto="2º SGT BM", funcao="Fiscal", status="ordinario"),
+                Militar(nome="Maria Souza", posto="SD BM", funcao="Condutor", status="extraordinario"),
+            ],
+        )
+
+    def get_block_documents(self, block_numero: str) -> list[BlockDocument]:
+        return list(self.block_documents_map.get(block_numero, []))
+
+    def add_document_to_block(
+        self,
+        id_procedimento: str,
+        id_documento: str,
+        block_numero: str,
+        *,
+        disponibilizar: bool = False,
+    ) -> dict[str, Any]:
+        self.last_block_add = {
+            "id_procedimento": id_procedimento,
+            "id_documento": id_documento,
+            "block_numero": block_numero,
+            "disponibilizar": disponibilizar,
+        }
+        self.block_documents_map.setdefault(block_numero, []).append(
+            BlockDocument(
+                seq=str(len(self.block_documents_map.get(block_numero, [])) + 1),
+                processo="08810058.000128/2026-69",
+                documento_id=id_documento,
+                tipo_documento="Solicitação de Reaprazamento",
+                assinante="",
+                numero_sei="39860248",
+                numero_documento="39860248",
+                assinado=False,
+            )
+        )
+        return {
+            "ok": True,
+            "message": f"Documento {id_documento} incluído no bloco {block_numero}",
+        }
+
+    def sign_document(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
+        self.signed_documents.append(
+            {"id_documento": id_documento, "id_procedimento": id_procedimento}
+        )
+        for docs in self.block_documents_map.values():
+            for doc in docs:
+                if doc.documento_id == id_documento:
+                    doc.assinado = True
+        return {"doc_ids": [id_documento], "signed": [id_documento], "already_signed": [], "errors": []}
+
+    def get_actions(self, id_procedimento: str, id_documento: str | None = None) -> dict[str, str]:
+        if id_procedimento != "47607237":
+            return {}
+        if id_documento == "48568466":
+            return {
+                "linkEditarConteudo": "controlador.php?acao=editor_montar&id_documento=48568466",
+                "linkAssinarDocumento": "controlador.php?acao=documento_assinar&id_documento=48568466",
+            }
+        if id_documento == "48568468":
+            return {}
+        if id_documento is not None:
+            return {}
+        return {
+            "linkIncluirDocumento": "controlador.php?acao=documento_escolher_tipo&id_procedimento=47607237",
+            "linkConsultarAlterarProcesso": "controlador.php?acao=procedimento_alterar&id_procedimento=47607237",
+            "linkEnviarProcesso": "controlador.php?acao=procedimento_enviar&id_procedimento=47607237",
+            "linkMarcador": "controlador.php?acao=andamento_marcador_gerenciar&id_procedimento=47607237",
+        }
+
+    def create_process(
+        self,
+        tipo_processo_id: str,
+        *,
+        especificacao: str = "",
+        interessados: str = "",
+        observacoes: str = "",
+        nivel_acesso: str = "0",
+        extra_fields: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        return {
+            "numero": "08810058.000999/2026-01",
+            "id_procedimento": "49999999",
+            "link": "https://sei.rn.gov.br/sei/controlador.php?id_procedimento=49999999",
+            "tipo_processo_id": tipo_processo_id,
+            "especificacao": especificacao,
+            "interessados": interessados,
+            "observacoes": observacoes,
+            "nivel_acesso": nivel_acesso,
+            "extra_fields": extra_fields or {},
+        }
+
+    def get_process_creation_metadata(self, tipo_processo_id: str, *, nivel_acesso: str = "0") -> dict[str, Any]:
+        if nivel_acesso == "2":
+            return {
+                "tipo_processo_id": tipo_processo_id,
+                "nivel_acesso_field": "rdoNivelAcesso",
+                "access_hypotheses": [
+                    {
+                        "field_name": "selGrauSigilo",
+                        "field_id": "selGrauSigilo",
+                        "field_label": "Grau de Sigilo",
+                        "hidden_field_name": None,
+                        "options": [
+                            {"value": "U", "label": "Ultrassecreto", "selected": False},
+                            {"value": "S", "label": "Secreto", "selected": False},
+                            {"value": "R", "label": "Reservado", "selected": False},
+                        ],
+                    },
+                    {
+                        "field_name": "selHipoteseLegal",
+                        "field_id": "selHipoteseLegal",
+                        "field_label": "Hipótese Legal",
+                        "hidden_field_name": "hdnHipoteseLegal",
+                        "options": [
+                            {"value": "19", "label": "Segurança de Instituições ou de Altas Autoridades", "selected": False},
+                            {"value": "23", "label": "Segredo de Procedimentos Disciplinares - Sigiloso", "selected": False},
+                        ],
+                    },
+                ],
+                "warnings": [],
+            }
+        return {
+            "tipo_processo_id": tipo_processo_id,
+            "nivel_acesso_field": "rdoNivelAcesso",
+            "access_hypotheses": [
+                {
+                    "field_name": "selHipoteseLegal",
+                    "field_id": "selHipoteseLegal",
+                    "field_label": "Hipótese Legal",
+                    "hidden_field_name": "hdnHipoteseLegal",
+                    "options": [
+                        {"value": "LGPD", "label": "Dados pessoais / LGPD", "selected": False},
+                        {"value": "ADM", "label": "Processo administrativo", "selected": False},
+                    ],
+                }
+            ] if nivel_acesso != "0" else [],
+            "warnings": [],
+        }
+
+    def list_document_types(self, id_procedimento: str) -> list[DocumentType]:
+        if id_procedimento != "47607237":
+            return []
+        return [
+            DocumentType(id_serie="5", nome="Despacho"),
+            DocumentType(id_serie="292", nome="Parte Genérica"),
+            DocumentType(id_serie="178", nome="Solicitação"),
+            DocumentType(id_serie="92", nome="Informação"),
+        ]
+
+    def get_document_creation_metadata(
+        self,
+        id_procedimento: str,
+        tipo: str,
+        *,
+        nivel_acesso: str = "0",
+    ) -> dict[str, Any]:
+        tipo_id = self.DOC_TYPES.get(tipo.lower().replace(" ", "_"), tipo)
+        base = {
+            "id_procedimento": id_procedimento,
+            "tipo_documento_id": tipo_id,
+            "tipo_documento": tipo,
+            "texto_inicial_options": [
+                {"value": "N", "label": "Nenhum"},
+                {"value": "T", "label": "Texto Padrão"},
+                {"value": "D", "label": "Documento Modelo"},
+            ],
+            "nivel_acesso_field": "rdoNivelAcesso",
+            "warnings": [],
+        }
+        if nivel_acesso == "2":
+            base["access_hypotheses"] = [
+                {
+                    "field_name": "selGrauSigilo",
+                    "field_id": "selGrauSigilo",
+                    "field_label": "Grau de Sigilo",
+                    "hidden_field_name": None,
+                    "options": [
+                        {"value": "U", "label": "Ultrassecreto", "selected": False},
+                        {"value": "S", "label": "Secreto", "selected": False},
+                        {"value": "R", "label": "Reservado", "selected": False},
+                    ],
+                },
+                {
+                    "field_name": "selHipoteseLegal",
+                    "field_id": "selHipoteseLegal",
+                    "field_label": "Hipótese Legal",
+                    "hidden_field_name": "hdnHipoteseLegal",
+                    "options": [
+                        {"value": "19", "label": "Segurança de Instituições ou de Altas Autoridades", "selected": False},
+                        {"value": "23", "label": "Segredo de Procedimentos Disciplinares - Sigiloso", "selected": False},
+                    ],
+                },
+            ]
+        elif nivel_acesso == "1":
+            base["access_hypotheses"] = [
+                {
+                    "field_name": "selHipoteseLegal",
+                    "field_id": "selHipoteseLegal",
+                    "field_label": "Hipótese Legal",
+                    "hidden_field_name": "hdnHipoteseLegal",
+                    "options": [
+                        {"value": "4", "label": "Informação Pessoal", "selected": False},
+                        {"value": "33", "label": "Dados Pessoais e Dados Pessoais Sensíveis", "selected": False},
+                    ],
+                }
+            ]
+        else:
+            base["access_hypotheses"] = []
+        return base
+
+    def get_process_access_metadata(self, id_procedimento: str) -> dict[str, Any]:
+        assert id_procedimento == "47607237"
+        return {
+            "id_procedimento": id_procedimento,
+            "nivel_acesso": "1",
+            "available_hypotheses": [
+                {
+                    "field_name": "selHipoteseLegal",
+                    "field_id": "selHipoteseLegal",
+                    "field_label": "Hipótese Legal",
+                    "hidden_field_name": "hdnHipoteseLegal",
+                    "options": [
+                        {"value": "4", "label": "Informação Pessoal", "selected": True},
+                        {"value": "33", "label": "Dados Pessoais e Dados Pessoais Sensíveis", "selected": False},
+                    ],
+                }
+            ],
+            "selected_hypothesis": {
+                "field_name": "selHipoteseLegal",
+                "field_label": "Hipótese Legal",
+                "hidden_field_name": "hdnHipoteseLegal",
+                "value": "4",
+                "label": "Informação Pessoal",
+            },
+            "selected_extra_fields": {
+                "selHipoteseLegal": "4",
+                "hdnHipoteseLegal": "4",
+            },
+            "warnings": [],
+        }
+
+    def create_document(
+        self,
+        id_procedimento: str,
+        tipo: str,
+        *,
+        nivel_acesso: str = "0",
+        texto_inicial: str = "N",
+        descricao: str = "",
+        interessados: str = "",
+        extra_fields: dict[str, str] | None = None,
+    ) -> DocumentCreated:
+        self.last_created_document = {
+            "id_procedimento": id_procedimento,
+            "tipo": tipo,
+            "nivel_acesso": nivel_acesso,
+            "texto_inicial": texto_inicial,
+            "descricao": descricao,
+            "interessados": interessados,
+            "extra_fields": extra_fields or {},
+        }
+        return DocumentCreated(
+            id_documento="59999999",
+            id_procedimento=id_procedimento,
+            tipo=tipo,
+            editor_url="https://sei.rn.gov.br/sei/controlador.php?acao=editor_montar&id_documento=59999999",
+        )
+
+    def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
+        return (
+            "https://sei.rn.gov.br/sei/editor/editor_processar.php?acao=editor_salvar&id_documento=59999999",
+            [
+                EditorSection(name="txaEditor_101", content="<p>Cabecalho</p>", section_id="101", editable=False),
+                EditorSection(name="txaEditor_422", content="<p>Conteudo atual do despacho</p>", section_id="422", editable=True),
+            ],
+        )
+
+    def edit_document_section(
+        self,
+        id_documento: str,
+        id_procedimento: str,
+        section_id: str,
+        new_raw_html: str,
+    ) -> bool:
+        self.last_edit = {
+            "id_documento": id_documento,
+            "id_procedimento": id_procedimento,
+            "section_id": section_id,
+            "content": new_raw_html,
+        }
+        return True
+
+
+class FakeClientLegacySwitch(FakeClient):
+    def switch_unit(self, keyword: str) -> bool:
+        self.switched_to = keyword
+        return True
+
+
+def test_inbox_snapshot_contract() -> None:
+    result = inbox_snapshot(FakeClient())
+
+    assert result["ok"] is True
+    assert result["schema_version"] == "1"
+    assert result["operation"] == "inbox-snapshot"
+    assert result["context"]["unidade_sigla"] == "OP 3"
+    assert result["data"]["recebidos_total"] == 1
+    assert result["data"]["blocos_total"] == 1
+    assert result["next_actions"][0]["action"] == "process-open"
+
+
+def test_process_open_contract() -> None:
+    result = process_open(FakeClient(), "08810058.000128/2026-69")
+
+    assert result["ok"] is True
+    assert result["resolved_ids"]["id_procedimento"] == "47607237"
+    assert result["data"]["documents_total"] == 8
+    assert result["data"]["documents"][0]["sei_number"] == "39860248"
+
+
+def test_process_open_resolves_human_number_from_id() -> None:
+    result = process_open(FakeClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["resolved_ids"]["numero_processo"] == "08810058.000128/2026-69"
+
+
+def test_document_read_contract() -> None:
+    result = document_read(FakeClient(), "39860248")
+
+    assert result["ok"] is True
+    assert result["resolved_ids"]["id_documento"] == "48568466"
+    assert result["data"]["documento"]["nome"] == "Solicitação de Reaprazamento"
+    assert result["data"]["line_count"] == 3
+    assert result["data"]["ui_context"]["process_open_in_current_unit"] is True
+    assert result["data"]["action_context"]["can_edit_document"] is True
+    assert result["data"]["semantic_context"]["document_kind_guess"] == "reaprazamento"
+    assert result["data"]["semantic_context"]["involved_military"][0]["display_name"] == "3º SGT BM João Silva"
+    assert result["data"]["domain_context"]["fields"]["requested_date"] == "20/04/2026"
+    assert result["next_actions"][0]["action"] == "process-open"
+
+
+def test_document_read_pdf_supports_binary_extraction() -> None:
+    result = document_read(FakeClient(), "48568469", id_procedimento="47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["documento"]["tipo"] == "pdf"
+    assert result["data"]["extraction_method"] in {"read_document_content", "download_document_pdf"}
+    assert result["data"]["semantic_context"]["information_only"] is True
+
+
+def test_document_read_pdf_resolves_sei_number_with_process_id() -> None:
+    result = document_read(FakeClient(), "39860251", id_procedimento="47607237")
+
+    assert result["ok"] is True
+    assert result["resolved_ids"]["id_documento"] == "48568469"
+    assert result["resolved_ids"]["numero_documento"] == "39860251"
+    assert result["data"]["documento"]["tipo"] == "pdf"
+
+
+def test_document_read_resolves_human_number_from_internal_ids() -> None:
+    result = document_read(FakeClient(), "48568466", id_procedimento="47607237")
+
+    assert result["ok"] is True
+    assert result["resolved_ids"]["numero_documento"] == "39860248"
+
+
+def test_document_read_not_found() -> None:
+    result = document_read(FakeClient(), "00000000")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "document_not_found"
+
+
+def test_process_read_contract() -> None:
+    result = process_read(FakeClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-read"
+    assert result["data"]["documents_total"] == 8
+    assert result["data"]["signed_total"] == 3
+    assert result["data"]["relatorios_total"] == 2
+    assert result["data"]["selection"]["mode_requested"] == "summary"
+    assert result["data"]["selection"]["documents_selected_total"] == 6
+    assert len(result["data"]["documents_read"]) == 6
+    assert result["data"]["read_summary"]["documents_succeeded_total"] == 6
+    assert result["data"]["read_summary"]["documents_failed_total"] == 0
+    assert result["data"]["read_summary"]["pdf_selected_total"] == 1
+    assert result["data"]["process_context"]["process_kind_guess"] == "reaprazamento"
+    assert result["data"]["process_context"]["action_required"] is True
+    assert any(item["extraction_method"] in {"read_document_content", "download_document_pdf"} for item in result["data"]["documents_read"])
+    assert result["next_actions"][0]["action"] == "document-read"
+
+
+def test_process_read_date_filter_reads_only_matching_title_dates() -> None:
+    result = process_read(
+        FakeClient(),
+        "47607237",
+        mode="all",
+        date_from="20/04/2026",
+        date_to="22/04/2026",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["selection"]["documents_matching_filter_total"] == 3
+    assert result["data"]["selection"]["documents_selected_total"] == 3
+    assert [item["documento"]["sei_number"] for item in result["data"]["documents_read"] if item["ok"]] == [
+        "39860249",
+        "39860250",
+        "39860251",
+    ]
+    assert result["data"]["documents_read"][-1]["extraction_method"] in {"read_document_content", "download_document_pdf"}
+    assert result["data"]["process_context"]["has_relatorio_operacional"] is True
+
+
+def test_process_summary_contract() -> None:
+    result = process_summary(FakeClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-summary"
+    assert result["data"]["process_kind_guess"] == "reaprazamento"
+    assert result["data"]["action_required"] is True
+    assert result["data"]["read_summary"]["documents_failed_total"] == 0
+    assert result["data"]["key_documents"]
+    assert result["data"]["action_items"]
+
+
+def test_process_create_preview_contract() -> None:
+    result = process_create_preview(
+        FakeClient(),
+        "ferias",
+        especificacao="Reaprazamento de férias do 3º SGT BM João Silva",
+        nivel_acesso="privado",
+        hipotese_acesso="LGPD",
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-create-preview"
+    assert result["resolved_ids"]["tipo_processo_id"] == "100000182"
+    assert result["data"]["preflight"]["will_create_in_current_unit"] is True
+    assert result["data"]["access_policy"]["nivel_codigo"] == "1"
+    assert result["data"]["access_policy"]["nivel_label"] == "restrito"
+    assert result["data"]["access_policy"]["available_hypotheses"]
+    assert result["data"]["access_policy"]["selected_hypothesis"]["value"] == "LGPD"
+    assert result["warnings"]
+
+
+def test_process_create_preview_exposes_hypotheses_when_non_public_access_is_requested() -> None:
+    result = process_create_preview(
+        FakeClient(),
+        "ferias",
+        especificacao="Reaprazamento de férias do 3º SGT BM João Silva",
+        nivel_acesso="restrito",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["access_policy"]["available_hypotheses"]
+    assert result["data"]["access_policy"]["selected_hypothesis"] is None
+
+
+def test_process_create_preview_sigiloso_exposes_both_required_fields() -> None:
+    result = process_create_preview(
+        FakeClient(),
+        "ferias",
+        especificacao="Teste sigiloso",
+        nivel_acesso="2",
+    )
+
+    assert result["ok"] is True
+    fields = {item["field_name"] for item in result["data"]["access_policy"]["available_hypotheses"]}
+    assert fields == {"selGrauSigilo", "selHipoteseLegal"}
+
+
+def test_process_create_confirm_contract() -> None:
+    logged: list[dict[str, Any]] = []
+    import sei_cli.operations.writing as writing_ops
+
+    original_append = writing_ops.append_created_process_log
+    writing_ops.append_created_process_log = logged.append
+    try:
+        result = process_create_confirm(
+            FakeClient(),
+            "informacao",
+            especificacao="Livro do fiscal do dia 30/03/2026",
+            interessados="OP 3",
+            observacoes="Criado para registro de serviço",
+            nivel_acesso="0",
+            confirm=True,
+        )
+    finally:
+        writing_ops.append_created_process_log = original_append
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-create-confirm"
+    assert result["resolved_ids"]["id_procedimento"] == "49999999"
+    assert result["data"]["created_process"]["numero"] == "08810058.000999/2026-01"
+    assert result["next_actions"][0]["action"] == "process-open"
+    assert logged[0]["id_procedimento"] == "49999999"
+
+
+def test_process_create_confirm_requires_explicit_confirmation() -> None:
+    result = process_create_confirm(
+        FakeClient(),
+        "informacao",
+        especificacao="Livro do fiscal do dia 30/03/2026",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+def test_process_create_confirm_requires_hypothesis_for_non_public_access() -> None:
+    result = process_create_confirm(
+        FakeClient(),
+        "ferias",
+        especificacao="Reaprazamento de férias do 3º SGT BM João Silva",
+        nivel_acesso="restrito",
+        confirm=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+def test_process_create_confirm_applies_selected_hypothesis() -> None:
+    logged: list[dict[str, Any]] = []
+    import sei_cli.operations.writing as writing_ops
+
+    original_append = writing_ops.append_created_process_log
+    writing_ops.append_created_process_log = logged.append
+    try:
+        result = process_create_confirm(
+            FakeClient(),
+            "ferias",
+            especificacao="Reaprazamento de férias do 3º SGT BM João Silva",
+            nivel_acesso="restrito",
+            hipotese_acesso="ADM",
+            confirm=True,
+        )
+    finally:
+        writing_ops.append_created_process_log = original_append
+
+    assert result["ok"] is True
+    assert result["data"]["access_policy"]["selected_hypothesis"]["value"] == "ADM"
+    assert result["data"]["created_process"]["extra_fields"]["selHipoteseLegal"] == "ADM"
+    assert result["data"]["created_process"]["extra_fields"]["hdnHipoteseLegal"] == "ADM"
+
+
+def test_process_create_confirm_sigiloso_requires_both_fields() -> None:
+    result = process_create_confirm(
+        FakeClient(),
+        "ferias",
+        especificacao="Teste sigiloso",
+        nivel_acesso="2",
+        hipotese_acesso="selHipoteseLegal=23",
+        confirm=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+def test_process_create_confirm_sigiloso_applies_both_fields() -> None:
+    logged: list[dict[str, Any]] = []
+    import sei_cli.operations.writing as writing_ops
+
+    original_append = writing_ops.append_created_process_log
+    writing_ops.append_created_process_log = logged.append
+    try:
+        result = process_create_confirm(
+            FakeClient(),
+            "ferias",
+            especificacao="Teste sigiloso",
+            nivel_acesso="2",
+            hipotese_acesso="selGrauSigilo=R,selHipoteseLegal=23",
+            confirm=True,
+        )
+    finally:
+        writing_ops.append_created_process_log = original_append
+
+    assert result["ok"] is True
+    selected = result["data"]["access_policy"]["selected_hypothesis"]
+    assert isinstance(selected, list)
+    assert {item["field_name"] for item in selected} == {"selGrauSigilo", "selHipoteseLegal"}
+    assert result["data"]["created_process"]["extra_fields"]["selGrauSigilo"] == "R"
+    assert result["data"]["created_process"]["extra_fields"]["selHipoteseLegal"] == "23"
+
+
+def test_document_create_preview_contract() -> None:
+    result = document_create_preview(
+        FakeClient(),
+        "47607237",
+        "despacho",
+        descricao="Despacho autorizando continuidade",
+        nivel_acesso="1",
+        hipotese_acesso="4",
+        hipotese_campo="selHipoteseLegal",
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "document-create-preview"
+    assert result["resolved_ids"]["tipo_documento_id"] == "5"
+    assert result["data"]["document_type"]["nome"] == "Despacho"
+    assert result["data"]["access_policy"]["selected_hypothesis"]["value"] == "4"
+
+
+def test_document_create_preview_sigiloso_exposes_both_required_fields() -> None:
+    result = document_create_preview(
+        FakeClient(),
+        "47607237",
+        "despacho",
+        nivel_acesso="2",
+    )
+
+    assert result["ok"] is True
+    fields = {item["field_name"] for item in result["data"]["access_policy"]["available_hypotheses"]}
+    assert fields == {"selGrauSigilo", "selHipoteseLegal"}
+
+
+def test_document_create_confirm_contract() -> None:
+    logged: list[dict[str, Any]] = []
+    import sei_cli.operations.writing as writing_ops
+
+    original_append = writing_ops.append_created_document_log
+    client = FakeClient()
+    writing_ops.append_created_document_log = logged.append
+    try:
+        result = document_create_confirm(
+            client,
+            "47607237",
+            "despacho",
+            descricao="Despacho autorizando continuidade",
+            nivel_acesso="1",
+            hipotese_acesso="4",
+            hipotese_campo="selHipoteseLegal",
+            confirm=True,
+        )
+    finally:
+        writing_ops.append_created_document_log = original_append
+
+    assert result["ok"] is True
+    assert result["operation"] == "document-create-confirm"
+    assert result["resolved_ids"]["id_documento"] == "59999999"
+    assert result["data"]["created_document"]["editor_url"]
+    assert client.last_created_document["nivel_acesso"] == "1"
+    assert logged[0]["id_documento"] == "59999999"
+
+
+def test_document_create_confirm_requires_confirmation() -> None:
+    result = document_create_confirm(
+        FakeClient(),
+        "47607237",
+        "despacho",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+def test_document_edit_preview_contract() -> None:
+    result = document_edit_preview(FakeClient(), "59999999", process_id="47607237")
+
+    assert result["ok"] is True
+    assert result["operation"] == "document-edit-preview"
+    assert result["data"]["editor"]["sections_total"] == 2
+    assert result["data"]["editor"]["selected_section"]["section_id"] == "422"
+    assert result["data"]["editor"]["editable_sections_count"] == 1
+    assert result["data"]["editor"]["sections"][0]["editable"] is False
+    assert result["data"]["editor"]["sections"][1]["editable"] is True
+
+
+def test_document_edit_confirm_contract() -> None:
+    client = FakeClient()
+    result = document_edit_confirm(
+        client,
+        "59999999",
+        process_id="47607237",
+        section_id="422",
+        content="<p>Despacho atualizado</p>",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "document-edit-confirm"
+    assert result["resolved_ids"]["section_id"] == "422"
+    assert client.last_edit["content"] == "<p>Despacho atualizado</p>"
+    assert result["data"]["quality_check"]["line_count"] >= 1
+    assert result["data"]["quality_check"]["editable_sections_count"] == 1
+    assert result["data"]["quality_check"]["edited_sections"] == ["422"]
+
+
+def test_document_quality_check_contract() -> None:
+    result = document_quality_check(FakeClient(), "39860248", process_id="47607237")
+
+    assert result["ok"] is True
+    assert result["operation"] == "document-quality-check"
+    assert "quality_check" in result["data"]
+    assert result["data"]["quality_check"]["editable_sections_count"] == 1
+    assert "document_profile" in result["data"]["quality_check"]
+    assert "template_variables_remaining" in result["data"]["quality_check"]
+
+
+def test_document_quality_check_dispatch_profile() -> None:
+    result = document_quality_check(FakeClient(), "39999999", process_id="47607237")
+
+    assert result["ok"] is True
+    quality = result["data"]["quality_check"]
+    assert quality["document_profile"]["kind"] == "despacho"
+    assert quality["document_profile"]["dispatch_checks"]["applies"] is True
+    assert quality["document_profile"]["dispatch_checks"]["has_action_verb"] is True
+    assert quality["document_profile"]["dispatch_checks"]["has_destination_signal"] is True
+    assert "sgt" in quality["suspicious_rank_terms"]
+
+
+class BlankEditableSectionClient(FakeClient):
+    def read_document(self, id_documento: str, id_procedimento: str) -> str:
+        if (id_documento, id_procedimento) == ("59999999", "47607237"):
+            return "Despacho\n@interessados_virgula_espaco@\n"
+        return super().read_document(id_documento, id_procedimento)
+
+    def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
+        save_url, sections = super().get_editor_sections(id_documento, id_procedimento)
+        return (
+            save_url,
+            [
+                EditorSection(name="txaEditor_101", content="<p>Cabecalho</p>", section_id="101", editable=False),
+                EditorSection(name="txaEditor_220", content="<p>&nbsp;</p>", section_id="220", editable=True),
+            ],
+        )
+
+
+class EscapedBlankEditableSectionClient(BlankEditableSectionClient):
+    def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
+        save_url, _sections = super().get_editor_sections(id_documento, id_procedimento)
+        return (
+            save_url,
+            [
+                EditorSection(name="txaEditor_101", content="&lt;p&gt;Cabecalho&lt;/p&gt;", section_id="101", editable=False),
+                EditorSection(name="txaEditor_220", content="&lt;p&gt;&nbsp;&lt;/p&gt;", section_id="220", editable=True),
+            ],
+        )
+
+
+class TemplateVariableEditableSectionClient(BlankEditableSectionClient):
+    def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
+        save_url, _sections = super().get_editor_sections(id_documento, id_procedimento)
+        return (
+            save_url,
+            [
+                EditorSection(name="txaEditor_101", content="<p>Cabecalho</p>", section_id="101", editable=False),
+                EditorSection(name="txaEditor_220", content="<p>@interessados_virgula_espaco@</p><p>&nbsp;</p>", section_id="220", editable=True),
+            ],
+        )
+
+
+class BoilerplateEditableSectionClient(BlankEditableSectionClient):
+    def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
+        save_url, _sections = super().get_editor_sections(id_documento, id_procedimento)
+        return (
+            save_url,
+            [
+                EditorSection(name="txaEditor_101", content="<p>Cabecalho</p>", section_id="101", editable=False),
+                EditorSection(
+                    name="txaEditor_220",
+                    content="<p>@interessados_virgula_espaco@</p><p>Natal/RN, data da assinatura eletrônica.</p><p>&nbsp;</p>",
+                    section_id="220",
+                    editable=True,
+                ),
+            ],
+        )
+
+
+def test_document_quality_check_ignores_standard_template_variables_and_detects_empty_editable_body() -> None:
+    result = document_quality_check(BlankEditableSectionClient(), "59999999", process_id="47607237")
+
+    assert result["ok"] is True
+    quality = result["data"]["quality_check"]
+    assert quality["empty_body_check"] is True
+    assert quality["template_variables_remaining"] == []
+    assert quality["standard_template_variables_remaining"] == ["@interessados_virgula_espaco@"]
+
+
+def test_document_quality_check_detects_empty_body_with_escaped_editor_html() -> None:
+    result = document_quality_check(EscapedBlankEditableSectionClient(), "59999999", process_id="47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["quality_check"]["empty_body_check"] is True
+
+
+def test_document_quality_check_detects_empty_body_with_only_template_variable_in_editable_section() -> None:
+    result = document_quality_check(TemplateVariableEditableSectionClient(), "59999999", process_id="47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["quality_check"]["empty_body_check"] is True
+
+
+def test_document_quality_check_detects_empty_body_with_signature_boilerplate_only() -> None:
+    result = document_quality_check(BoilerplateEditableSectionClient(), "59999999", process_id="47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["quality_check"]["empty_body_check"] is True
+
+
+def test_document_create_confirm_inherits_process_access_by_default() -> None:
+    logged: list[dict[str, Any]] = []
+    import sei_cli.operations.writing as writing_ops
+
+    original_append = writing_ops.append_created_document_log
+    client = FakeClient()
+    writing_ops.append_created_document_log = logged.append
+    try:
+        result = document_create_confirm(
+            client,
+            "47607237",
+            "despacho",
+            descricao="Despacho herdando acesso",
+            confirm=True,
+        )
+    finally:
+        writing_ops.append_created_document_log = original_append
+
+    assert result["ok"] is True
+    assert result["data"]["access_policy"]["inherits_from_process"] is True
+    assert result["data"]["access_policy"]["nivel_codigo"] == "1"
+    assert result["data"]["access_policy"]["selected_hypothesis"]["value"] == "4"
+    assert client.last_created_document["nivel_acesso"] == "1"
+    assert client.last_created_document["extra_fields"]["selHipoteseLegal"] == "4"
+    assert result["warnings"] == []
+    assert logged[0]["access_policy"]["inherits_from_process"] is True
+
+
+def test_document_edit_confirm_requires_confirmation() -> None:
+    result = document_edit_confirm(
+        FakeClient(),
+        "59999999",
+        process_id="47607237",
+        content="<p>Teste</p>",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+def test_process_report_contract() -> None:
+    result = process_report(FakeClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-report"
+    assert result["data"]["overview"]["documents_total"] == 8
+    assert result["data"]["relatorios"]
+    assert result["data"]["relatorios"][0]["signature_status"]["signed"] is False
+    assert result["data"]["relatorios"][0]["signature_status"]["signature_pending"] is True
+    assert result["data"]["relatorios"][0]["parsing_strategy"] in {"structured_editor", "text_fallback"}
+    assert result["data"]["relatorios"][0]["relatorio"]["fiscal"] == "João Silva"
+    assert "Relatório" in result["data"]["relatorios"][0]["summary"]
+
+
+def test_signature_block_list_contract() -> None:
+    result = signature_block_list(FakeClient())
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-list"
+    assert result["data"]["blocks_total"] == 1
+    assert result["data"]["pending_documents_total"] == 1
+
+
+def test_signature_block_read_contract() -> None:
+    result = signature_block_read(FakeClient(), "774681")
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-read"
+    assert result["data"]["documents_total"] == 2
+    assert result["data"]["pending_total"] == 1
+    assert result["data"]["bloco"]["unidades_destino"] == ["CMDO"]
+    assert result["data"]["documents"][0]["numero_sei"] == "39860248"
+
+
+def test_signature_block_review_contract() -> None:
+    result = signature_block_review(FakeClient(), "774681")
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-review"
+    assert result["data"]["ready_to_sign"] is True
+    assert result["data"]["signable_document_ids"] == ["48568466"]
+    assert result["data"]["pending_documents"][0]["assinantes"] == ["Fulano"]
+
+
+def test_signature_block_add_document_preview_contract() -> None:
+    result = signature_block_add_document_preview(
+        FakeClient(),
+        "774681",
+        "39860250",
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-add-document-preview"
+    assert result["resolved_ids"]["block_numero"] == "774681"
+    assert result["resolved_ids"]["id_documento"] == "48568468"
+    assert result["data"]["mutation_preview"]["disponibilizar"] is False
+    assert result["data"]["mutation_preview"]["already_in_block"] is False
+    assert result["data"]["bloco"]["numero"] == "774681"
+    assert result["data"]["documento"]["id_documento"] == "48568468"
+    assert any("Recebido" in warning for warning in result["warnings"])
+
+
+def test_signature_block_add_document_confirm_contract() -> None:
+    client = FakeClient()
+    result = signature_block_add_document_confirm(
+        client,
+        "774681",
+        "39860250",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-add-document-confirm"
+    assert result["resolved_ids"]["id_documento"] == "48568468"
+    assert client.last_block_add == {
+        "id_procedimento": "47607237",
+        "id_documento": "48568468",
+        "block_numero": "774681",
+        "disponibilizar": False,
+    }
+
+
+def test_signature_block_add_document_preview_detects_document_already_in_block_by_sei_number() -> None:
+    result = signature_block_add_document_preview(
+        FakeClient(),
+        "774681",
+        "39860248",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["mutation_preview"]["already_in_block"] is True
+    assert "Documento já consta neste bloco." in result["warnings"]
+
+
+def test_signature_block_add_document_confirm_requires_confirmation() -> None:
+    result = signature_block_add_document_confirm(
+        FakeClient(),
+        "774681",
+        "39860250",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+class SilentBlockAddClient(FakeClient):
+    def add_document_to_block(
+        self,
+        id_procedimento: str,
+        id_documento: str,
+        block_numero: str,
+        *,
+        disponibilizar: bool = False,
+    ) -> dict[str, Any]:
+        self.last_block_add = {
+            "id_procedimento": id_procedimento,
+            "id_documento": id_documento,
+            "block_numero": block_numero,
+            "disponibilizar": disponibilizar,
+        }
+        return {"ok": True, "message": "Documento incluído no bloco 774681"}
+
+
+class SeiNumberBlockAddClient(FakeClient):
+    def add_document_to_block(
+        self,
+        id_procedimento: str,
+        id_documento: str,
+        block_numero: str,
+        *,
+        disponibilizar: bool = False,
+    ) -> dict[str, Any]:
+        self.last_block_add = {
+            "id_procedimento": id_procedimento,
+            "id_documento": id_documento,
+            "block_numero": block_numero,
+            "disponibilizar": disponibilizar,
+        }
+        self.block_documents_map.setdefault(block_numero, []).append(
+            BlockDocument(
+                seq=str(len(self.block_documents_map.get(block_numero, [])) + 1),
+                processo="08810058.000128/2026-69",
+                documento_id="39860250",
+                tipo_documento="Relatório do Fiscal",
+                assinante="",
+                numero_sei="39860250",
+                numero_documento="39860250",
+                assinado=False,
+            )
+        )
+        return {"ok": True, "message": "Documento incluído no bloco 774681"}
+
+
+def test_signature_block_add_document_confirm_detects_silent_failure() -> None:
+    result = signature_block_add_document_confirm(
+        SilentBlockAddClient(),
+        "774681",
+        "39860250",
+        confirm=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+def test_signature_block_add_document_confirm_accepts_verification_by_sei_number() -> None:
+    client = SeiNumberBlockAddClient()
+    result = signature_block_add_document_confirm(
+        client,
+        "774681",
+        "39860250",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["verification"]["included_in_block"] is True
+
+
+def test_signature_block_add_document_confirm_fails_early_when_document_already_in_block() -> None:
+    result = signature_block_add_document_confirm(
+        FakeClient(),
+        "774681",
+        "39860248",
+        confirm=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+    assert "já consta no bloco" in result["error"]["message"]
+
+
+def test_signature_block_sign_preview_contract() -> None:
+    result = signature_block_sign_preview(FakeClient(), "774681")
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-sign-preview"
+    assert result["data"]["pending_documents_total"] == 1
+    assert result["data"]["selected_documents_total"] == 1
+    assert result["data"]["signable_document_ids"] == ["48568466"]
+
+
+def test_signature_block_sign_confirm_contract() -> None:
+    client = FakeClient()
+    result = signature_block_sign_confirm(client, "774681", confirm=True)
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-sign-confirm"
+    assert result["resolved_ids"]["document_ids"] == ["48568466"]
+    assert client.signed_documents == [{"id_documento": "48568466", "id_procedimento": "47607237"}]
+    assert result["data"]["verification"]["remaining_pending_total"] == 0
+
+
+def test_signature_block_sign_confirm_requires_confirmation() -> None:
+    result = signature_block_sign_confirm(FakeClient(), "774681")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+class SilentBlockSignClient(FakeClient):
+    def sign_document(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
+        self.signed_documents.append(
+            {"id_documento": id_documento, "id_procedimento": id_procedimento}
+        )
+        return {"doc_ids": [id_documento], "signed": [id_documento], "already_signed": [], "errors": []}
+
+
+class ExplicitSignErrorClient(FakeClient):
+    def sign_document(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
+        return {
+            "doc_ids": [id_documento],
+            "signed": [],
+            "already_signed": [],
+            "errors": ["SEI retornou ao formulário de assinatura sem confirmar a operação."],
+        }
+
+
+class SeiNumberBlockSignClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_documents_map["774681"] = [
+            BlockDocument(
+                seq="1",
+                processo="08810058.000128/2026-69",
+                documento_id="39860251",
+                tipo_documento="Relatório do Fiscal",
+                assinante="Fulano",
+                numero_sei="39860251",
+                numero_documento="39860251",
+                assinado=False,
+            )
+        ]
+
+    def search_document(self, protocolo: str) -> tuple[str, str] | None:
+        if protocolo == "39860251":
+            return ("48568469", "47607237")
+        return super().search_document(protocolo)
+
+    def sign_document(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
+        self.signed_documents.append(
+            {"id_documento": id_documento, "id_procedimento": id_procedimento}
+        )
+        for docs in self.block_documents_map.values():
+            for doc in docs:
+                if doc.documento_id in {id_documento, "39860251"}:
+                    doc.assinado = True
+        return {"doc_ids": [id_documento], "signed": [id_documento], "already_signed": [], "errors": []}
+
+
+def test_signature_block_sign_confirm_detects_silent_failure() -> None:
+    result = signature_block_sign_confirm(SilentBlockSignClient(), "774681", confirm=True)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+def test_signature_block_sign_confirm_propagates_sign_document_error() -> None:
+    result = signature_block_sign_confirm(ExplicitSignErrorClient(), "774681", confirm=True)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+    assert "formulário de assinatura" in result["error"]["message"]
+
+
+def test_signature_block_sign_confirm_resolves_block_document_by_sei_number() -> None:
+    client = SeiNumberBlockSignClient()
+    result = signature_block_sign_confirm(client, "774681", confirm=True)
+
+    assert result["ok"] is True
+    assert result["resolved_ids"]["document_ids"] == ["48568469"]
+    assert client.signed_documents == [{"id_documento": "48568469", "id_procedimento": "47607237"}]
+
+
+def test_relatorio_read_contract() -> None:
+    result = relatorio_read(FakeClient(), "39860250")
+
+    assert result["ok"] is True
+    assert result["operation"] == "relatorio-read"
+    assert result["data"]["documento"]["nome"] == "Relatório do Fiscal 21/04/2026"
+    assert result["data"]["signature_status"]["signed"] is False
+    assert result["data"]["signature_status"]["signature_pending"] is True
+    assert result["data"]["relatorio"]["fiscal"] == "João Silva"
+    assert "Fiscal" in result["data"]["summary"]
+
+
+def test_relatorio_read_pdf_fallback_contract() -> None:
+    result = relatorio_read(FakeClient(), "39860243")
+
+    assert result["ok"] is True
+    assert result["operation"] == "relatorio-read"
+    assert result["data"]["documento"]["tipo"] == "pdf"
+    assert result["data"]["parsing_strategy"] == "text_fallback"
+    assert result["data"]["extraction_method"] in {
+        "read_document_content",
+        "read_document_content_retry",
+        "download_document_pdf",
+        "download_document_pdf_retry",
+    }
+    assert result["data"]["relatorio"]["fiscal"] == "João Silva"
+    assert result["data"]["signature_status"]["signed"] is False
+
+
+def test_block_review_contract() -> None:
+    result = block_review(FakeClient(), "774681")
+
+    assert result["ok"] is True
+    assert result["operation"] == "block-review"
+    assert result["data"]["documents_total"] == 2
+    assert result["data"]["pending_total"] == 1
+    assert result["data"]["processos_total"] == 2
+    assert result["next_actions"][0]["action"] == "process-open"
+
+
+def test_block_review_not_found() -> None:
+    result = block_review(FakeClient(), "999999")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "block_not_found"
+
+
+def test_inbox_snapshot_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["inbox-snapshot", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "inbox-snapshot"
+
+
+def test_process_open_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["process-open", "08810058.000128/2026-69", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["resolved_ids"]["id_procedimento"] == "47607237"
+
+
+def test_document_read_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["document-read", "39860248", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["semantic_context"]["document_kind_guess"] == "reaprazamento"
+    assert payload["data"]["action_context"]["can_forward_process"] is True
+    assert payload["data"]["char_count"] == len(
+        "3º SGT BM João Silva solicita reaprazamento de férias de 10/04/2026 para 20/04/2026.\n"
+        "Encaminhar ao CMDO PABM APODI para despacho e posterior envio ao DPSGP.\n"
+        "Justificativa: necessidade de adequação da escala operacional.\n"
+    )
+
+
+def test_document_read_cli_json_error_exit_code(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["document-read", "00000000", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "document_not_found"
+
+
+def test_process_read_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["process-read", "47607237", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["selection"]["documents_selected_total"] == 6
+    assert payload["data"]["process_context"]["process_kind_guess"] == "reaprazamento"
+    assert payload["data"]["relatorios_total"] == 2
+
+
+def test_process_summary_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["process-summary", "47607237", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-summary"
+    assert payload["data"]["process_kind_guess"] == "reaprazamento"
+
+
+def test_process_report_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["process-report", "47607237", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-report"
+    assert payload["data"]["relatorios"][0]["signature_status"]["signed"] is False
+    assert payload["data"]["relatorios"][0]["relatorio"]["fiscal"] == "João Silva"
+
+
+def test_process_create_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-create-preview",
+            "ferias",
+            "--especificacao",
+            "Reaprazamento de férias do 3º SGT BM João Silva",
+            "--nivel",
+            "privado",
+            "--hipotese-acesso",
+            "LGPD",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["resolved_ids"]["tipo_processo_id"] == "100000182"
+    assert payload["data"]["access_policy"]["nivel_codigo"] == "1"
+    assert payload["data"]["access_policy"]["selected_hypothesis"]["value"] == "LGPD"
+
+
+def test_process_create_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-create-confirm",
+            "informacao",
+            "--especificacao",
+            "Livro do fiscal do dia 30/03/2026",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["resolved_ids"]["id_procedimento"] == "49999999"
+
+
+def test_process_create_confirm_cli_json_non_public_requires_hypothesis(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-create-confirm",
+            "ferias",
+            "--especificacao",
+            "Reaprazamento de férias do 3º SGT BM João Silva",
+            "--nivel",
+            "restrito",
+            "--hipotese-acesso",
+            "ADM",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["access_policy"]["selected_hypothesis"]["value"] == "ADM"
+
+
+def test_process_create_preview_cli_json_sigiloso(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-create-preview",
+            "ferias",
+            "--especificacao",
+            "Teste sigiloso",
+            "--nivel",
+            "2",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    fields = {item["field_name"] for item in payload["data"]["access_policy"]["available_hypotheses"]}
+    assert fields == {"selGrauSigilo", "selHipoteseLegal"}
+
+
+def test_process_create_confirm_cli_json_sigiloso(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-create-confirm",
+            "ferias",
+            "--especificacao",
+            "Teste sigiloso",
+            "--nivel",
+            "2",
+            "--hipotese-acesso",
+            "selGrauSigilo=R,selHipoteseLegal=23",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    selected = payload["data"]["access_policy"]["selected_hypothesis"]
+    assert isinstance(selected, list)
+
+
+def test_document_create_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "document-create-preview",
+            "47607237",
+            "despacho",
+            "--descricao",
+            "Despacho autorizando continuidade",
+            "--nivel",
+            "1",
+            "--hipotese-acesso",
+            "4",
+            "--hipotese-campo",
+            "selHipoteseLegal",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["resolved_ids"]["tipo_documento_id"] == "5"
+
+
+def test_document_create_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "document-create-confirm",
+            "47607237",
+            "despacho",
+            "--descricao",
+            "Despacho autorizando continuidade",
+            "--nivel",
+            "1",
+            "--hipotese-acesso",
+            "4",
+            "--hipotese-campo",
+            "selHipoteseLegal",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["resolved_ids"]["id_documento"] == "59999999"
+
+
+def test_document_edit_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["document-edit-preview", "59999999", "--process-id", "47607237", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["editor"]["sections_total"] == 2
+
+
+def test_document_edit_confirm_cli_json(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    content_path = tmp_path / "doc.html"
+    content_path.write_text("<p>Despacho atualizado</p>", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "document-edit-confirm",
+            "59999999",
+            "--process-id",
+            "47607237",
+            "--section-id",
+            "422",
+            "--content-file",
+            str(content_path),
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["resolved_ids"]["section_id"] == "422"
+
+
+def test_document_quality_check_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["document-quality-check", "39860248", "--process-id", "47607237", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert "quality_check" in payload["data"]
+    assert "document_profile" in payload["data"]["quality_check"]
+
+
+def test_relatorio_read_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["relatorio-read", "39860250", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["relatorio"]["fiscal"] == "João Silva"
+
+
+def test_signature_block_list_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["signature-block-list", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "signature-block-list"
+
+
+def test_signature_block_read_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["signature-block-read", "774681", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "signature-block-read"
+
+
+def test_signature_block_review_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["signature-block-review", "774681", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "signature-block-review"
+
+
+def test_signature_block_add_document_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["signature-block-add-document-preview", "774681", "39860250", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "signature-block-add-document-preview"
+    assert payload["resolved_ids"]["id_documento"] == "48568468"
+
+
+def test_signature_block_add_document_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "signature-block-add-document-confirm",
+            "774681",
+            "39860250",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "signature-block-add-document-confirm"
+    assert payload["resolved_ids"]["id_documento"] == "48568468"
+
+
+def test_signature_block_sign_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["signature-block-sign-preview", "774681", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "signature-block-sign-preview"
+    assert payload["data"]["signable_document_ids"] == ["48568466"]
+
+
+def test_signature_block_sign_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["signature-block-sign-confirm", "774681", "--confirm", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "signature-block-sign-confirm"
+    assert payload["data"]["verification"]["remaining_pending_total"] == 0
+
+
+def test_switch_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["switch", "OP 3", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["valid"] is True
+    assert payload["unidade_sigla"] == "OP 3"
+
+
+def test_switch_cli_json_normalizes_legacy_bool(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClientLegacySwitch)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["switch", "OP 3", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["valid"] is True
+    assert payload["unidade_sigla"] == "OP 3"
+
+
+class FirstRelatorioCandidateFailsClient(FakeClient):
+    def download_document(self, doc: TreeDocument, output_path: str | None = None) -> bytes | str:
+        if doc.id_documento == "48568463":
+            raise RuntimeError("Falha proposital no primeiro relatório candidato")
+        return super().download_document(doc, output_path)
+
+
+class HtmlViewFallbackRelatorioClient(FakeClient):
+    def read_relatorio(self, id_documento: str, id_procedimento: str) -> RelatorioServico:
+        raise RuntimeError("Editor indisponível")
+
+    def view_document_html(self, id_documento: str, id_procedimento: str) -> str:
+        if (id_documento, id_procedimento) != ("48568468", "47607237"):
+            raise RuntimeError("HTML do relatório não encontrado")
+        return Path("tests/fixtures/relatorio_body.html").read_text()
+
+
+def test_process_report_tries_next_relatorio_candidate_when_first_fails() -> None:
+    result = process_report(FirstRelatorioCandidateFailsClient(), "47607237", relatorio_limit=1)
+
+    assert result["ok"] is True
+    assert len(result["data"]["relatorios"]) == 1
+    assert result["data"]["relatorios"][0]["documento"]["id_documento"] == "48568468"
+    assert result["data"]["relatorios"][0]["parsing_strategy"] == "structured_editor"
+    assert result["data"]["relatorio_failures"]
+
+
+def test_relatorio_read_uses_html_view_before_text_fallback() -> None:
+    result = relatorio_read(HtmlViewFallbackRelatorioClient(), "39860250")
+
+    assert result["ok"] is True
+    assert result["data"]["parsing_strategy"] == "structured_html_view"
+    assert result["data"]["extraction_method"] == "view_document_html"
+    assert result["data"]["relatorio"]["fiscal"] == "Vilson"
+    assert result["data"]["relatorio"]["posto_fiscal"] == "2° SGT BM"
+    assert len(result["data"]["relatorio"]["militares"]) == 8
+    assert len(result["data"]["relatorio"]["viaturas"]) >= 4
+
+
+def test_block_review_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["block-review", "774681", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["documents_total"] == 2

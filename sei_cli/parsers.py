@@ -182,12 +182,17 @@ def parse_document_tree(content: str, base_url: str) -> list[Document]:
         else:
             tipo = "documento"
         
+        # Detect signed status from icon/src in context around this node
+        # SEI uses icon filenames like "documento_assinado" or "protocolo_documento_assinado"
+        assinado = "assinado" in full_line.lower()
+
         docs.append(Document(
             numero=doc_id,
             nome=_norm(title),
             tipo=tipo,
             id_documento=doc_id,
             link=urljoin(base_url, url),
+            assinado=assinado,
         ))
     return docs
 
@@ -273,8 +278,9 @@ def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument
                 nodes[idx]['target'] = params[4]
                 nodes[idx]['nome'] = params[5]
                 nodes[idx]['label'] = params[6] if len(params) > 6 else params[5]
-                # Detect type from icon
+                # Detect type from icon (also store for signed detection)
                 icon = params[7] if len(params) > 7 else ''
+                nodes[idx]['icon'] = icon
                 if 'documento_pdf' in icon:
                     nodes[idx]['tipo'] = 'pdf'
                 elif 'documento_externo' in icon:
@@ -333,6 +339,18 @@ def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument
                 if m:
                     sei_number = m.group(1)
 
+        # Detect signed status from icon URL or HTML content
+        # SEI uses icon filenames like "documento_assinado", "protocolo_documento_assinado",
+        # or "assinado" in the src/html to indicate signed documents
+        src_url_raw = node.get('src_url', '')
+        html_raw = node.get('html_content', '')
+        icon_raw = node.get('icon', '')  # from infraArvoreNo params
+        assinado = any(
+            'assinado' in s.lower()
+            for s in (src_url_raw, html_raw, icon_raw)
+            if s
+        )
+
         docs.append(TreeDocument(
             id_documento=node.get('id', ''),
             nome=nome_clean,
@@ -342,6 +360,7 @@ def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument
             src_url=urljoin(base_url, node['src_url']) if node.get('src_url') else None,
             html_content=node.get('html_content'),
             sei_number=sei_number,
+            assinado=assinado,
         ))
 
     return docs
@@ -377,8 +396,31 @@ def parse_blocks(content: str, base_url: str) -> list[Block]:
             if (label := _norm(div.text_content()))
         ]
         if not dest_units:
-            raw_dest = _norm(tds[6].text_content()).replace("Aguardando Devolução", "").strip()
-            dest_units = [raw_dest] if raw_dest else []
+            # When no divUnidadeRotulo divs exist, units may be in separate
+            # child elements (spans, divs, anchors) or separated by <br>.
+            # First try to extract from individual child elements.
+            child_texts = []
+            for child in tds[6]:
+                if child.tag == 'br':
+                    continue
+                t = _norm(child.text_content()).replace("Aguardando Devolução", "").strip()
+                if t:
+                    child_texts.append(t)
+            if child_texts:
+                dest_units = child_texts
+            else:
+                # Fallback: insert separator before <br> tags, then split
+                from lxml.html import tostring as _html_tostring
+                raw_html = _html_tostring(tds[6], encoding='unicode')
+                raw_html = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
+                parts = [
+                    _norm(p).replace("Aguardando Devolução", "").strip()
+                    for p in raw_html.split('\n')
+                ]
+                dest_units = [p for p in parts if p]
+            if not dest_units:
+                raw_dest = _norm(tds[6].text_content()).replace("Aguardando Devolução", "").strip()
+                dest_units = [raw_dest] if raw_dest else []
         unidade_destino = "; ".join(dest_units)
         descricao = _norm(tds[8].text_content()) if len(tds) > 8 else ""
         
@@ -412,21 +454,99 @@ def parse_block_documents(content: str, base_url: str) -> list[BlockDocument]:
         tds = row.xpath("./td")
         if len(tds) < 5:
             continue
+
+        def _cell_lines(td: object) -> list[str]:
+            labels = [
+                _norm(div.text_content())
+                for div in td.xpath('.//div[contains(@class,"divRotuloItemCelula") or contains(@class,"divUnidadeRotulo")]')
+            ]
+            labels = [item for item in labels if item]
+            if labels:
+                return labels
+
+            values: list[str] = []
+            for raw in td.xpath(".//text()"):
+                text = _norm(str(raw))
+                if not text:
+                    continue
+                if text in values:
+                    continue
+                values.append(text)
+            return values
+
+        def _cell_metadata_candidates(td: object) -> list[str]:
+            candidates: list[str] = []
+            for attr_name in ("title", "aria-label", "onclick", "href"):
+                for raw in td.xpath(f".//*[@{attr_name}]/@{attr_name}"):
+                    text = _norm(unescape(str(raw)))
+                    if not text or text in candidates:
+                        continue
+                    candidates.append(text)
+            for text in _cell_lines(td):
+                if text not in candidates:
+                    candidates.append(text)
+            return candidates
+
+        def _extract_document_number(
+            *,
+            doc_id: str,
+            visible_lines: list[str],
+            metadata_candidates: list[str],
+        ) -> str | None:
+            contextual_patterns = (
+                r"\bdocumento\s+sei\s+(\d{6,})\b",
+                r"\bsei\s*[#: -]?\s*(\d{6,})\b",
+                r"\bn[úu]mero\s+sei\s*[#: -]?\s*(\d{6,})\b",
+            )
+            for item in metadata_candidates:
+                lowered = item.casefold()
+                for pattern in contextual_patterns:
+                    match = re.search(pattern, lowered, flags=re.IGNORECASE)
+                    if match and match.group(1) != doc_id:
+                        return match.group(1)
+
+            for item in visible_lines[1:]:
+                if re.fullmatch(r"\d{8,}", item) and item != doc_id:
+                    return item
+
+            fallback_candidates: list[str] = []
+            ignored_query_params = {"infra_sistema", "infra_unidade_atual", "id_procedimento", "id_bloco"}
+            for item in metadata_candidates:
+                parsed = urlparse(item)
+                if parsed.query:
+                    query = parse_qs(parsed.query)
+                    for key, values in query.items():
+                        if key in ignored_query_params or key == "id_documento":
+                            continue
+                        for value in values:
+                            if re.fullmatch(r"\d{8,}", value) and value != doc_id and value not in fallback_candidates:
+                                fallback_candidates.append(value)
+                    continue
+                for match in re.findall(r"\b\d{8,}\b", item):
+                    if match != doc_id and match not in fallback_candidates:
+                        fallback_candidates.append(match)
+            return fallback_candidates[0] if fallback_candidates else None
         
         seq = _norm(tds[1].text_content()) if len(tds) > 1 else ""
         processo = _norm(tds[2].text_content()) if len(tds) > 2 else ""
-        doc_id = _norm(tds[3].text_content()) if len(tds) > 3 else ""
+        document_lines = _cell_lines(tds[3]) if len(tds) > 3 else []
+        document_candidates = _cell_metadata_candidates(tds[3]) if len(tds) > 3 else []
+        doc_id = document_lines[0] if document_lines else ""
+        numero_documento = _extract_document_number(
+            doc_id=doc_id,
+            visible_lines=document_lines,
+            metadata_candidates=document_candidates,
+        )
+        data_documento = None
+
+        for item in document_candidates:
+            if data_documento is None:
+                date_match = re.search(r"\b\d{2}/\d{2}/\d{4}\b", item)
+                if date_match:
+                    data_documento = date_match.group(0)
+                    break
         tipo_doc = _norm(tds[4].text_content()) if len(tds) > 4 else ""
-        assinantes: list[str] = []
-        if len(tds) > 5:
-            assinantes = [
-                label
-                for div in tds[5].xpath('.//div[contains(@class,"divRotuloItemCelula")]')
-                if (label := _norm(div.text_content()))
-            ]
-            if not assinantes:
-                raw = _norm(tds[5].text_content())
-                assinantes = [raw] if raw else []
+        assinantes = _cell_lines(tds[5]) if len(tds) > 5 else []
         assinante = "; ".join(assinantes)
         
         # Check if signed (look for 'Assinatura' img with specific title)
@@ -440,6 +560,8 @@ def parse_block_documents(content: str, base_url: str) -> list[BlockDocument]:
             tipo_documento=tipo_doc,
             assinante=assinante,
             assinantes=assinantes,
+            numero_documento=numero_documento,
+            data_documento=data_documento,
             assinado=assinado,
         ))
     

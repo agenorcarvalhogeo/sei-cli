@@ -1,56 +1,89 @@
-# Reaprazamento de Férias — CBMRN
-# Fluxo completo do requerimento até publicação em BG
-
 nome: Reaprazamento de Férias
 orgao: cbmrn
 tipo_processo: "Pessoal: Férias"
 descricao: >
-  Militar solicita alteração de período de férias.
-  Requer aprovação do comandante, acostamento pela secretaria,
-  publicação em Boletim Geral, e notificação às partes.
+  Workflow do reaprazamento de férias com dois cenários: auto-solicitação do militar
+  ou análise de solicitação recebida de subordinado. O fluxo cobre apenas as etapas
+  sob controle direto do operador até o encaminhamento final.
 
 etapas:
-  - ordem: 1
+  - id: 01-escolher-cenario
+    ordem: 1
+    ator: operador
+    funcao: Militar ou comandante responsável pelo fluxo
+    acao: definir_cenario
+    descricao: Define se o fluxo é de auto-solicitação ou de pedido recebido de subordinado.
+    decisao:
+      vou_solicitar:
+        destino: 02-auto-criar-processo
+      subordinado_solicita:
+        destino: 06-analisar-processo-recebido
+
+  - id: 02-auto-criar-processo
+    ordem: 2
     ator: solicitante
     funcao: Militar requerente
     acao: criar_processo
-    documento: Requerimento
-    descricao: Cria processo e anexa requerimento de reaprazamento
-    destino: comandante
+    documento: Processo de reaprazamento
+    descricao: Cria o processo de reaprazamento no ambiente atual.
+    destino: 03-auto-criar-solicitacao
 
-  - ordem: 2
-    ator: comandante
-    funcao: Comandante da Unidade
-    acao: despachar
-    documento: Despacho
-    decisao:
-      aprovar:
-        destino: secretaria
-      indeferir:
-        destino: solicitante
-        notificar: true
-    descricao: Analisa e decide sobre o reaprazamento
-
-  - ordem: 3
-    ator: secretaria
-    funcao: Secretaria Administrativa
-    acao: acostar_autos
-    descricao: Acosta o despacho aos autos e prepara para publicação
-    destino: bg
-
-  - ordem: 4
-    ator: bg
-    funcao: Seção de Pessoal / BG
-    acao: publicar
-    documento: Publicação em BGCB
-    descricao: Publica o ato no Boletim Geral do Corpo de Bombeiros
-    notificar:
-      - comandante
-      - solicitante
-
-  - ordem: 5
+  - id: 03-auto-criar-solicitacao
+    ordem: 3
     ator: solicitante
     funcao: Militar requerente
-    acao: ciencia
-    descricao: Toma ciência da publicação
+    acao: criar_documento
+    documento: Solicitação
+    descricao: Redige a solicitação de mudança da data original para a nova data pretendida.
+    destino: 04-auto-ler-solicitacao
+
+  - id: 04-auto-ler-solicitacao
+    ordem: 4
+    ator: solicitante
+    funcao: Militar requerente
+    acao: ler_documento
+    documento: Solicitação
+    descricao: Relê a solicitação criada para validar dados, datas e contexto antes do envio.
+    destino: 05-auto-encaminhar-comandante
+
+  - id: 05-auto-encaminhar-comandante
+    ordem: 5
+    ator: solicitante
+    funcao: Militar requerente
+    acao: encaminhar
+    descricao: Encaminha o processo ao comandante ou chefe competente.
+    fim: true
+
+  - id: 06-analisar-processo-recebido
+    ordem: 6
+    ator: comandante
+    funcao: Comandante ou chefe responsável
+    acao: analisar_pedido
+    descricao: Abre o processo recebido e analisa o contexto estrutural do pedido.
+    destino: 07-ler-solicitacao-recebida
+
+  - id: 07-ler-solicitacao-recebida
+    ordem: 7
+    ator: comandante
+    funcao: Comandante ou chefe responsável
+    acao: ler_documento
+    documento: Solicitação
+    descricao: Lê a solicitação inicial para contextualizar o pedido antes do despacho.
+    destino: 08-despachar-autorizacao
+
+  - id: 08-despachar-autorizacao
+    ordem: 8
+    ator: comandante
+    funcao: Comandante ou chefe responsável
+    acao: despachar
+    documento: Despacho
+    descricao: Formaliza a autorização do reaprazamento no processo.
+    destino: 09-encaminhar-secretarias
+
+  - id: 09-encaminhar-secretarias
+    ordem: 9
+    ator: comandante
+    funcao: Comandante ou chefe responsável
+    acao: encaminhar
+    descricao: Encaminha o processo às secretarias e setores competentes.
     fim: true

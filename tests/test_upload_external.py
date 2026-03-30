@@ -10,6 +10,7 @@ import tempfile
 from unittest.mock import MagicMock, patch, call
 
 import pytest
+from bs4 import BeautifulSoup
 
 from sei_cli.client import SEIClient
 
@@ -358,3 +359,221 @@ var linkAssinarDocumento = 'controlador.php?acao=documento_assinar&id_documento=
 
         assert "error" in result
         assert "55555" in result["error"]
+
+
+class TestExecuteSignForm:
+    def setup_method(self):
+        self.client = _make_client()
+        self.client.client = MagicMock()
+        self.client.base_url = SEIClient.BASE
+        self.client._control_html = None
+        self.client._hash_pool = {}
+
+    @patch("sei_cli.client.auth._follow")
+    @patch("sei_cli.client.load_credentials")
+    @patch("sei_cli.client.orgao_to_value")
+    def test_returns_error_when_sei_returns_to_sign_form(
+        self,
+        mock_orgao_to_value,
+        mock_load_credentials,
+        mock_follow,
+    ):
+        from sei_cli.models import Credentials
+
+        mock_load_credentials.return_value = Credentials(
+            usuario="u",
+            senha="s",
+            orgao="CBM",
+            login_url="https://sei.rn.gov.br",
+            cargo="2º Tenente QOEM BM",
+        )
+        mock_orgao_to_value.return_value = "28"
+
+        form = BeautifulSoup(
+            '<form id="frmAssinaturas" action="controlador.php?acao=documento_assinar">'
+            '<input name="hdnIdDocumentos" value="48783546" />'
+            '<input name="txtUsuario" value="u" />'
+            "</form>",
+            "lxml",
+        ).find("form")
+
+        response = _mock_response(
+            '<html><body><form id="frmAssinaturas"></form></body></html>',
+            url="https://sei.rn.gov.br/sei/controlador.php?acao=documento_assinar&id_documento=48783546",
+        )
+        self.client.client.post.return_value = response
+        mock_follow.return_value = response
+
+        result = self.client._execute_sign_form(form, "<html></html>")
+
+        assert result["signed"] == []
+        assert result["already_signed"] == []
+        assert result["errors"]
+        assert "formulário de assinatura" in result["errors"][0]
+
+    @patch("sei_cli.client.auth._follow")
+    @patch("sei_cli.client.load_credentials")
+    @patch("sei_cli.client.orgao_to_value")
+    def test_still_accepts_success_redirect(
+        self,
+        mock_orgao_to_value,
+        mock_load_credentials,
+        mock_follow,
+    ):
+        from sei_cli.models import Credentials
+
+        mock_load_credentials.return_value = Credentials(
+            usuario="u",
+            senha="s",
+            orgao="CBM",
+            login_url="https://sei.rn.gov.br",
+            cargo="2º Tenente QOEM BM",
+        )
+        mock_orgao_to_value.return_value = "28"
+
+        form = BeautifulSoup(
+            '<form id="frmAssinaturas" action="controlador.php?acao=documento_assinar">'
+            '<input name="hdnIdDocumentos" value="48783546" />'
+            '<input name="txtUsuario" value="u" />'
+            "</form>",
+            "lxml",
+        ).find("form")
+
+        response = _mock_response(
+            "<html><body>ok</body></html>",
+            url="https://sei.rn.gov.br/sei/controlador.php?acao=arvore_visualizar&id_documento=48783546",
+        )
+        self.client.client.post.return_value = response
+        mock_follow.return_value = response
+
+        result = self.client._execute_sign_form(form, "<html></html>")
+
+        assert result["signed"] == ["48783546"]
+        assert result["errors"] == []
+
+    @patch("sei_cli.client.auth._follow")
+    @patch("sei_cli.client.load_credentials")
+    @patch("sei_cli.client.orgao_to_value")
+    def test_detects_already_signed_before_treating_returned_form_as_error(
+        self,
+        mock_orgao_to_value,
+        mock_load_credentials,
+        mock_follow,
+    ):
+        from sei_cli.models import Credentials
+
+        mock_load_credentials.return_value = Credentials(
+            usuario="u",
+            senha="s",
+            orgao="CBM",
+            login_url="https://sei.rn.gov.br",
+            cargo="2º Tenente QOEM BM",
+        )
+        mock_orgao_to_value.return_value = "28"
+
+        form = BeautifulSoup(
+            '<form id="frmAssinaturas" action="controlador.php?acao=documento_assinar">'
+            '<input name="hdnIdDocumentos" value="48783546" />'
+            "</form>",
+            "lxml",
+        ).find("form")
+
+        response = _mock_response(
+            "<html><body>Documento 40381565 já foi assinado por &quot;LEO ZENON TASSI&quot;."
+            "<form id=\"frmAssinaturas\"></form></body></html>",
+            url="https://sei.rn.gov.br/sei/controlador.php?acao=documento_assinar&id_documento=48783546",
+        )
+        self.client.client.post.return_value = response
+        mock_follow.return_value = response
+
+        result = self.client._execute_sign_form(form, "<html></html>")
+
+        assert result["signed"] == []
+        assert result["errors"] == []
+        assert result["already_signed"]
+
+    @patch("sei_cli.client.auth._follow")
+    @patch("sei_cli.client.load_credentials")
+    @patch("sei_cli.client.orgao_to_value")
+    def test_uses_selected_cargo_from_form_when_credentials_cargo_is_empty(
+        self,
+        mock_orgao_to_value,
+        mock_load_credentials,
+        mock_follow,
+    ):
+        from sei_cli.models import Credentials
+
+        mock_load_credentials.return_value = Credentials(
+            usuario="u",
+            senha="s",
+            orgao="CBM",
+            login_url="https://sei.rn.gov.br",
+            cargo="",
+        )
+        mock_orgao_to_value.return_value = "28"
+
+        form = BeautifulSoup(
+            '<form id="frmAssinaturas" action="controlador.php?acao=documento_assinar">'
+            '<input name="hdnIdDocumentos" value="48783546" />'
+            '<select name="selCargoFuncao">'
+            '<option value="2º Tenente QOEM BM" selected>2º Tenente QOEM BM</option>'
+            "</select>"
+            "</form>",
+            "lxml",
+        ).find("form")
+
+        response = _mock_response(
+            "<html><body>ok</body></html>",
+            url="https://sei.rn.gov.br/sei/controlador.php?acao=arvore_visualizar&id_documento=48783546",
+        )
+        self.client.client.post.return_value = response
+        mock_follow.return_value = response
+
+        self.client._execute_sign_form(form, "<html></html>")
+
+        posted_content = self.client.client.post.call_args.kwargs["content"].decode("iso-8859-1")
+        assert "selCargoFuncao=2%BA+Tenente+QOEM+BM" in posted_content
+
+    @patch("sei_cli.client.auth._follow")
+    @patch("sei_cli.client.load_credentials")
+    @patch("sei_cli.client.orgao_to_value")
+    def test_skips_null_placeholder_option_when_credentials_cargo_is_empty(
+        self,
+        mock_orgao_to_value,
+        mock_load_credentials,
+        mock_follow,
+    ):
+        from sei_cli.models import Credentials
+
+        mock_load_credentials.return_value = Credentials(
+            usuario="u",
+            senha="s",
+            orgao="CBM",
+            login_url="https://sei.rn.gov.br",
+            cargo="",
+        )
+        mock_orgao_to_value.return_value = "28"
+
+        form = BeautifulSoup(
+            '<form id="frmAssinaturas" action="controlador.php?acao=documento_assinar">'
+            '<input name="hdnIdDocumentos" value="48783546" />'
+            '<select name="selCargoFuncao">'
+            '<option value="null"></option>'
+            '<option value="2º Tenente QOEM BM">2º Tenente QOEM BM</option>'
+            "</select>"
+            "</form>",
+            "lxml",
+        ).find("form")
+
+        response = _mock_response(
+            "<html><body>ok</body></html>",
+            url="https://sei.rn.gov.br/sei/controlador.php?acao=arvore_visualizar&id_documento=48783546",
+        )
+        self.client.client.post.return_value = response
+        mock_follow.return_value = response
+
+        self.client._execute_sign_form(form, "<html></html>")
+
+        posted_content = self.client.client.post.call_args.kwargs["content"].decode("iso-8859-1")
+        assert "selCargoFuncao=null" not in posted_content
+        assert "selCargoFuncao=2%BA+Tenente+QOEM+BM" in posted_content

@@ -140,6 +140,7 @@ class EditorSection:
     name: str         # e.g. txaEditor_406
     content: str      # HTML content
     section_id: str   # e.g. 406
+    editable: bool = True
 
 
 @dataclass(slots=True)

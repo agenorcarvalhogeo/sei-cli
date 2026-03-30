@@ -4,6 +4,7 @@ import re
 from unittest.mock import MagicMock, patch, call
 import pytest
 from sei_cli.client import SEIClient
+from sei_cli.models import SystemStatus, Unit
 
 
 # --- Fixtures: realistic HTML snippets ---
@@ -182,6 +183,89 @@ class TestAutoUnitSwitch:
         # Should still have tried to restore
         assert mock_switch.call_count == 2
         mock_switch.assert_any_call("CBM - DAT - SEC  - 1°SAT/1°CAT")
+
+
+class TestSwitchUnit:
+    @patch("sei_cli.client.parse_unit_switch_form")
+    @patch("sei_cli.client.parse_units_switch_page")
+    @patch("sei_cli.client.parse_unit_switch_link")
+    def test_noop_when_target_is_current_unit(
+        self,
+        mock_switch_link,
+        mock_units_page,
+        mock_switch_form,
+    ):
+        client = SEIClient.__new__(SEIClient)
+        client._fresh_control = MagicMock(return_value="<html></html>")
+        client._sei_url = lambda path: f"https://sei.rn.gov.br/sei/{path}"
+        client._current_unit_id = "110008367"
+        client._control_html = None
+        client._menu_links = {}
+        client._persist_session = MagicMock()
+        client.status = MagicMock(return_value=SystemStatus(valid=True, unidade_sigla="CBM - COBM - CMDO PABM APODI"))
+        client._post = MagicMock()
+
+        switch_response = MagicMock()
+        switch_response.url = "https://sei.rn.gov.br/sei/controlador.php?acao=infra_trocar_unidade&infra_unidade_atual=110008367"
+        switch_response.text = "<html></html>"
+        client._get = MagicMock(return_value=switch_response)
+
+        mock_switch_link.return_value = "https://sei.rn.gov.br/sei/controlador.php?acao=infra_trocar_unidade&infra_unidade_atual=110008367"
+        mock_units_page.return_value = [
+            Unit(sigla="CBM - COBM - CMDO PABM APODI", descricao="PABM", link="110008367"),
+        ]
+        mock_switch_form.return_value = ("controlador.php", {})
+
+        status = client.switch_unit("CBM - COBM - CMDO PABM APODI")
+
+        assert status.valid is True
+        client._post.assert_not_called()
+        client.status.assert_called_once()
+
+    @patch("sei_cli.client.parse_menu_links")
+    @patch("sei_cli.client.parse_system_status")
+    @patch("sei_cli.client.parse_unit_switch_form")
+    @patch("sei_cli.client.parse_units_switch_page")
+    @patch("sei_cli.client.parse_unit_switch_link")
+    def test_returns_post_status_when_control_page_parse_is_invalid(
+        self,
+        mock_switch_link,
+        mock_units_page,
+        mock_switch_form,
+        mock_parse_status,
+        mock_menu_links,
+    ):
+        client = SEIClient.__new__(SEIClient)
+        client._fresh_control = MagicMock(return_value="<html></html>")
+        client._sei_url = lambda path: f"https://sei.rn.gov.br/sei/{path}"
+        client._current_unit_id = "110006929"
+        client._control_html = None
+        client._menu_links = {}
+        client._persist_session = MagicMock()
+
+        switch_response = MagicMock()
+        switch_response.url = "https://sei.rn.gov.br/sei/controlador.php?acao=infra_trocar_unidade&infra_unidade_atual=110006929"
+        switch_response.text = "<html>post ok</html>"
+        control_response = MagicMock()
+        control_response.text = "<html>control invalid</html>"
+        client._get = MagicMock(side_effect=[switch_response, control_response])
+        client._post = MagicMock(return_value=switch_response)
+
+        mock_switch_link.return_value = "https://sei.rn.gov.br/sei/controlador.php?acao=infra_trocar_unidade&infra_unidade_atual=110006929"
+        mock_units_page.return_value = [
+            Unit(sigla="CBM - COBM - CMDO PABM APODI", descricao="PABM", link="110008367"),
+        ]
+        mock_switch_form.return_value = ("controlador.php", {})
+        mock_parse_status.side_effect = [
+            SystemStatus(valid=True, unidade_sigla="CBM - COBM - CMDO PABM APODI"),
+            SystemStatus(valid=False, unidade_sigla="CBM - COBM - CMDO PABM APODI"),
+        ]
+        mock_menu_links.return_value = {}
+
+        status = client.switch_unit("CBM - COBM - CMDO PABM APODI")
+
+        assert status.valid is True
+        assert status.unidade_sigla == "CBM - COBM - CMDO PABM APODI"
 
 
 class TestFindAccessibleUnit:

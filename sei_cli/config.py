@@ -8,6 +8,8 @@ from sei_cli.models import Credentials
 
 CREDENTIALS_PATH = Path("~/.config/sei/credentials.json").expanduser()
 SESSION_PATH = Path("~/.config/sei-cli/session.json").expanduser()
+CREATED_PROCESSES_PATH = Path("~/.config/sei-cli/created_processes.json").expanduser()
+CREATED_DOCUMENTS_PATH = Path("~/.config/sei-cli/created_documents.json").expanduser()
 
 ORGAO_MAP: dict[str, str] = {
     "CBM": "28",
@@ -148,3 +150,36 @@ def load_session(path: Path = SESSION_PATH) -> dict | None:
 def clear_session(path: Path = SESSION_PATH) -> None:
     if path.exists():
         path.unlink()
+
+
+def _load_json_list(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _append_json_list(path: Path, item: dict) -> None:
+    _ensure_parent(path)
+    data = _load_json_list(path)
+    data.append(item)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def append_created_process_log(item: dict, path: Path = CREATED_PROCESSES_PATH) -> None:
+    _append_json_list(path, item)
+
+
+def append_created_document_log(item: dict, path: Path = CREATED_DOCUMENTS_PATH) -> None:
+    _append_json_list(path, item)
+
+
+def load_created_processes(path: Path = CREATED_PROCESSES_PATH) -> list[dict]:
+    return _load_json_list(path)
+
+
+def load_created_documents(path: Path = CREATED_DOCUMENTS_PATH) -> list[dict]:
+    return _load_json_list(path)

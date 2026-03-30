@@ -20,7 +20,7 @@ import json
 import re
 import time
 from typing import Any, Iterator
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -743,6 +743,83 @@ class SEIClient:
         return {
             "tipo_processo_id": tipo_processo_id,
             **access_metadata,
+        }
+
+    def get_process_access_metadata(self, id_procedimento: str) -> dict[str, Any]:
+        """Read the current access policy from the process alter form.
+
+        Returns the active access level plus the selected legal hypothesis fields
+        in the same structure expected by the canonical writing operations.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError("Não foi possível acessar a árvore do processo")
+
+        start = arvore_html.find('Nos[0]')
+        end = arvore_html.find('Nos[1]', start)
+        nos0 = arvore_html[start:end].replace('\\"', '"')
+
+        alt_m = re.search(
+            r'href="(controlador\.php\?acao=procedimento_alterar[^"]*)"',
+            nos0,
+        )
+        if not alt_m:
+            raise RuntimeError("Alterar Processo action not found in toolbar")
+
+        alt_url = self._sei_url(alt_m.group(1).replace('&amp;', '&'))
+        r_form = self._get(alt_url)
+        soup = BeautifulSoup(r_form.text, "lxml")
+        form = soup.find("form", id="frmProcedimentoCadastro")
+        if not form:
+            raise RuntimeError("Alter process form not found")
+
+        data = self._collect_form_defaults(form)
+        nivel_acesso = data.get("rdoNivelAcesso", "0")
+        access_metadata = self._extract_access_hypotheses_from_form(
+            soup,
+            data,
+            nivel_acesso=nivel_acesso,
+        )
+
+        selected_items: list[dict[str, Any]] = []
+        selected_extra_fields: dict[str, str] = {}
+        for field in access_metadata.get("access_hypotheses", []):
+            field_name = field["field_name"]
+            selected_value = data.get(field_name, "")
+            if not selected_value:
+                continue
+            option = next(
+                (item for item in field["options"] if item["value"] == selected_value),
+                None,
+            )
+            if not option:
+                continue
+            selected_items.append(
+                {
+                    "field_name": field_name,
+                    "field_label": field.get("field_label"),
+                    "hidden_field_name": field.get("hidden_field_name"),
+                    "value": option["value"],
+                    "label": option["label"],
+                }
+            )
+            selected_extra_fields[field_name] = option["value"]
+            hidden_field = field.get("hidden_field_name")
+            if hidden_field:
+                selected_extra_fields[hidden_field] = option["value"]
+
+        if nivel_acesso == "2":
+            selected_hypothesis: dict[str, Any] | list[dict[str, Any]] | None = selected_items or None
+        else:
+            selected_hypothesis = selected_items[0] if selected_items else None
+
+        return {
+            "id_procedimento": id_procedimento,
+            "nivel_acesso": nivel_acesso,
+            "available_hypotheses": access_metadata.get("access_hypotheses", []),
+            "selected_hypothesis": selected_hypothesis,
+            "selected_extra_fields": selected_extra_fields,
+            "warnings": access_metadata.get("warnings", []),
         }
 
     def _load_document_creation_form(
@@ -2378,9 +2455,14 @@ class SEIClient:
         units = parse_units_switch_page(r.text, self._sei_url(""))
         form_action, hiddens = parse_unit_switch_form(r.text)
         
+        current_unit_id = parse_qs(urlparse(str(r.url)).query).get("infra_unidade_atual", [None])[0]
+
         kw = keyword.lower()
         target = None
         for u in units:
+            if kw == (u.link or "").lower():
+                target = u
+                break
             if kw in u.sigla.lower() or kw in u.descricao.lower():
                 target = u
                 break
@@ -2388,6 +2470,11 @@ class SEIClient:
         if not target or not target.link:
             available = ", ".join(u.sigla for u in units)
             raise RuntimeError(f"Unidade '{keyword}' não encontrada. Disponíveis: {available}")
+
+        if current_unit_id and target.link == current_unit_id:
+            status = self.status()
+            self._current_unit_id = target.link
+            return status
         
         # POST form with selInfraUnidades (the key JS creates dynamically)
         post_url = urljoin(str(r.url), form_action) if form_action else switch_url
@@ -2397,7 +2484,7 @@ class SEIClient:
 
         # After switching, the response is a confirmation page, not the control
         # page. We need to explicitly load the control page to get process lists.
-        status = parse_system_status(r2.text)
+        post_status = parse_system_status(r2.text)
         self._current_unit_id = target.link
         control_url = self._sei_url(
             f"controlador.php?acao=procedimento_controlar"
@@ -2407,7 +2494,12 @@ class SEIClient:
         self._control_html = rc.text
         self._menu_links = parse_menu_links(rc.text, self._sei_url(""))
         self._persist_session()
-        return parse_system_status(rc.text)
+        control_status = parse_system_status(rc.text)
+        if control_status.valid:
+            return control_status
+        if post_status.valid:
+            return post_status
+        return control_status
 
     # --- Search ---
 
@@ -2716,8 +2808,9 @@ class SEIClient:
 
         return True
 
-    # Alias for CLI compatibility
-    switch_unit = trocar_unidade
+    # Legacy compatibility helper kept for callers that still expect the
+    # boolean-returning unit switch flow.
+    switch_unit_legacy = trocar_unidade
 
     def reabrir_processo(self, id_procedimento: str) -> bool:
         """Reopen a process that was closed/concluded in the current unit.
@@ -4660,10 +4753,15 @@ class SEIClient:
             current_status = self.status()
             original_sigla = current_status.unidade_sigla
         except Exception:
-            original_sigla = None
+            try:
+                fresh_control = self._fresh_control()
+                current_status = parse_system_status(fresh_control)
+                original_sigla = current_status.unidade_sigla
+            except Exception:
+                original_sigla = None
 
         # Already on the right unit?
-        if original_sigla and required in original_sigla:
+        if original_sigla and required.casefold() in original_sigla.casefold():
             yield None
             return
 
@@ -5460,13 +5558,26 @@ class SEIClient:
         creds = load_credentials()
         form_action = urljoin(self._sei_url(""), form.get("action", ""))
 
-        # Collect all form fields (SEI pre-populates txtUsuario and hdnIdUsuario
-        # with the logged-in user — do NOT override these)
+        # Collect form fields (SEI pre-populates txtUsuario/hdnIdUsuario and
+        # may also preselect selCargoFuncao in a <select>).
         sign_data = {}
         for inp in form.find_all("input"):
             n = inp.get("name", "")
             if n:
                 sign_data[n] = inp.get("value", "")
+        for select in form.find_all("select"):
+            name = select.get("name", "")
+            if not name:
+                continue
+            selected = select.find("option", selected=True)
+            if selected is None:
+                for option in select.find_all("option"):
+                    value = (option.get("value") or "").strip()
+                    if value and value.casefold() != "null":
+                        selected = option
+                        break
+            if selected is not None:
+                sign_data[name] = selected.get("value", "")
 
         # selCargoFuncao: use value from credentials.json (campo "cargo").
         # Must be encoded as ISO-8859-1 (º → \xba).
@@ -5519,12 +5630,19 @@ class SEIClient:
                 if text and text not in found_messages:
                     found_messages.add(text)
 
+        plain_text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)
+
         # Also check for inline "já foi assinado" which may not be in a standard div
-        if "já foi assinado" in r.text and not any("já foi assinado" in m for m in found_messages):
-            # Extract the message around it
-            match = re.search(r'Documento\s+\d+\s+já foi assinado[^<]*', r.text)
+        if "já foi assinado" in plain_text.lower() and not any("já foi assinado" in m.lower() for m in found_messages):
+            match = re.search(
+                r"Documento\s+\d+\s+já\s+foi\s+assinado.*?(?:\.|$)",
+                plain_text,
+                re.IGNORECASE,
+            )
             if match:
                 found_messages.add(match.group().strip())
+            else:
+                found_messages.add("Documento já foi assinado.")
 
         for text in found_messages:
             if "já foi assinado" in text:
@@ -5533,6 +5651,11 @@ class SEIClient:
                 result["signed"].append(doc_ids)
             elif "erro" in text.lower() or "incorret" in text.lower():
                 result["errors"].append(text)
+
+        returned_to_sign_form = (
+            "acao=documento_assinar" in str(r.url)
+            or 'id="frmAssinaturas"' in r.text
+        )
 
         # Check if redirected to blocos list (success — signed and returned)
         if "Blocos de Assinatura" in r.text and not result["signed"] and not result["already_signed"]:
@@ -5556,15 +5679,21 @@ class SEIClient:
             if any(p in r.text.lower() for p in success_patterns):
                 result["signed"].append(doc_ids)
 
-        # Fallback: if we POSTed credentials and got no error/already-signed, assume success.
-        # The sign page title reappearing does NOT mean "already signed" — it can appear on
-        # success pages too (e.g., bloco signing). Only treat as "already_signed" if the
-        # response explicitly contains "já foi assinado".
+        # If SEI returned to the sign form without explicit success, treat it as failure.
+        # This usually means invalid orgao/cargo/senha or another missing field.
+        # IMPORTANT: "já foi assinado" detection has PRIORITY over URL-based checks,
+        # because SEI may return to the sign form URL even when the document was
+        # already signed — the response body contains the actual status.
         if not result["signed"] and not result["already_signed"] and not result["errors"]:
             if "já foi assinado" in r.text:
-                result["already_signed"].append(f"Documentos {doc_ids} já assinados")
+                match = re.search(r'Documento\s+\d+\s+já foi assinado[^<]*', r.text)
+                msg = match.group().strip() if match else f"Documentos {doc_ids} já assinados"
+                result["already_signed"].append(msg)
+            elif returned_to_sign_form:
+                result["errors"].append(
+                    "SEI retornou ao formulário de assinatura sem confirmar a operação."
+                )
             else:
-                # No error and no explicit "already signed" → POST succeeded → signed
                 result["signed"].append(doc_ids)
 
         self._control_html = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 import click
@@ -10,6 +11,32 @@ from rich.table import Table
 
 from sei_cli.client import SEIClient
 from sei_cli.models import Block, Process, SystemStatus
+from sei_cli.operations import (
+    block_review as op_block_review,
+    document_create_confirm as op_document_create_confirm,
+    document_create_preview as op_document_create_preview,
+    document_edit_confirm as op_document_edit_confirm,
+    document_edit_preview as op_document_edit_preview,
+    document_quality_check as op_document_quality_check,
+    document_read as op_document_read,
+    inbox_snapshot as op_inbox_snapshot,
+    process_create_confirm as op_process_create_confirm,
+    process_create_preview as op_process_create_preview,
+    process_open as op_process_open,
+    process_read as op_process_read,
+    process_report as op_process_report,
+    process_summary as op_process_summary,
+    relatorio_read as op_relatorio_read,
+    signature_block_add_document_confirm as op_signature_block_add_document_confirm,
+    signature_block_add_document_preview as op_signature_block_add_document_preview,
+    signature_block_list as op_signature_block_list,
+    signature_block_read as op_signature_block_read,
+    signature_block_sign_confirm as op_signature_block_sign_confirm,
+    signature_block_sign_preview as op_signature_block_sign_preview,
+    signature_block_review as op_signature_block_review,
+    workflow_next as op_workflow_next,
+    workflow_show as op_workflow_show,
+)
 
 console = Console()
 
@@ -17,6 +44,18 @@ console = Console()
 def _emit(data: Any, as_json: bool) -> None:
     if as_json:
         click.echo(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _emit_operation_result(result: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        _emit(result, True)
+    else:
+        if result.get("ok"):
+            console.print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            console.print(f"[red]{result.get('error', {}).get('message', 'Operação falhou')}[/red]")
+    if not result.get("ok"):
+        raise SystemExit(1)
 
 
 def _print_status(status: SystemStatus) -> None:
@@ -29,6 +68,16 @@ def _print_status(status: SystemStatus) -> None:
     table.add_row("Usuário", status.usuario or "-")
     table.add_row("Último acesso", status.ultimo_acesso or "-")
     console.print(table)
+
+
+def _normalize_switch_status(client: SEIClient, result: Any) -> SystemStatus:
+    if isinstance(result, SystemStatus):
+        return result
+    if result is True:
+        return client.status()
+    if result is False:
+        raise RuntimeError("Falha ao trocar unidade")
+    raise RuntimeError(f"Retorno inesperado da troca de unidade: {type(result).__name__}")
 
 
 def _table_processes(title: str, items: list[Process]) -> None:
@@ -476,7 +525,7 @@ def units_cmd(as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
 def switch_cmd(sigla: str, as_json: bool) -> None:
     with SEIClient() as client:
-        status = client.switch_unit(sigla)
+        status = _normalize_switch_status(client, client.switch_unit(sigla))
 
     if as_json:
         _emit(asdict(status), True)
@@ -1199,6 +1248,502 @@ def upload_cmd(
         }, True)
         return
     console.print(f"[green]✅ Documento externo criado — id_documento: {id_doc}[/green]")
+
+
+@cli.command("inbox-snapshot")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def inbox_snapshot_cmd(as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_inbox_snapshot(client)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-open")
+@click.argument("numero_ou_id")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_open_cmd(numero_ou_id: str, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_process_open(client, numero_ou_id)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("document-read")
+@click.argument("numero_ou_id")
+@click.option("--process-id", default=None, help="ID do processo relacionado")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def document_read_cmd(numero_ou_id: str, process_id: str | None, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_document_read(client, numero_ou_id, id_procedimento=process_id)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-read")
+@click.argument("numero_ou_id")
+@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--date-from", default=None, help="Filtrar documentos a partir desta data")
+@click.option("--date-to", default=None, help="Filtrar documentos até esta data")
+@click.option("--sample-size", default=3, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_read_cmd(
+    numero_ou_id: str,
+    mode: str,
+    date_from: str | None,
+    date_to: str | None,
+    sample_size: int,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_read(
+            client,
+            numero_ou_id,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            sample_size=sample_size,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-summary")
+@click.argument("numero_ou_id")
+@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--date-from", default=None)
+@click.option("--date-to", default=None)
+@click.option("--sample-size", default=3, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_summary_cmd(
+    numero_ou_id: str,
+    mode: str,
+    date_from: str | None,
+    date_to: str | None,
+    sample_size: int,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_summary(
+            client,
+            numero_ou_id,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            sample_size=sample_size,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-report")
+@click.argument("numero_ou_id")
+@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--date-from", default=None)
+@click.option("--date-to", default=None)
+@click.option("--sample-size", default=3, show_default=True, type=int)
+@click.option("--include-relatorios/--no-include-relatorios", default=True, show_default=True)
+@click.option("--relatorio-limit", default=1, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_report_cmd(
+    numero_ou_id: str,
+    mode: str,
+    date_from: str | None,
+    date_to: str | None,
+    sample_size: int,
+    include_relatorios: bool,
+    relatorio_limit: int,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_report(
+            client,
+            numero_ou_id,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            sample_size=sample_size,
+            include_relatorios=include_relatorios,
+            relatorio_limit=relatorio_limit,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-create-preview")
+@click.argument("tipo_processo")
+@click.option("--especificacao", required=True)
+@click.option("--interessados", default="")
+@click.option("--observacoes", default="")
+@click.option("--nivel", "nivel_acesso", default="0")
+@click.option("--motivo-acesso", default="")
+@click.option("--hipotese-acesso", default="")
+@click.option("--hipotese-campo", default="")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_create_preview_cmd(
+    tipo_processo: str,
+    especificacao: str,
+    interessados: str,
+    observacoes: str,
+    nivel_acesso: str,
+    motivo_acesso: str,
+    hipotese_acesso: str,
+    hipotese_campo: str,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_create_preview(
+            client,
+            tipo_processo,
+            especificacao=especificacao,
+            interessados=interessados,
+            observacoes=observacoes,
+            nivel_acesso=nivel_acesso,
+            motivo_acesso=motivo_acesso,
+            hipotese_acesso=hipotese_acesso,
+            hipotese_campo=hipotese_campo,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-create-confirm")
+@click.argument("tipo_processo")
+@click.option("--especificacao", required=True)
+@click.option("--interessados", default="")
+@click.option("--observacoes", default="")
+@click.option("--nivel", "nivel_acesso", default="0")
+@click.option("--motivo-acesso", default="")
+@click.option("--hipotese-acesso", default="")
+@click.option("--hipotese-campo", default="")
+@click.option("--confirm", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_create_confirm_cmd(
+    tipo_processo: str,
+    especificacao: str,
+    interessados: str,
+    observacoes: str,
+    nivel_acesso: str,
+    motivo_acesso: str,
+    hipotese_acesso: str,
+    hipotese_campo: str,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_create_confirm(
+            client,
+            tipo_processo,
+            especificacao=especificacao,
+            interessados=interessados,
+            observacoes=observacoes,
+            nivel_acesso=nivel_acesso,
+            motivo_acesso=motivo_acesso,
+            hipotese_acesso=hipotese_acesso,
+            hipotese_campo=hipotese_campo,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("document-create-preview")
+@click.argument("numero_ou_id_processo")
+@click.argument("tipo_documento")
+@click.option("--descricao", default="")
+@click.option("--interessados", default="")
+@click.option("--texto-inicial", default="N")
+@click.option("--nivel", "nivel_acesso", default="inherit")
+@click.option("--motivo-acesso", default="")
+@click.option("--hipotese-acesso", default="")
+@click.option("--hipotese-campo", default="")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def document_create_preview_cmd(
+    numero_ou_id_processo: str,
+    tipo_documento: str,
+    descricao: str,
+    interessados: str,
+    texto_inicial: str,
+    nivel_acesso: str,
+    motivo_acesso: str,
+    hipotese_acesso: str,
+    hipotese_campo: str,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_document_create_preview(
+            client,
+            numero_ou_id_processo,
+            tipo_documento,
+            descricao=descricao,
+            interessados=interessados,
+            texto_inicial=texto_inicial,
+            nivel_acesso=nivel_acesso,
+            motivo_acesso=motivo_acesso,
+            hipotese_acesso=hipotese_acesso,
+            hipotese_campo=hipotese_campo,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("document-create-confirm")
+@click.argument("numero_ou_id_processo")
+@click.argument("tipo_documento")
+@click.option("--descricao", default="")
+@click.option("--interessados", default="")
+@click.option("--texto-inicial", default="N")
+@click.option("--nivel", "nivel_acesso", default="inherit")
+@click.option("--motivo-acesso", default="")
+@click.option("--hipotese-acesso", default="")
+@click.option("--hipotese-campo", default="")
+@click.option("--confirm", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def document_create_confirm_cmd(
+    numero_ou_id_processo: str,
+    tipo_documento: str,
+    descricao: str,
+    interessados: str,
+    texto_inicial: str,
+    nivel_acesso: str,
+    motivo_acesso: str,
+    hipotese_acesso: str,
+    hipotese_campo: str,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_document_create_confirm(
+            client,
+            numero_ou_id_processo,
+            tipo_documento,
+            descricao=descricao,
+            interessados=interessados,
+            texto_inicial=texto_inicial,
+            nivel_acesso=nivel_acesso,
+            motivo_acesso=motivo_acesso,
+            hipotese_acesso=hipotese_acesso,
+            hipotese_campo=hipotese_campo,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("document-edit-preview")
+@click.argument("numero_ou_id")
+@click.option("--process-id", default=None)
+@click.option("--section-id", default=None)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def document_edit_preview_cmd(
+    numero_ou_id: str,
+    process_id: str | None,
+    section_id: str | None,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_document_edit_preview(
+            client,
+            numero_ou_id,
+            process_id=process_id,
+            section_id=section_id,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("document-edit-confirm")
+@click.argument("numero_ou_id")
+@click.option("--process-id", default=None)
+@click.option("--section-id", default=None)
+@click.option("--content", default=None, help="HTML bruto a salvar")
+@click.option("--content-file", default=None, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--confirm", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def document_edit_confirm_cmd(
+    numero_ou_id: str,
+    process_id: str | None,
+    section_id: str | None,
+    content: str | None,
+    content_file: Path | None,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    payload = content
+    if content_file is not None:
+        payload = content_file.read_text(encoding="utf-8")
+    if payload is None:
+        raise click.UsageError("Informe --content ou --content-file.")
+    with SEIClient() as client:
+        result = op_document_edit_confirm(
+            client,
+            numero_ou_id,
+            content=payload,
+            process_id=process_id,
+            section_id=section_id,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("document-quality-check")
+@click.argument("numero_ou_id")
+@click.option("--process-id", default=None)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def document_quality_check_cmd(numero_ou_id: str, process_id: str | None, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_document_quality_check(client, numero_ou_id, process_id=process_id)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("relatorio-read")
+@click.argument("numero_ou_id")
+@click.option("--process-id", default=None)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def relatorio_read_cmd(numero_ou_id: str, process_id: str | None, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_relatorio_read(client, numero_ou_id, id_procedimento=process_id)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("block-review")
+@click.argument("block_numero")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def block_review_cmd(block_numero: str, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_block_review(client, block_numero)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-list")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_list_cmd(as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_list(client)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-read")
+@click.argument("block_numero")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_read_cmd(block_numero: str, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_read(client, block_numero)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-review")
+@click.argument("block_numero")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_review_cmd(block_numero: str, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_review(client, block_numero)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-add-document-preview")
+@click.argument("block_numero")
+@click.argument("numero_ou_id_documento")
+@click.option("--process-id", default=None)
+@click.option("--disponibilizar", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_add_document_preview_cmd(
+    block_numero: str,
+    numero_ou_id_documento: str,
+    process_id: str | None,
+    disponibilizar: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_add_document_preview(
+            client,
+            block_numero,
+            numero_ou_id_documento,
+            process_id=process_id,
+            disponibilizar=disponibilizar,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-add-document-confirm")
+@click.argument("block_numero")
+@click.argument("numero_ou_id_documento")
+@click.option("--process-id", default=None)
+@click.option("--disponibilizar", is_flag=True)
+@click.option("--confirm", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_add_document_confirm_cmd(
+    block_numero: str,
+    numero_ou_id_documento: str,
+    process_id: str | None,
+    disponibilizar: bool,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_add_document_confirm(
+            client,
+            block_numero,
+            numero_ou_id_documento,
+            process_id=process_id,
+            disponibilizar=disponibilizar,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-sign-preview")
+@click.argument("block_numero")
+@click.option("--document-id", "document_ids", multiple=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_sign_preview_cmd(
+    block_numero: str,
+    document_ids: tuple[str, ...],
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_sign_preview(
+            client,
+            block_numero,
+            document_ids=list(document_ids),
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-sign-confirm")
+@click.argument("block_numero")
+@click.option("--document-id", "document_ids", multiple=True)
+@click.option("--confirm", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_sign_confirm_cmd(
+    block_numero: str,
+    document_ids: tuple[str, ...],
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_sign_confirm(
+            client,
+            block_numero,
+            document_ids=list(document_ids),
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("workflow-show")
+@click.argument("ref")
+@click.option("--orgao", default=None)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def workflow_show_cmd(ref: str, orgao: str | None, as_json: bool) -> None:
+    result = op_workflow_show(ref, orgao=orgao)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("workflow-next")
+@click.argument("ref")
+@click.option("--current-step", default=None)
+@click.option("--decision", default=None)
+@click.option("--orgao", default=None)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def workflow_next_cmd(
+    ref: str,
+    current_step: str | None,
+    decision: str | None,
+    orgao: str | None,
+    as_json: bool,
+) -> None:
+    result = op_workflow_next(ref, current_step=current_step, decision=decision, orgao=orgao)
+    _emit_operation_result(result, as_json)
 
 
 if __name__ == "__main__":
