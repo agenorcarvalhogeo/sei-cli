@@ -184,6 +184,41 @@ class TestAutoUnitSwitch:
         assert mock_switch.call_count == 2
         mock_switch.assert_any_call("CBM - DAT - SEC  - 1°SAT/1°CAT")
 
+    @patch.object(SEIClient, 'switch_unit')
+    @patch.object(SEIClient, 'list_units')
+    @patch.object(SEIClient, 'status')
+    def test_retries_restore_when_status_still_points_to_other_unit(self, mock_status, mock_units, mock_switch):
+        from sei_cli.models import SystemStatus, Unit
+        mock_status.side_effect = [
+            SystemStatus(
+                valid=True,
+                unidade_sigla="CBM - DAT - SEC  - 1°SAT/1°CAT",
+                unidade_descricao="SAT",
+                usuario="TEST",
+                ultimo_acesso="",
+            ),
+            SystemStatus(
+                valid=True,
+                unidade_sigla="PAD-PDF",
+                unidade_descricao="PAD",
+                usuario="TEST",
+                ultimo_acesso="",
+            ),
+        ]
+        mock_units.return_value = [
+            Unit(sigla="CBM - COBM - CMDO PABM APODI", descricao="PABM", link="110008367"),
+            Unit(sigla="CBM - DAT - SEC  - 1°SAT/1°CAT", descricao="SAT", link="110007086"),
+        ]
+
+        with self.client._auto_unit_switch(ARVORE_RESTRICTED) as switched:
+            assert switched == "CBM - COBM - CMDO PABM APODI"
+
+        assert mock_switch.call_count == 3
+        assert mock_switch.mock_calls[-2:] == [
+            call("CBM - DAT - SEC  - 1°SAT/1°CAT"),
+            call("CBM - DAT - SEC  - 1°SAT/1°CAT"),
+        ]
+
 
 class TestSwitchUnit:
     @patch("sei_cli.client.parse_unit_switch_form")

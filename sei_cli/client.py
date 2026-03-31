@@ -5239,6 +5239,13 @@ class SEIClient:
             if original_sigla:
                 try:
                     self.switch_unit(original_sigla)
+                    try:
+                        restored_status = self.status()
+                        restored_sigla = restored_status.unidade_sigla or ""
+                    except Exception:
+                        restored_sigla = ""
+                    if restored_sigla and original_sigla.casefold() not in restored_sigla.casefold():
+                        self.switch_unit(original_sigla)
                 except Exception:
                     pass  # Best effort — don't mask the real exception
 
