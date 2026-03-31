@@ -21,6 +21,8 @@ from sei_cli.operations import (
     document_pdf_preview as op_document_pdf_preview,
     document_quality_check as op_document_quality_check,
     document_read as op_document_read,
+    environment_triage_apply as op_environment_triage_apply,
+    environment_triage_preview as op_environment_triage_preview,
     inbox_snapshot as op_inbox_snapshot,
     marker_catalog as op_marker_catalog,
     process_create_confirm as op_process_create_confirm,
@@ -1273,6 +1275,75 @@ def upload_cmd(
 def inbox_snapshot_cmd(as_json: bool) -> None:
     with SEIClient() as client:
         result = op_inbox_snapshot(client)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("environment-triage-preview")
+@click.option("--only-new", is_flag=True, help="Somente processos novos (vermelho)")
+@click.option("--only-changed", is_flag=True, help="Somente processos com novidade (ícone amarelo)")
+@click.option("--only-unmarked", is_flag=True, help="Somente processos sem marcador")
+@click.option("--include-marked-review", is_flag=True, help="Incluir processos já marcados para revisão")
+@click.option("--limit", default=5, show_default=True, type=int)
+@click.option("--mode", default="contextual", show_default=True, type=click.Choice(["fast", "contextual", "deep"]))
+@click.option("--sample-size", default=3, show_default=True, type=int, help="Amostra usada no modo deep")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def environment_triage_preview_cmd(
+    only_new: bool,
+    only_changed: bool,
+    only_unmarked: bool,
+    include_marked_review: bool,
+    limit: int,
+    mode: str,
+    sample_size: int,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_environment_triage_preview(
+            client,
+            only_new=only_new,
+            only_changed=only_changed,
+            only_unmarked=only_unmarked,
+            include_marked_review=include_marked_review,
+            limit=limit,
+            mode=mode,
+            sample_size=sample_size,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("environment-triage-apply")
+@click.option("--only-new", is_flag=True, help="Somente processos novos (vermelho)")
+@click.option("--only-changed", is_flag=True, help="Somente processos com novidade (ícone amarelo)")
+@click.option("--only-unmarked", is_flag=True, help="Somente processos sem marcador")
+@click.option("--include-marked-review", is_flag=True, help="Incluir processos já marcados para revisão")
+@click.option("--limit", default=5, show_default=True, type=int)
+@click.option("--mode", default="contextual", show_default=True, type=click.Choice(["fast", "contextual", "deep"]))
+@click.option("--sample-size", default=3, show_default=True, type=int, help="Amostra usada no modo deep")
+@click.option("--confirm", is_flag=True, help="Confirma a aplicação da triagem")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def environment_triage_apply_cmd(
+    only_new: bool,
+    only_changed: bool,
+    only_unmarked: bool,
+    include_marked_review: bool,
+    limit: int,
+    mode: str,
+    sample_size: int,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_environment_triage_apply(
+            client,
+            only_new=only_new,
+            only_changed=only_changed,
+            only_unmarked=only_unmarked,
+            include_marked_review=include_marked_review,
+            limit=limit,
+            mode=mode,
+            sample_size=sample_size,
+            confirm=confirm,
+        )
     _emit_operation_result(result, as_json)
 
 

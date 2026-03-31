@@ -34,6 +34,7 @@ class Process:
     id_procedimento: str | None
     link: str
     novo: bool
+    recente: bool = False
     atribuido: str | None = None
     marcador: str | None = None
     caixa: str = "recebidos"

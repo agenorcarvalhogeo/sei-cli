@@ -20,6 +20,8 @@ from sei_cli.operations import (
     document_pdf_preview,
     document_quality_check,
     document_read,
+    environment_triage_apply,
+    environment_triage_preview,
     inbox_snapshot,
     marker_catalog,
     process_marker_history,
@@ -159,6 +161,17 @@ class FakeClient:
                 marcador="LIVROS",
                 caixa="recebidos",
             )
+        ,
+            Process(
+                numero="08810254.000117/2026-62",
+                tipo="Pessoal: Férias - Alteração",
+                especificacao="Reaprazamento de férias",
+                id_procedimento="48756457",
+                link="",
+                novo=False,
+                recente=True,
+                caixa="recebidos",
+            )
         ]
         gerados = [
             Process(
@@ -264,6 +277,25 @@ class FakeClient:
 
     def get_full_document_tree(self, id_procedimento: str) -> list[TreeDocument]:
         if id_procedimento != "47607237":
+            if id_procedimento == "48756457":
+                return [
+                    TreeDocument(
+                        id_documento="48784646",
+                        nome="Despacho 40382558",
+                        tipo="interno",
+                        sei_number="40382558",
+                        parent_folder=None,
+                        assinado=True,
+                    ),
+                    TreeDocument(
+                        id_documento="48783191",
+                        nome="Solicitação de Reaprazamento",
+                        tipo="interno",
+                        sei_number="40381240",
+                        parent_folder=None,
+                        assinado=False,
+                    ),
+                ]
             return []
         return [
             TreeDocument(
@@ -384,6 +416,16 @@ class FakeClient:
             return (
                 "Despacho atualizado do 3º SGT BM João Silva.\n"
                 "Encaminhar ao CMDO PABM APODI para providências.\n"
+            )
+        if (id_documento, id_procedimento) == ("48784646", "48756457"):
+            return (
+                "Despacho sobre o reaprazamento de férias.\n"
+                "Aguardando despacho do comandante.\n"
+            )
+        if (id_documento, id_procedimento) == ("48783191", "48756457"):
+            return (
+                "Solicitação de reaprazamento de férias do militar.\n"
+                "Necessita manifestação do comandante e posterior encaminhamento.\n"
             )
         raise RuntimeError("Documento não encontrado")
 
@@ -783,7 +825,7 @@ def test_inbox_snapshot_contract() -> None:
     assert result["schema_version"] == "1"
     assert result["operation"] == "inbox-snapshot"
     assert result["context"]["unidade_sigla"] == "OP 3"
-    assert result["data"]["recebidos_total"] == 1
+    assert result["data"]["recebidos_total"] == 2
     assert result["data"]["blocos_total"] == 1
     assert result["next_actions"][0]["action"] == "process-open"
 
@@ -1116,6 +1158,64 @@ def test_document_pdf_confirm_contract(tmp_path) -> None:
     assert result["operation"] == "document-pdf-confirm"
     assert result["data"]["download"]["path"] == str(output)
     assert output.exists()
+
+
+def test_environment_triage_preview_contract() -> None:
+    result = environment_triage_preview(FakeClient(), limit=5)
+
+    assert result["ok"] is True
+    assert result["operation"] == "environment-triage-preview"
+    assert result["data"]["filters"]["mode"] == "contextual"
+    assert result["data"]["candidates_selected_total"] >= 2
+    assert any("new" in item["triage_reason"] for item in result["data"]["candidates"])
+    assert any("unmarked" in item["triage_reason"] for item in result["data"]["candidates"])
+    assert any(item.get("context_document") for item in result["data"]["candidates"])
+
+
+def test_environment_triage_preview_fast_mode_avoids_document_reads() -> None:
+    class CountingClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_calls = 0
+
+        def read_document(self, id_documento: str, id_procedimento: str) -> str:
+            self.read_calls += 1
+            return super().read_document(id_documento, id_procedimento)
+
+    client = CountingClient()
+    result = environment_triage_preview(client, limit=5, mode="fast")
+
+    assert result["ok"] is True
+    assert result["data"]["filters"]["mode"] == "fast"
+    assert client.read_calls == 0
+
+
+def test_environment_triage_preview_contextual_reads_at_most_one_doc_per_candidate() -> None:
+    class CountingClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_calls = 0
+
+        def read_document(self, id_documento: str, id_procedimento: str) -> str:
+            self.read_calls += 1
+            return super().read_document(id_documento, id_procedimento)
+
+    client = CountingClient()
+    result = environment_triage_preview(client, limit=3, mode="contextual")
+
+    assert result["ok"] is True
+    assert result["data"]["filters"]["mode"] == "contextual"
+    assert client.read_calls <= result["data"]["candidates_selected_total"]
+    assert all("summary" in item for item in result["data"]["candidates"])
+
+
+def test_environment_triage_apply_contract() -> None:
+    client = FakeClient()
+    result = environment_triage_apply(client, only_unmarked=True, limit=5, confirm=True)
+
+    assert result["ok"] is True
+    assert result["operation"] == "environment-triage-apply"
+    assert result["data"]["applied_total"] >= 1
 
 
 def test_process_create_preview_exposes_hypotheses_when_non_public_access_is_requested() -> None:
@@ -2391,6 +2491,34 @@ def test_document_pdf_confirm_cli_json(monkeypatch, tmp_path) -> None:
     assert payload["ok"] is True
     assert payload["operation"] == "document-pdf-confirm"
     assert payload["resolved_ids"]["id_documento"] == "48568466"
+
+
+def test_environment_triage_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["environment-triage-preview", "--only-unmarked", "--mode", "fast", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "environment-triage-preview"
+    assert payload["data"]["filters"]["mode"] == "fast"
+
+
+def test_environment_triage_apply_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["environment-triage-apply", "--only-unmarked", "--mode", "contextual", "--confirm", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "environment-triage-apply"
 
 
 def test_relatorio_read_cli_json(monkeypatch) -> None:

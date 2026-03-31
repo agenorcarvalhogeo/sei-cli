@@ -99,6 +99,11 @@ def _parse_process_row(row: html.HtmlElement, caixa: str, base_url: str) -> Proc
         tipo, especificacao = aria.split(" / ", 1)
 
     novo = "processoNaoVisualizado" in (el.attrib.get("class") or "")
+    recente = bool(
+        row.xpath(
+            "./td//a[contains(@aria-label,'Um documento foi incluído ou assinado neste processo')]"
+        )
+    )
 
     atrib = row.xpath("./td/a[contains(@class, 'ancoraSigla')]/text()")
     atribuido = _norm(atrib[0]) if atrib else None
@@ -113,6 +118,7 @@ def _parse_process_row(row: html.HtmlElement, caixa: str, base_url: str) -> Proc
         id_procedimento=_extract_id(link),
         link=link,
         novo=novo,
+        recente=recente,
         atribuido=atribuido,
         marcador=marcador_val,
         caixa=caixa,

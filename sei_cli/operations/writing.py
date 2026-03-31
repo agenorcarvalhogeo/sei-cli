@@ -24,6 +24,7 @@ from .reading import (
     _resolve_marker_reference,
     _resolve_process_id,
     _result,
+    environment_triage_preview,
     process_marker_read,
     process_marker_preview,
 )
@@ -1609,6 +1610,95 @@ def document_pdf_confirm(
             resolved_ids=resolved_ids,
             exc=exc,
         )
+
+
+def environment_triage_apply(
+    client: Any,
+    *,
+    only_new: bool = False,
+    only_changed: bool = False,
+    only_unmarked: bool = False,
+    include_marked_review: bool = False,
+    limit: int = 5,
+    mode: str = "contextual",
+    sample_size: int = 3,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "environment-triage-apply"
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para aplicar a triagem de ambiente.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = environment_triage_preview(
+            client,
+            only_new=only_new,
+            only_changed=only_changed,
+            only_unmarked=only_unmarked,
+            include_marked_review=include_marked_review,
+            limit=limit,
+            mode=mode,
+            sample_size=sample_size,
+        )
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+
+        applied: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for item in preview["data"].get("candidates", []):
+            processo = item.get("processo") or {}
+            id_procedimento = processo.get("id_procedimento")
+            selected_marker = item.get("selected_marker")
+            marker_action = item.get("marker_action")
+            suggested_text = item.get("suggested_marker_text") or ""
+            if not id_procedimento or not selected_marker or marker_action not in {"create", "update"}:
+                skipped.append(
+                    {
+                        "processo": processo,
+                        "marker_action": marker_action,
+                        "reason": "no_mutation_needed_or_no_marker_suggestion",
+                    }
+                )
+                continue
+            marker_id = selected_marker.get("marcador_id")
+            if marker_action == "create":
+                ok = client.set_marcador(id_procedimento, marker_id, suggested_text)
+            else:
+                current_markers = item.get("current_markers") or []
+                current_marker_id = (current_markers[0].get("marcador_id") if current_markers else marker_id)
+                ok = client.update_marcador(id_procedimento, current_marker_id, suggested_text)
+            if ok:
+                applied.append(
+                    {
+                        "processo": processo,
+                        "marker_action": marker_action,
+                        "selected_marker": selected_marker,
+                        "text": suggested_text,
+                    }
+                )
+            else:
+                skipped.append(
+                    {
+                        "processo": processo,
+                        "marker_action": marker_action,
+                        "reason": "mutation_not_confirmed",
+                    }
+                )
+
+        return _result(
+            operation=operation,
+            context=preview["context"],
+            data={
+                "applied_total": len(applied),
+                "skipped_total": len(skipped),
+                "applied": applied,
+                "skipped": skipped,
+            },
+        )
+    except Exception as exc:
+        return _error_result(operation=operation, exc=exc)
 
 
 def signature_block_add_document_preview(

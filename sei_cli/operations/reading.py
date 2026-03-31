@@ -7,6 +7,7 @@ import io
 import importlib
 import re
 from typing import Any
+import unicodedata
 
 from sei_cli.models import Block, BlockDocument, Process, TreeDocument
 from sei_cli.relatorio_parser import (
@@ -79,6 +80,7 @@ def _process_preview(process: Process) -> dict[str, Any]:
         "especificacao": process.especificacao,
         "id_procedimento": process.id_procedimento,
         "novo": process.novo,
+        "recente": process.recente,
         "atribuido": process.atribuido,
         "marcador": process.marcador,
         "caixa": process.caixa,
@@ -343,6 +345,7 @@ def _ui_context(
         "process_box_category": process.caixa if process else None,
         "process_marker": process.marcador if process else None,
         "process_is_new": process.novo if process else None,
+        "process_has_recent_change": process.recente if process else None,
     }
 
 
@@ -1562,7 +1565,9 @@ def _normalize_marker_item(item: Any) -> dict[str, Any]:
 
 
 def _normalize_marker_name(value: str) -> str:
-    return value.strip().casefold().replace("/", " ").replace("-", " ")
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return normalized.strip().casefold().replace("/", " ").replace("-", " ")
 
 
 def _resolve_marker_reference(markers: list[dict[str, Any]], marker_ref: str | None) -> dict[str, Any] | None:
@@ -1615,7 +1620,9 @@ def _build_marker_suggested_text(summary_data: dict[str, Any]) -> str:
     elif summary_data.get("information_only"):
         parts.append("somente informação")
 
-    short = " — ".join(part.strip(" .") for part in parts if part).strip()
+    short = " - ".join(part.strip(" .") for part in parts if part).strip()
+    # Sanitize to latin-1 safe chars (SEI encoding)
+    short = short.encode("latin-1", errors="replace").decode("latin-1")
     if short:
         return short
 
@@ -1623,6 +1630,261 @@ def _build_marker_suggested_text(summary_data: dict[str, Any]) -> str:
     if summary:
         return summary[:180].rstrip(" .,;") + ("..." if len(summary) > 180 else "")
     return ""
+
+
+def _suggest_marker_from_summary(markers: list[dict[str, Any]], summary_data: dict[str, Any]) -> dict[str, Any] | None:
+    haystacks = [
+        str((summary_data.get("processo") or {}).get("tipo") or ""),
+        str((summary_data.get("processo") or {}).get("especificacao") or ""),
+        str(summary_data.get("summary") or ""),
+        str(summary_data.get("process_kind_guess") or ""),
+    ]
+    haystack = _normalize_marker_name(" ".join(haystacks))
+    preference_map = [
+        ("ferias", "Férias / Dispensas"),
+        ("dispensa", "Férias / Dispensas"),
+        ("licenca", "Férias / Dispensas"),
+        ("auxilio alimenta", "Auxílio Alimentação"),
+        ("auxilio refeic", "Auxílio Alimentação"),
+        ("capacitac", "Cursos / Capacitacao"),
+        ("curso", "Cursos / Capacitacao"),
+        ("instrucao", "Cursos / Capacitacao"),
+        ("treinamento", "Cursos / Capacitacao"),
+        ("vistoria", "Vistorias / Camara Tecnica"),
+        ("camara tecnica", "Vistorias / Camara Tecnica"),
+        ("evento", "Demandas Externas"),
+        ("peticionamento", "Demandas Externas"),
+        ("demanda externa", "Demandas Externas"),
+        ("orgao", "Demandas Externas"),
+        ("oficio", "Ofícios"),
+        ("normativo", "Normativos / Diretrizes"),
+        ("diretriz", "Normativos / Diretrizes"),
+        ("orientac", "Normativos / Diretrizes"),
+        ("material", "Materiais"),
+        ("viatura", "VTR / Viaturas"),
+        ("vtr", "VTR / Viaturas"),
+        ("licitac", "Licitacoes / Contratos"),
+        ("contrato", "Licitacoes / Contratos"),
+        ("diaria", "Diárias Operacionais"),
+        ("denuncia", "Denúncias"),
+        ("interdi", "Interdições 2025"),
+        ("notifica", "Notificações 2025"),
+        ("suprimento", "Suprimento de Fundos"),
+        ("pessoal", "Pessoal / Requerimentos"),
+        ("requerimento", "Pessoal / Requerimentos"),
+        ("censo", "Pessoal / Requerimentos"),
+        ("cadastral", "Pessoal / Requerimentos"),
+        ("isenc", "Isenção de CLEP"),
+        ("clep", "Isenção de CLEP"),
+        ("levantamento", "Demandas Externas"),
+    ]
+    for token, marker_name in preference_map:
+        if token in haystack:
+            resolved = _resolve_marker_reference(markers, marker_name)
+            if resolved:
+                return resolved
+    # Fallback: "Ofícios" as catch-all for uncategorized processes
+    fallback = _resolve_marker_reference(markers, "Ofícios")
+    return fallback
+
+
+def _environment_triage_reason(process: Process) -> list[str]:
+    reasons: list[str] = []
+    if process.novo:
+        reasons.append("new")
+    if process.recente:
+        reasons.append("changed")
+    if not process.marcador:
+        reasons.append("unmarked")
+    elif process.recente:
+        reasons.append("marked_review")
+    return reasons
+
+
+def _environment_candidate(process: Process, *, include_marked_review: bool) -> bool:
+    if process.novo or process.recente or not process.marcador:
+        return True
+    if include_marked_review and process.marcador:
+        return True
+    return False
+
+
+def _fast_suggest_marker(markers: list[dict[str, Any]], process: Process) -> dict[str, Any] | None:
+    """Suggest a marker using only process metadata (tipo + especificacao). No HTTP calls."""
+    fake_summary = {
+        "processo": {"tipo": process.tipo or "", "especificacao": process.especificacao or ""},
+        "summary": f"{process.tipo or ''} {process.especificacao or ''}",
+        "process_kind_guess": "",
+    }
+    return _suggest_marker_from_summary(markers, fake_summary)
+
+
+def _sanitize_marker_text(value: str) -> str:
+    value = " ".join(value.split()).strip()
+    value = value.encode("latin-1", errors="replace").decode("latin-1")
+    return value[:180].rstrip(" .,;")
+
+
+def _process_subject(process: Process) -> str:
+    tipo = (process.tipo or "").strip(" .")
+    especificacao = (process.especificacao or "").strip(" .")
+    if especificacao and tipo:
+        tipo_norm = _normalize_marker_name(tipo)
+        especificacao_norm = _normalize_marker_name(especificacao)
+        if tipo_norm and tipo_norm not in especificacao_norm:
+            return f"{tipo} - {especificacao}"
+        return especificacao
+    return especificacao or tipo or process.numero
+
+
+def _status_from_semantic(semantic_context: dict[str, Any], text: str, doc: TreeDocument | None = None) -> str:
+    lower = text.lower()
+    deadline = semantic_context.get("deadline")
+    if deadline:
+        return f"responder até {deadline}"
+    if semantic_context.get("action_required"):
+        action_kind = semantic_context.get("action_kind")
+        if action_kind == "despacho":
+            return "aguarda despacho"
+        if action_kind == "encaminhamento":
+            return "aguarda encaminhamento"
+        return "exige providência"
+    if "empenho" in lower:
+        return "empenho emitido"
+    if "autoriz" in lower:
+        return "autorizado"
+    if "encaminh" in lower:
+        return "encaminhado"
+    if semantic_context.get("information_only"):
+        return "somente informação"
+    if doc and doc.assinado:
+        return "último documento assinado"
+    return "em andamento"
+
+
+def _fast_suggested_text(process: Process) -> str:
+    """Build suggested marker text from process metadata only. No HTTP calls."""
+    subject = _process_subject(process)
+    parts: list[str] = []
+    if subject:
+        parts.append(subject)
+    if process.novo:
+        parts.append("novo")
+    elif process.recente:
+        parts.append("teve novidade")
+    short = " - ".join(part.strip(" .") for part in parts if part).strip()
+    return _sanitize_marker_text(short) if short else ""
+
+
+def _select_context_document(docs: list[TreeDocument]) -> TreeDocument | None:
+    if not docs:
+        return None
+
+    def _score(item: tuple[int, TreeDocument]) -> tuple[int, int]:
+        index, doc = item
+        name = _normalize_marker_name(doc.nome or "")
+        keyword_score = 0
+        for token, score in (
+            ("despacho", 60),
+            ("oficio", 55),
+            ("parecer", 50),
+            ("manifest", 45),
+            ("requer", 40),
+            ("solicit", 35),
+            ("relatorio", 30),
+            ("inform", 25),
+            ("parte generica", 20),
+        ):
+            if token in name:
+                keyword_score = max(keyword_score, score)
+        signed_score = 5 if doc.assinado else 0
+        recency_score = index
+        return keyword_score + signed_score + recency_score, recency_score
+
+    index, selected = max(enumerate(docs), key=_score)
+    return docs[index] if selected else None
+
+
+def _contextual_triage_candidate(client: Any, process: Process, markers: list[dict[str, Any]]) -> dict[str, Any]:
+    process_preview = _process_preview(process)
+    process_id = process.id_procedimento or process.numero
+    docs = client.get_full_document_tree(process_id)
+    context_doc = _select_context_document(docs)
+    if not context_doc:
+        selected_marker = _fast_suggest_marker(markers, process)
+        suggested_text = _fast_suggested_text(process)
+        return {
+            "processo": process_preview,
+            "triage_reason": _environment_triage_reason(process),
+            "marker_action": "create" if not process.marcador else ("update" if process.recente or process.novo else "keep"),
+            "current_marker": process.marcador,
+            "selected_marker": selected_marker,
+            "suggested_marker_text": suggested_text,
+            "summary": suggested_text,
+            "context_document": None,
+        }
+
+    text, extraction_method = _read_tree_document_text(
+        client,
+        context_doc,
+        id_documento=context_doc.id_documento,
+        id_procedimento=process_id,
+    )
+    semantic_context, _domain_context = _semantic_context(
+        {
+            "nome": context_doc.nome,
+            "tipo": context_doc.tipo,
+            "sei_number": context_doc.sei_number,
+        },
+        text,
+    )
+    summary_data = {
+        "processo": {
+            "tipo": process.tipo or "",
+            "especificacao": process.especificacao or "",
+        },
+        "summary": semantic_context.get("summary") or "",
+        "process_kind_guess": semantic_context.get("document_kind_guess") or "",
+        "involved_military": semantic_context.get("involved_military") or [],
+        "deadlines": [semantic_context["deadline"]] if semantic_context.get("deadline") else [],
+        "requires_response": semantic_context.get("requires_response"),
+        "action_required": semantic_context.get("action_required"),
+        "dominant_action_kind": semantic_context.get("action_kind"),
+        "information_only": semantic_context.get("information_only"),
+    }
+    selected_marker = _suggest_marker_from_summary(markers, summary_data)
+    subject = _process_subject(process)
+    status = _status_from_semantic(semantic_context, text, context_doc)
+    suggested_text = _sanitize_marker_text(f"{subject} - {status}")
+    marker_action = "create" if not process.marcador else ("update" if process.recente or process.novo else "keep")
+    return {
+        "processo": process_preview,
+        "triage_reason": _environment_triage_reason(process),
+        "marker_action": marker_action,
+        "current_marker": process.marcador,
+        "selected_marker": selected_marker,
+        "suggested_marker_text": suggested_text,
+        "summary": semantic_context.get("summary") or suggested_text,
+        "context_document": {
+            "id_documento": context_doc.id_documento,
+            "numero_documento": context_doc.sei_number,
+            "nome": context_doc.nome,
+            "tipo": context_doc.tipo,
+            "assinado": context_doc.assinado,
+            "extraction_method": extraction_method,
+        },
+    }
+
+
+def _triage_priority(process: Process) -> tuple[int, int]:
+    score = 0
+    if process.novo:
+        score += 4
+    if process.recente:
+        score += 3
+    if not process.marcador:
+        score += 2
+    return score, 1 if process.caixa == "recebidos" else 0
 
 
 def _list_process_markers(client: Any, id_procedimento: str) -> list[dict[str, Any]]:
@@ -1840,6 +2102,159 @@ def process_marker_history(
             resolved_ids=resolved_ids,
             exc=exc,
         )
+
+
+def environment_triage_preview(
+    client: Any,
+    *,
+    only_new: bool = False,
+    only_changed: bool = False,
+    only_unmarked: bool = False,
+    include_marked_review: bool = False,
+    limit: int = 5,
+    mode: str = "contextual",
+    sample_size: int = 3,
+) -> dict[str, Any]:
+    operation = "environment-triage-preview"
+    try:
+        context = _context(client)
+        warnings: list[str] = []
+        processes = client.list_processes()
+        all_processes = list(processes.recebidos) + list(processes.gerados)
+        filtered: list[Process] = []
+        for process in all_processes:
+            if not _environment_candidate(process, include_marked_review=include_marked_review):
+                continue
+            reasons = _environment_triage_reason(process)
+            if only_new and "new" not in reasons:
+                continue
+            if only_changed and "changed" not in reasons:
+                continue
+            if only_unmarked and "unmarked" not in reasons:
+                continue
+            filtered.append(process)
+
+        filtered.sort(key=_triage_priority, reverse=True)
+        candidates: list[dict[str, Any]] = []
+        markers = [_normalize_marker_item(item) for item in client.list_marcadores()]
+
+        if mode == "deep":
+            # Deep mode: reads docs per process (~100s each). Use for small batches.
+            for process in filtered:
+                if len(candidates) >= limit:
+                    break
+                preview = process_marker_preview(
+                    client,
+                    process.id_procedimento or process.numero,
+                    mode="summary",
+                    sample_size=sample_size,
+                )
+                if not preview.get("ok"):
+                    warnings.append(
+                        f"deep_skip:{process.numero}: {((preview.get('error') or {}).get('message') or 'sem acesso ou leitura indisponível')}"
+                    )
+                    continue
+                current_markers = preview["data"].get("current_markers") or []
+                selected_marker = _suggest_marker_from_summary(markers, preview["data"])
+                if not current_markers:
+                    marker_action = "create"
+                elif process.recente or process.novo:
+                    marker_action = "update"
+                else:
+                    marker_action = "keep"
+                candidates.append(
+                    {
+                        "processo": preview["data"].get("processo"),
+                        "triage_reason": _environment_triage_reason(process),
+                        "marker_action": marker_action,
+                        "current_marker": preview["data"].get("current_marker"),
+                        "current_markers": current_markers,
+                        "selected_marker": selected_marker,
+                        "suggested_marker_text": preview["data"].get("suggested_marker_text"),
+                        "summary": preview["data"].get("summary"),
+                    }
+                )
+        elif mode == "contextual":
+            for process in filtered[:limit]:
+                try:
+                    candidates.append(_contextual_triage_candidate(client, process, markers))
+                except Exception as exc:
+                    selected_marker = _fast_suggest_marker(markers, process)
+                    suggested_text = _fast_suggested_text(process)
+                    candidates.append(
+                        {
+                            "processo": _process_preview(process),
+                            "triage_reason": _environment_triage_reason(process),
+                            "marker_action": "create" if not process.marcador else ("update" if process.recente or process.novo else "keep"),
+                            "current_marker": process.marcador,
+                            "selected_marker": selected_marker,
+                            "suggested_marker_text": suggested_text,
+                            "summary": suggested_text,
+                            "context_document": None,
+                            "warning": f"contextual_fallback: {exc}",
+                        }
+                    )
+        else:
+            # Fast mode: uses only process metadata. No doc reads.
+            for process in filtered[:limit]:
+                selected_marker = _fast_suggest_marker(markers, process)
+                suggested_text = _fast_suggested_text(process)
+                has_marker = bool(process.marcador)
+                if not has_marker:
+                    marker_action = "create"
+                elif process.recente or process.novo:
+                    marker_action = "update"
+                else:
+                    marker_action = "keep"
+                candidates.append(
+                    {
+                        "processo": _process_preview(process),
+                        "triage_reason": _environment_triage_reason(process),
+                        "marker_action": marker_action,
+                        "current_marker": process.marcador,
+                        "selected_marker": selected_marker,
+                        "suggested_marker_text": suggested_text,
+                        "summary": suggested_text,
+                        "context_document": None,
+                    }
+                )
+
+        return _result(
+            operation=operation,
+            context=context,
+            data={
+                "filters": {
+                    "only_new": only_new,
+                    "only_changed": only_changed,
+                    "only_unmarked": only_unmarked,
+                    "include_marked_review": include_marked_review,
+                    "limit": limit,
+                    "mode": mode,
+                },
+                "recebidos_total": len(processes.recebidos),
+                "gerados_total": len(processes.gerados),
+                "candidates_total": len(filtered),
+                "candidates_selected_total": len(candidates),
+                "candidates": candidates,
+            },
+            next_actions=[
+                NextAction(
+                    action="environment-triage-apply",
+                    label="Aplicar criação/atualização de marcadores para os candidatos selecionados",
+                    params={
+                        "only_new": only_new,
+                        "only_changed": only_changed,
+                        "only_unmarked": only_unmarked,
+                        "include_marked_review": include_marked_review,
+                        "limit": limit,
+                        "mode": mode,
+                    },
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(operation=operation, exc=exc)
 
 
 def process_report(

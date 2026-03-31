@@ -112,8 +112,9 @@ Credenciais no Bitwarden: vault item `SEI SISBOM RN CBMRN` (alias `sei`).
 
 ## Security Rules
 
-1. **Never sign/create documents without Leo's explicit approval** — list first, show what's pending, wait for go-ahead
-2. Credentials sourced from Bitwarden vault (`sei` alias)
+1. **Never sign, certify/authenticate, forward to another unit, or cancel/delete consolidated artifacts without Leo's explicit approval**. These actions have juridical or operational impact.
+2. **Creating and editing document drafts do not require a second approval step** when Leo's request is already explicit (ex: "faça um despacho", "confeccione o documento", "redija a parte genérica"). In this case, create the draft, fill the content, run the quality/readback checks, and then report the result.
+3. Credentials sourced from Bitwarden vault (`sei` alias)
 
 ## Quick Reference — sei-cli Python API
 
@@ -141,7 +142,7 @@ with SEIClient() as c:
     result = c.sign_document(id_documento, id_procedimento)
     # → {'signed': [...], 'already_signed': [...], 'errors': [...]}
 
-    # --- Create document (needs Leo's approval) ---
+    # --- Create/edit draft document (can run directly if request is explicit) ---
     types = c.list_document_types(id_procedimento)  # 21 types available
     created = c.create_document(
         id_procedimento,
@@ -250,7 +251,7 @@ Two distinct signing flows:
    - Then use c.sign_block(numero)
 ```
 
-### 3. Create document (needs approval)
+### 3. Create document draft
 ```
 1. Leo says "faz um despacho no processo X dizendo Y"
 2. c.login()
@@ -258,8 +259,10 @@ Two distinct signing flows:
 4. save_url, sections = c.get_editor_sections(created.id_documento, id_proc)
 5. Modify body section with content
 6. c.save_document(save_url, sections)
-7. Show preview to Leo → wait for "assina"
-8. c.sign_document(created.id_documento, id_proc)
+7. Re-read / quality-check the saved content
+8. Report draft ready for review/signature
+
+**Do not stop for a second authorization here** if the user already asked explicitly for the document to be drafted. The extra approval gate starts at signature/certification/forwarding, not at drafting.
 ```
 
 ### 4. Full despacho workflow (end-to-end)
@@ -271,8 +274,9 @@ Two distinct signing flows:
 5. save_url, sections = c.get_editor_sections(created.id_documento, id_proc)
 6. Fill body with formatted HTML (use CSS classes below)
 7. c.save_document(save_url, sections)
-8. Report to Leo: "Despacho criado no processo X. Conteúdo: ..."
-9. Wait for Leo's approval → c.sign_document(...)
+8. Re-read and quality-check the saved document
+9. Report to Leo: "Despacho criado no processo X. Conteúdo: ..."
+10. Wait for Leo's explicit approval only for `c.sign_document(...)`
 ```
 
 ### 5. Alter process metadata
@@ -294,12 +298,12 @@ Prefer the canonical marker flow:
 1. sei process-marker-preview <processo> --json
 2. Review suggested_marker_text and selected marker
 3. sei process-marker-set-preview <processo> --marker "<nome-ou-id>" --json
-4. Wait for explicit approval
+4. Apply directly when the task is explicit and low-risk (organizational triage / environment review)
 5. sei process-marker-set-confirm <processo> --marker "<nome-ou-id>" --confirm --json
 
 For removal:
 1. sei process-marker-remove-preview <processo> --json
-2. Wait for explicit approval
+2. Use explicit approval only if the removal is ambiguous or can hide current process context
 3. sei process-marker-remove-confirm <processo> --confirm --json
 ```
 
@@ -500,7 +504,14 @@ Nunca chame `switch_unit('UNIDADE')` se já estiver nela. O SEI pode corromper a
 > Dica de Ouro: `id_procedimento` e `id_documento` são numéricos e **imutáveis**. Apenas `infra_hash` muda por navegação. Se os IDs de um documento sumiram ou trocaram totalmente do nada, sua sessão corrompeu. Não invente que o ID "mudou".
 
 ### 7. Classificar Processos (Marcadores/Acompanhamento) "No Escuro"
-**Nunca classifique ou adicione marcadores** a um processo lendo apenas o assunto ou a "especificação" da tabela. A especificação costuma ser genérica (ex: "Processos transferidos PARA o PABM" quando eram "DO PABM"). Sempre extraia a árvore de documentos (`get_full_document_tree`) e leia o conteúdo de pelo menos 1 documento (ex: ofício ou requerimento inicial) antes de decidir onde encaixar o processo.
+Para classificação manual de um processo específico, não classifique lendo apenas o assunto ou a "especificação" da tabela. Use pelo menos leitura contextual do processo.
+
+Exceção operacional:
+- na canônica `environment-triage`, o modo `fast` pode sugerir marcador só por metadados para screening
+- o modo `contextual` é o default e lê 1 documento-chave por processo
+- o modo `deep` fica para casos difíceis
+
+Ou seja: screening rápido por metadados é aceitável; aplicação definitiva deve preferir pelo menos o modo `contextual`.
 
 ### 8. Acompanhamento Especial: Alterar vs Delete+Re-Add
 Para mudar o grupo ou a observação de um processo que **já está** em Acompanhamento Especial, use SEMPRE `c.alterar_acompanhamento_especial()`. Nunca tente remover o processo do acompanhamento para adicionar de novo, pois o formulário de adição depende de comportamentos em JS que quebram o fluxo puramente HTTP.
