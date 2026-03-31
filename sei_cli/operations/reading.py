@@ -846,6 +846,8 @@ def _document_read_core(
         "id_documento": id_documento,
         "sei_number": numero_documento_resolvido,
     }
+    if "assinado eletronicamente" in text.casefold():
+        metadata["assinado"] = True
 
     process_actions = _safe_get_actions(client, id_procedimento)
     document_actions = _safe_get_actions(client, id_procedimento, id_documento)
@@ -1535,6 +1537,174 @@ def process_summary(
             *[NextAction(**item) for item in base_result.get("next_actions", [])[:2]],
         ],
         warnings=base_result.get("warnings", []),
+    )
+
+
+def _normalize_marker_item(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        marker_id = item.get("marcador_id") or item.get("id")
+        return {
+            "marcador_id": marker_id,
+            "id": marker_id,
+            "nome": item.get("nome"),
+            "descricao": item.get("descricao") or "",
+            "cor": item.get("cor"),
+            "link": item.get("link"),
+        }
+    return {
+        "marcador_id": getattr(item, "marcador_id", None),
+        "id": getattr(item, "marcador_id", None),
+        "nome": getattr(item, "nome", None),
+        "descricao": getattr(item, "descricao", "") or "",
+        "cor": getattr(item, "cor", None),
+        "link": getattr(item, "link", None),
+    }
+
+
+def _normalize_marker_name(value: str) -> str:
+    return value.strip().casefold().replace("/", " ").replace("-", " ")
+
+
+def _resolve_marker_reference(markers: list[dict[str, Any]], marker_ref: str | None) -> dict[str, Any] | None:
+    if not marker_ref:
+        return None
+    ref = marker_ref.strip()
+    if not ref:
+        return None
+    for marker in markers:
+        if str(marker.get("marcador_id") or "") == ref:
+            return marker
+    normalized_ref = _normalize_marker_name(ref)
+    for marker in markers:
+        name = str(marker.get("nome") or "")
+        if _normalize_marker_name(name) == normalized_ref:
+            return marker
+    for marker in markers:
+        name = str(marker.get("nome") or "")
+        if normalized_ref and normalized_ref in _normalize_marker_name(name):
+            return marker
+    return None
+
+
+def _build_marker_suggested_text(summary_data: dict[str, Any]) -> str:
+    summary = (summary_data.get("summary") or "").strip()
+    if summary:
+        return summary
+
+    parts: list[str] = []
+    process_kind = summary_data.get("process_kind_guess")
+    if process_kind:
+        parts.append(f"Processo classificado como {process_kind}.")
+    involved = summary_data.get("involved_military") or []
+    if involved:
+        names = ", ".join(
+            person.get("display_name") or person.get("name") or ""
+            for person in involved[:3]
+            if person.get("display_name") or person.get("name")
+        )
+        if names:
+            parts.append(f"Militares envolvidos: {names}.")
+    deadlines = summary_data.get("deadlines") or []
+    if deadlines:
+        parts.append(f"Prazo(s): {', '.join(deadlines[:2])}.")
+    if summary_data.get("action_required"):
+        action_kind = summary_data.get("dominant_action_kind") or "manifestacao"
+        parts.append(f"Exige providencia do usuario: {action_kind}.")
+    elif summary_data.get("requires_response"):
+        parts.append("Processo demanda resposta do usuario.")
+    elif summary_data.get("information_only"):
+        parts.append("Processo aparenta ser apenas informativo.")
+    return " ".join(parts).strip()
+
+
+def marker_catalog(client: Any) -> dict[str, Any]:
+    operation = "marker-catalog"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        markers = [_normalize_marker_item(item) for item in client.list_marcadores()]
+        return _result(
+            operation=operation,
+            context=context,
+            data={
+                "markers_total": len(markers),
+                "markers": markers,
+            },
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_marker_preview(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    marker: str | None = None,
+    mode: str = "summary",
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sample_size: int = 3,
+    suggested_text: str | None = None,
+) -> dict[str, Any]:
+    operation = "process-marker-preview"
+    base_result = process_summary(
+        client,
+        numero_ou_id,
+        mode=mode,
+        date_from=date_from,
+        date_to=date_to,
+        sample_size=sample_size,
+    )
+    if not base_result["ok"]:
+        base_result["operation"] = operation
+        return base_result
+
+    markers = [_normalize_marker_item(item) for item in client.list_marcadores()]
+    selected_marker = _resolve_marker_reference(markers, marker)
+    warnings = list(base_result.get("warnings", []))
+    if marker and not selected_marker:
+        warnings.append(f"Marcador '{marker}' não encontrado no catálogo atual da unidade.")
+
+    summary_data = base_result["data"]
+    marker_text = (suggested_text or "").strip() or _build_marker_suggested_text(summary_data)
+    process_data = summary_data.get("processo", {})
+    current_marker = process_data.get("marcador")
+
+    return _result(
+        operation=operation,
+        context=base_result["context"],
+        resolved_ids=base_result["resolved_ids"],
+        data={
+            "processo": process_data,
+            "preflight": summary_data.get("preflight", {}),
+            "current_marker": current_marker,
+            "summary": summary_data.get("summary"),
+            "action_items": summary_data.get("action_items", []),
+            "requires_response": summary_data.get("requires_response"),
+            "action_required": summary_data.get("action_required"),
+            "deadlines": summary_data.get("deadlines", []),
+            "involved_military": summary_data.get("involved_military", []),
+            "selected_marker": selected_marker,
+            "suggested_marker_text": marker_text,
+            "available_markers_total": len(markers),
+            "available_markers": markers,
+        },
+        next_actions=[
+            NextAction(
+                action="process-marker-set-preview",
+                label="Preparar aplicação de marcador no processo",
+                params={
+                    "numero_ou_id": base_result["resolved_ids"].get("id_procedimento") or numero_ou_id,
+                    "marker": selected_marker.get("marcador_id") if selected_marker else marker,
+                },
+            )
+        ],
+        warnings=warnings,
     )
 
 

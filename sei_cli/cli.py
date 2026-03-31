@@ -20,8 +20,14 @@ from sei_cli.operations import (
     document_quality_check as op_document_quality_check,
     document_read as op_document_read,
     inbox_snapshot as op_inbox_snapshot,
+    marker_catalog as op_marker_catalog,
     process_create_confirm as op_process_create_confirm,
     process_create_preview as op_process_create_preview,
+    process_marker_preview as op_process_marker_preview,
+    process_marker_remove_confirm as op_process_marker_remove_confirm,
+    process_marker_remove_preview as op_process_marker_remove_preview,
+    process_marker_set_confirm as op_process_marker_set_confirm,
+    process_marker_set_preview as op_process_marker_set_preview,
     process_open as op_process_open,
     process_read as op_process_read,
     process_report as op_process_report,
@@ -30,6 +36,10 @@ from sei_cli.operations import (
     signature_block_add_document_confirm as op_signature_block_add_document_confirm,
     signature_block_add_document_preview as op_signature_block_add_document_preview,
     signature_block_list as op_signature_block_list,
+    signature_block_recall_confirm as op_signature_block_recall_confirm,
+    signature_block_recall_preview as op_signature_block_recall_preview,
+    signature_block_refresh_confirm as op_signature_block_refresh_confirm,
+    signature_block_refresh_preview as op_signature_block_refresh_preview,
     signature_block_read as op_signature_block_read,
     signature_block_sign_confirm as op_signature_block_sign_confirm,
     signature_block_sign_preview as op_signature_block_sign_preview,
@@ -1331,6 +1341,135 @@ def process_summary_cmd(
     _emit_operation_result(result, as_json)
 
 
+@cli.command("marker-catalog")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def marker_catalog_cmd(as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_marker_catalog(client)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-marker-preview")
+@click.argument("numero_ou_id")
+@click.option("--marker", default=None, help="ID ou nome do marcador")
+@click.option("--texto", default=None, help="Texto sugerido explícito para o marcador")
+@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--date-from", default=None)
+@click.option("--date-to", default=None)
+@click.option("--sample-size", default=3, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_marker_preview_cmd(
+    numero_ou_id: str,
+    marker: str | None,
+    texto: str | None,
+    mode: str,
+    date_from: str | None,
+    date_to: str | None,
+    sample_size: int,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_marker_preview(
+            client,
+            numero_ou_id,
+            marker=marker,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            sample_size=sample_size,
+            suggested_text=texto,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-marker-set-preview")
+@click.argument("numero_ou_id")
+@click.option("--marker", required=True, help="ID ou nome do marcador")
+@click.option("--texto", default=None, help="Texto do marcador")
+@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--date-from", default=None)
+@click.option("--date-to", default=None)
+@click.option("--sample-size", default=3, show_default=True, type=int)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_marker_set_preview_cmd(
+    numero_ou_id: str,
+    marker: str,
+    texto: str | None,
+    mode: str,
+    date_from: str | None,
+    date_to: str | None,
+    sample_size: int,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_marker_set_preview(
+            client,
+            numero_ou_id,
+            marker=marker,
+            texto=texto,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            sample_size=sample_size,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-marker-set-confirm")
+@click.argument("numero_ou_id")
+@click.option("--marker", required=True, help="ID ou nome do marcador")
+@click.option("--texto", default=None, help="Texto do marcador")
+@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--date-from", default=None)
+@click.option("--date-to", default=None)
+@click.option("--sample-size", default=3, show_default=True, type=int)
+@click.option("--confirm", is_flag=True, help="Confirma a aplicação do marcador")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_marker_set_confirm_cmd(
+    numero_ou_id: str,
+    marker: str,
+    texto: str | None,
+    mode: str,
+    date_from: str | None,
+    date_to: str | None,
+    sample_size: int,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_marker_set_confirm(
+            client,
+            numero_ou_id,
+            marker=marker,
+            texto=texto,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            sample_size=sample_size,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-marker-remove-preview")
+@click.argument("numero_ou_id")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_marker_remove_preview_cmd(numero_ou_id: str, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_process_marker_remove_preview(client, numero_ou_id)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-marker-remove-confirm")
+@click.argument("numero_ou_id")
+@click.option("--confirm", is_flag=True, help="Confirma a remoção do marcador")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_marker_remove_confirm_cmd(numero_ou_id: str, confirm: bool, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_process_marker_remove_confirm(client, numero_ou_id, confirm=confirm)
+    _emit_operation_result(result, as_json)
+
+
 @cli.command("process-report")
 @click.argument("numero_ou_id")
 @click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
@@ -1676,6 +1815,84 @@ def signature_block_add_document_confirm_cmd(
             numero_ou_id_documento,
             process_id=process_id,
             disponibilizar=disponibilizar,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-recall-preview")
+@click.argument("block_numero")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_recall_preview_cmd(block_numero: str, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_recall_preview(client, block_numero)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-recall-confirm")
+@click.argument("block_numero")
+@click.option("--confirm", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_recall_confirm_cmd(
+    block_numero: str,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_recall_confirm(
+            client,
+            block_numero,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-refresh-preview")
+@click.argument("block_numero")
+@click.option("--add-document-id", "add_document_ids", multiple=True)
+@click.option("--remove-document-id", "remove_document_ids", multiple=True)
+@click.option("--no-redisponibilizar", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_refresh_preview_cmd(
+    block_numero: str,
+    add_document_ids: tuple[str, ...],
+    remove_document_ids: tuple[str, ...],
+    no_redisponibilizar: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_refresh_preview(
+            client,
+            block_numero,
+            add_document_ids=list(add_document_ids),
+            remove_document_ids=list(remove_document_ids),
+            redisponibilizar=not no_redisponibilizar,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("signature-block-refresh-confirm")
+@click.argument("block_numero")
+@click.option("--add-document-id", "add_document_ids", multiple=True)
+@click.option("--remove-document-id", "remove_document_ids", multiple=True)
+@click.option("--no-redisponibilizar", is_flag=True)
+@click.option("--confirm", is_flag=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def signature_block_refresh_confirm_cmd(
+    block_numero: str,
+    add_document_ids: tuple[str, ...],
+    remove_document_ids: tuple[str, ...],
+    no_redisponibilizar: bool,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_signature_block_refresh_confirm(
+            client,
+            block_numero,
+            add_document_ids=list(add_document_ids),
+            remove_document_ids=list(remove_document_ids),
+            redisponibilizar=not no_redisponibilizar,
             confirm=confirm,
         )
     _emit_operation_result(result, as_json)

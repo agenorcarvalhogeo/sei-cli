@@ -69,7 +69,7 @@ the **process** or a **document** in the tree. Actions are JS variables
 | Gerar PDF do Processo | `procedimento_gerar_pdf` | `download_pdf()` / `download_document_pdf()` |
 | Gerar ZIP do Processo | `procedimento_gerar_zip` | — |
 | Comentários | `comentario_listar` | — |
-| **Gerenciar Marcador** | `andamento_marcador_gerenciar` | `set_marcador()` |
+| **Gerenciar Marcador** | `andamento_marcador_gerenciar` | `process-marker-*` / `set_marcador()` |
 | Controle de Prazo | `controle_prazo_definir` | — |
 | Controle de Processos | (JS) | — |
 | Pesquisar no Processo | `procedimento_pesquisar` | — |
@@ -235,8 +235,19 @@ For each block: c.get_block_documents(num)
 
 ### 2. Sign (needs approval)
 ```
-Show pending blocks/docs to Leo → wait for "assina bloco X"
-c.sign_block(numero) or c.sign_document(id_doc, id_proc)
+Show pending blocks/docs to Leo → wait for explicit approval
+
+Two distinct signing flows:
+
+1. Local signing in the generating unit
+   - If the document is in a disponibilized block, first recall/cancel availability
+   - Then sign locally with c.sign_document(id_doc, id_proc)
+
+2. Block signing in the destination unit
+   - Use only when the signer does not have access to the generating unit
+   - Disponibilize the block to the destination unit
+   - Switch to the destination unit
+   - Then use c.sign_block(numero)
 ```
 
 ### 3. Create document (needs approval)
@@ -278,12 +289,18 @@ c.alter_process(
 
 ### 6. Organize processes (marcadores + descrições)
 ```
-1. c.list_processes() → get all processes in unit
-2. For each: c.alter_process(id, descricao="...") → add clear title
-3. c.set_marcador(id, marcador_id="64956", texto="...") → categorize
-4. Available marcadores: ALMOX, Armamento, CURSOS, Diárias, Equipamentos,
-   Escala Especial, Férias/Dispensas, Informações, LIVROS,
-   Materiais Quartel, Suprimento, Transferência, Zen On
+Prefer the canonical marker flow:
+
+1. sei process-marker-preview <processo> --json
+2. Review suggested_marker_text and selected marker
+3. sei process-marker-set-preview <processo> --marker "<nome-ou-id>" --json
+4. Wait for explicit approval
+5. sei process-marker-set-confirm <processo> --marker "<nome-ou-id>" --confirm --json
+
+For removal:
+1. sei process-marker-remove-preview <processo> --json
+2. Wait for explicit approval
+3. sei process-marker-remove-confirm <processo> --confirm --json
 ```
 
 ## Formatação de Documentos & Produção Textual
@@ -487,3 +504,24 @@ Nunca chame `switch_unit('UNIDADE')` se já estiver nela. O SEI pode corromper a
 
 ### 8. Acompanhamento Especial: Alterar vs Delete+Re-Add
 Para mudar o grupo ou a observação de um processo que **já está** em Acompanhamento Especial, use SEMPRE `c.alterar_acompanhamento_especial()`. Nunca tente remover o processo do acompanhamento para adicionar de novo, pois o formulário de adição depende de comportamentos em JS que quebram o fluxo puramente HTTP.
+
+### 9. Assinatura Local vs Assinatura por Bloco
+São fluxos diferentes e a skill deve respeitar isso.
+
+- **Assinatura local:** a unidade geradora assina localmente. Se o documento estiver em bloco disponibilizado, primeiro recolher/cancelar a disponibilização. Não usar `sign_block` nesse cenário.
+- **Assinatura por bloco:** usar apenas na unidade destinatária do bloco disponibilizado, quando o signatário não tem acesso à unidade geradora do documento.
+- Cenário de referência validado: **CMDO PABM APODI → PAD-PDF**.
+
+### 10. Marcadores: não classificar no escuro
+Nunca aplicar marcador só pela descrição da tabela. Use a leitura canônica do processo:
+
+- `process-summary`
+- `process-read`
+- `process-marker-preview`
+
+O texto do marcador deve refletir:
+- do que trata o processo
+- se exige manifestação do usuário
+- se há prazo
+- se é apenas informativo
+- militares envolvidos, quando aplicável

@@ -93,6 +93,8 @@ class SEIClient:
     def _get(self, url: str) -> httpx.Response:
         r = self.client.get(url)
         r = auth._follow(self.client, r, self.base_url)
+        with contextlib.suppress(Exception):
+            r.encoding = "iso-8859-1"
         self._harvest_hashes(r.text)
         return r
 
@@ -110,6 +112,8 @@ class SEIClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         r = auth._follow(self.client, r, self.base_url)
+        with contextlib.suppress(Exception):
+            r.encoding = "iso-8859-1"
         self._harvest_hashes(r.text)
         return r
 
@@ -133,6 +137,8 @@ class SEIClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         r = auth._follow(self.client, r, self.base_url)
+        with contextlib.suppress(Exception):
+            r.encoding = "iso-8859-1"
         self._harvest_hashes(r.text)
         return r
 
@@ -2020,28 +2026,11 @@ class SEIClient:
 
     def get_block_documents(self, block_numero: str) -> list[BlockDocument]:
         """List documents inside a specific bloco de assinatura."""
-        html = self._ensure_control()
-        blocos_url = self._menu_links.get("blocos_assinatura")
-        if not blocos_url:
+        detail = self._get_block_detail_page(block_numero)
+        if detail is None:
             return []
-        
-        r = self._get(blocos_url)
-        soup = BeautifulSoup(r.text, "lxml")
-        
-        # Find the link to the specific block
-        detail_url = None
-        for a in soup.find_all("a"):
-            href = a.get("href", "")
-            if "rel_bloco_protocolo_listar" in href and a.text.strip() == block_numero:
-                detail_url = urljoin(self._sei_url(""), href)
-                break
-        
-        self._control_html = None
-        
-        if not detail_url:
-            return []
-        
-        rd = self._get(detail_url)
+
+        rd, _soup = detail
         return parse_block_documents(rd.text, base_url=self._sei_url(""))
 
     def _get_blocos_page(self) -> tuple[str, "BeautifulSoup"]:
@@ -2054,6 +2043,160 @@ class SEIClient:
         self._control_html = None
         soup = BeautifulSoup(r.text, "lxml")
         return blocos_url, soup
+
+    def _get_block_detail_page(self, block_numero: str) -> tuple[httpx.Response, "BeautifulSoup"] | None:
+        """Open a bloco detail page (`rel_bloco_protocolo_listar`)."""
+        _blocos_url, blocos_soup = self._get_blocos_page()
+
+        detail_url = None
+        for a in blocos_soup.find_all("a"):
+            href = a.get("href", "")
+            if "rel_bloco_protocolo_listar" in href and a.get_text(strip=True) == block_numero:
+                detail_url = urljoin(self._sei_url(""), href.replace("&amp;", "&"))
+                break
+
+        if not detail_url:
+            list_match = re.search(
+                rf"controlador\.php\?acao=rel_bloco_protocolo_listar[^'\"]*id_bloco={block_numero}[^'\"]*",
+                str(blocos_soup),
+            )
+            if list_match:
+                detail_url = self._sei_url(list_match.group(0).replace("&amp;", "&"))
+
+        if not detail_url:
+            return None
+
+        rd = self._get(detail_url)
+        return rd, BeautifulSoup(rd.text, "lxml")
+
+    def _extract_block_document_entries(self, detail_html: str) -> list[dict[str, Any]]:
+        soup = BeautifulSoup(detail_html, "lxml")
+        rows = soup.find_all("tr", class_=re.compile(r"infraTr(Clara|Escura)"))
+        entries: list[dict[str, Any]] = []
+
+        # Extract per-document sign URLs from JS arrays (arrSequencial / arrLinkAssinatura).
+        # SEI stores these in <script> blocks, indexed by 0-based position.
+        _js_seq: dict[int, str] = {}  # position → seq
+        _js_sign: dict[int, str] = {}  # position → sign url
+        for m in re.finditer(r'arrSequencial\[(\d+)\]\s*=\s*"([^"]+)"', detail_html):
+            _js_seq[int(m.group(1))] = m.group(2)
+        for m in re.finditer(r'arrLinkAssinatura\[(\d+)\]\s*=\s*"([^"]+)"', detail_html):
+            _js_sign[int(m.group(1))] = m.group(2).replace("&amp;", "&")
+        # Build seq → sign_url map
+        _seq_to_sign_url: dict[str, str] = {}
+        for pos, seq_val in _js_seq.items():
+            if pos in _js_sign:
+                _seq_to_sign_url[seq_val] = urljoin(
+                    self._sei_url(""), _js_sign[pos]
+                )
+
+        def _extract_action_url(tag: Any) -> str | None:
+            onclick = tag.get("onclick", "")
+            match = re.search(r"""['"]([^'"]*controlador\.php\?[^'"]+)['"]""", onclick)
+            if match:
+                return urljoin(self._sei_url(""), match.group(1).replace("&amp;", "&"))
+            href = tag.get("href", "")
+            if href and href != "#" and not href.startswith("#ID-"):
+                return urljoin(self._sei_url(""), href.replace("&amp;", "&"))
+            return None
+
+        for row in rows:
+            checkbox = row.find("input", {"type": "checkbox"})
+            if not checkbox:
+                continue
+            tds = row.find_all("td")
+            if len(tds) < 6:
+                continue
+            seq = tds[1].get_text(" ", strip=True)
+            processo = tds[2].get_text(" ", strip=True)
+            numero_sei = tds[3].get_text(" ", strip=True)
+            tipo_documento = tds[4].get_text(" ", strip=True)
+            assinante = tds[5].get_text(" ", strip=True)
+            assinantes = [
+                text.strip()
+                for text in tds[5].stripped_strings
+                if text and text.strip()
+            ]
+            documento_id = None
+            preview_url = None
+            sign_url = None
+            for a in row.find_all("a"):
+                label = a.get_text(" ", strip=True)
+                href = a.get("href", "")
+                if href.startswith("#ID-"):
+                    match = re.search(r"#ID-(\d+)-", href)
+                    if match:
+                        documento_id = match.group(1)
+                if numero_sei and numero_sei in label:
+                    preview_url = _extract_action_url(a)
+                candidate_sign_url = _extract_action_url(a)
+                if candidate_sign_url and "acao=documento_assinar" in candidate_sign_url:
+                    sign_url = candidate_sign_url
+            for tag in row.find_all(True):
+                if sign_url:
+                    break
+                onclick = tag.get("onclick", "")
+                match = re.search(r"""['"]([^'"]*controlador\.php\?[^'"]*acao=documento_assinar[^'"]+)['"]""", onclick)
+                if match:
+                    sign_url = urljoin(self._sei_url(""), match.group(1).replace("&amp;", "&"))
+            # Fallback: use sign URL from JS arrays if not found in row HTML
+            if not sign_url and seq and seq in _seq_to_sign_url:
+                sign_url = _seq_to_sign_url[seq]
+            imgs = row.find_all("img", title=True)
+            assinado = any("Assinatura" in (img.get("title") or "") for img in imgs)
+            entries.append(
+                {
+                    "seq": seq,
+                    "processo": processo,
+                    "documento_id": documento_id or numero_sei,
+                    "numero_sei": numero_sei or None,
+                    "numero_documento": numero_sei or None,
+                    "tipo_documento": tipo_documento,
+                    "assinante": assinante,
+                    "assinantes": assinantes,
+                    "assinado": assinado,
+                    "checkbox_name": checkbox.get("name"),
+                    "checkbox_value": checkbox.get("value"),
+                    "preview_url": preview_url,
+                    "sign_url": sign_url,
+                }
+            )
+        return entries
+
+    def preview_block_document(self, block_numero: str, doc_sei_number: str) -> str:
+        """Preview a document from a block detail page without leaving block context."""
+        detail = self._get_block_detail_page(block_numero)
+        if detail is None:
+            raise RuntimeError(f"Bloco {block_numero} não encontrado")
+        rd, soup = detail
+        entries = self._extract_block_document_entries(rd.text)
+        target = next(
+            (
+                entry
+                for entry in entries
+                if entry.get("numero_sei") == doc_sei_number
+                or entry.get("numero_documento") == doc_sei_number
+                or entry.get("documento_id") == doc_sei_number
+            ),
+            None,
+        )
+        if not target or not target.get("preview_url"):
+            raise RuntimeError(f"Documento {doc_sei_number} não encontrado no bloco {block_numero}")
+
+        rp = self._get(str(target["preview_url"]))
+        modal_soup = BeautifulSoup(rp.text, "lxml")
+        modal = (
+            modal_soup.find(id="divInfraSparklingModal")
+            or modal_soup.find("div", class_=re.compile(r"InfraSparklingModal", re.I))
+            or modal_soup.find("div", id=re.compile(r"divInfra.*Modal", re.I))
+        )
+        if modal:
+            return modal.get_text("\n", strip=True)
+        iframe = modal_soup.find("iframe")
+        if iframe and iframe.get("src"):
+            rf = self._get(urljoin(self._sei_url(""), iframe["src"].replace("&amp;", "&")))
+            return BeautifulSoup(rf.text, "lxml").get_text("\n", strip=True)
+        return modal_soup.get_text("\n", strip=True)
 
     def _blocos_form_action(self, soup: "BeautifulSoup", action_name: str) -> str:
         """Extract a JS action URL from the blocos page (e.g. bloco_disponibilizar)."""
@@ -3732,32 +3875,27 @@ class SEIClient:
         # The response should contain the new document ID.
         self._control_html = None
 
-        # Parse the response for the new document
-        created_soup = BeautifulSoup(rcreated.text, "lxml")
+        id_doc, editor_url = self._extract_created_document_result(
+            rcreated.text,
+            response_url=str(rcreated.url),
+            id_procedimento=id_procedimento,
+        )
 
-        # If redirected to editor_montar, extract doc ID from URL
-        id_doc = ""
-        editor_url = None
-        url_str = str(rcreated.url)
-        id_doc_match = re.search(r"id_documento=(\d+)", url_str)
-        if id_doc_match:
-            id_doc = id_doc_match.group(1)
-            editor_url = url_str
-
-        # Also check the HTML for id_documento
         if not id_doc:
-            id_doc_match = re.search(r"id_documento=(\d+)", rcreated.text)
-            if id_doc_match:
-                id_doc = id_doc_match.group(1)
+            created_soup = BeautifulSoup(rcreated.text, "lxml")
+            validation = created_soup.find("textarea", {"id": "txaInfraValidacao"})
+            if validation and validation.get_text(strip=True):
+                raise RuntimeError(validation.get_text(strip=True))
 
-        # Extract editor URL if present
-        if not editor_url:
-            editor_match = re.search(
-                r'controlador\.php\?acao=editor_montar[^"\']+id_documento=' + id_doc,
-                rcreated.text,
+            form_still_present = created_soup.find("form", id="frmDocumentoCadastro")
+            if form_still_present:
+                raise RuntimeError(
+                    "SEI reexibiu o formulário de criação do documento sem informar o id_documento."
+                )
+
+            raise RuntimeError(
+                "SEI não retornou id_documento após a criação do documento."
             )
-            if editor_match:
-                editor_url = urljoin(self._sei_url(""), editor_match.group())
 
         tipo_nome = next(
             (dt.nome for dt in [DocumentType(id_serie, tipo)]
@@ -3771,6 +3909,48 @@ class SEIClient:
             tipo=tipo_nome,
             editor_url=editor_url,
         )
+
+    def _extract_created_document_result(
+        self,
+        response_html: str,
+        *,
+        response_url: str,
+        id_procedimento: str,
+    ) -> tuple[str, str | None]:
+        """Extract created document id/editor URL from a document creation response."""
+        id_doc = ""
+        editor_url = None
+
+        id_doc_match = re.search(r"id_documento=(\d+)", response_url)
+        if id_doc_match:
+            id_doc = id_doc_match.group(1)
+            if "acao=editor_montar" in response_url:
+                editor_url = response_url
+
+        patterns = [
+            r"var\s+linkEditarConteudo\s*=\s*'([^']+)'",
+            r'(controlador\.php\?acao=editor_montar[^"\']+)',
+            r'(controlador\.php\?acao=arvore_visualizar[^"\']*id_documento=\d+[^"\']*)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, response_html)
+            if not match:
+                continue
+            candidate = match.group(1).replace("&amp;", "&")
+            candidate_url = urljoin(self._sei_url(""), candidate)
+            if not editor_url and "acao=editor_montar" in candidate_url:
+                editor_url = candidate_url
+            if not id_doc:
+                id_doc_match = re.search(r"id_documento=(\d+)", candidate_url)
+                if id_doc_match:
+                    id_doc = id_doc_match.group(1)
+
+        if not editor_url and id_doc:
+            fallback_editor = self._get_editor_url(id_doc, id_procedimento)
+            if fallback_editor:
+                editor_url = fallback_editor
+
+        return id_doc, editor_url
 
     def get_editor_sections(
         self, id_documento: str, id_procedimento: str
@@ -4906,12 +5086,12 @@ class SEIClient:
 
     # --- Signing ---
 
-    def sign_block(self, block_numero: str) -> dict:
+    def sign_block(self, block_numero: str, doc_indices: list[int] | None = None) -> dict:
         """Sign all pending documents in a bloco de assinatura.
 
         Returns dict with 'signed', 'already_signed', 'errors' lists.
         """
-        return self._sign_from_blocos(block_numero)
+        return self._sign_from_blocos(block_numero, doc_indices=doc_indices)
 
     # --- Ciência (acknowledgement) ---
 
@@ -5405,7 +5585,10 @@ class SEIClient:
 
     def _follow_upload(self, response: "httpx.Response") -> "httpx.Response":
         """Follow redirects for an upload response (no hash harvesting needed)."""
-        return auth._follow(self.client, response, self.base_url)
+        r = auth._follow(self.client, response, self.base_url)
+        with contextlib.suppress(Exception):
+            r.encoding = "iso-8859-1"
+        return r
 
     def sign_document(self, id_documento: str, id_procedimento: str) -> dict:
         """Sign a single document by ID (from process tree).
@@ -5490,51 +5673,101 @@ class SEIClient:
             sign_url = urljoin(self._sei_url(""), sign_match.group(1))
             self._control_html = None
 
-            return self._execute_sign(sign_url, id_documento)
+            result = self._execute_sign(sign_url, id_documento)
+            if (
+                not result.get("signed")
+                and not result.get("already_signed")
+                and (result.get("errors") or result.get("returned_to_sign_form"))
+            ):
+                with contextlib.suppress(Exception):
+                    view_html = self.view_document_html(id_documento, id_procedimento)
+                    if re.search(r"assinado\s+eletronicamente\s+por", view_html, re.IGNORECASE):
+                        result["signed"] = [id_documento]
+                        result["errors"] = []
+            return result
 
-    def _sign_from_blocos(self, block_numero: str) -> dict:
-        """Navigate to blocos, find the block, and sign its documents."""
-        html = self._ensure_control()
-        blocos_url = self._menu_links.get("blocos_assinatura")
-        if not blocos_url:
-            return {"error": "Link de blocos não encontrado"}
+    def _sign_from_blocos(self, block_numero: str, *, doc_indices: list[int] | None = None) -> dict:
+        """Sign documents from a block detail page using per-document sign URLs."""
+        detail = self._get_block_detail_page(block_numero)
+        if detail is None:
+            return {"error": f"Bloco {block_numero} não encontrado"}
 
-        rb = self._get(blocos_url)
+        rd, _docs_soup = detail
+        entries = self._extract_block_document_entries(rd.text)
+        pending_entries = [
+            entry
+            for entry in entries
+            if not entry.get("assinado") and entry.get("sign_url")
+        ]
+        if not pending_entries:
+            return {"error": f"Bloco {block_numero} não possui documentos pendentes assináveis"}
 
-        # Extract sign URL from acaoAssinar JS
-        urls = re.findall(
-            r"controlador\.php\?acao=documento_assinar[^'\"]+",
-            rb.text,
-        )
-        if not urls:
-            return {"error": "URL de assinatura não encontrada na página de blocos"}
+        selected_entries = pending_entries
+        if doc_indices:
+            target_indices = {int(idx) for idx in doc_indices}
+            selected_entries = [entry for entry in pending_entries if int(entry.get("seq") or 0) in target_indices]
+            if not selected_entries:
+                return {"error": f"Nenhum documento pendente corresponde aos índices {sorted(target_indices)} no bloco {block_numero}"}
 
-        sign_url = urljoin(self._sei_url(""), urls[0])
+        result: dict[str, Any] = {"doc_ids": [], "signed": [], "already_signed": [], "errors": []}
+        for entry in selected_entries:
+            sign_url = entry.get("sign_url")
+            doc_ref = entry.get("documento_id") or entry.get("numero_sei") or entry.get("numero_documento")
+            if not sign_url or not doc_ref:
+                result["errors"].append(
+                    f"Documento do bloco sem URL de assinatura: seq={entry.get('seq')}"
+                )
+                continue
+            item_result = self._execute_sign(str(sign_url), str(doc_ref))
+            result["doc_ids"].append(str(doc_ref))
+            result["signed"].extend([str(item) for item in item_result.get("signed", []) if item])
+            result["already_signed"].extend(
+                [str(item) for item in item_result.get("already_signed", []) if item]
+            )
+            if item_result.get("error"):
+                result["errors"].append(str(item_result["error"]))
+            for error in item_result.get("errors", []) or []:
+                if error:
+                    result["errors"].append(str(error))
 
-        # POST the blocos form with the target block ID
-        bsoup = BeautifulSoup(rb.text, "lxml")
-        form = bsoup.find("form", {"id": "frmBlocoLista"})
-        if not form:
-            return {"error": "Formulário de blocos não encontrado"}
-
-        fdata = {}
-        for inp in form.find_all("input"):
-            n = inp.get("name", "")
-            if n:
-                fdata[n] = inp.get("value", "")
-        fdata["hdnInfraItemId"] = block_numero
-
-        rs = self._post(sign_url, fdata)
-        ssoup = BeautifulSoup(rs.text, "lxml")
-        form2 = ssoup.find("form", {"id": "frmAssinaturas"})
-        if not form2:
-            return {"error": "Formulário de assinatura não encontrado"}
-
-        doc_id = form2.find("input", {"name": "hdnIdDocumentos"})
-        doc_id_val = doc_id.get("value", "") if doc_id else ""
-
-        self._control_html = None
-        return self._execute_sign_form(form2, rs.text)
+        verification_docs = self.get_block_documents(block_numero)
+        selected_refs = {
+            ref
+            for entry in selected_entries
+            for ref in (
+                entry.get("documento_id"),
+                entry.get("numero_sei"),
+                entry.get("numero_documento"),
+                entry.get("checkbox_value"),
+            )
+            if ref
+        }
+        still_pending = [
+            doc
+            for doc in verification_docs
+            if not doc.assinado
+            and any(
+                ref and ref in {
+                    doc.documento_id or "",
+                    doc.numero_sei or "",
+                    doc.numero_documento or "",
+                }
+                for ref in selected_refs
+            )
+        ]
+        if not still_pending:
+            result["errors"] = []
+            for entry in selected_entries:
+                doc_ref = (
+                    entry.get("documento_id")
+                    or entry.get("numero_sei")
+                    or entry.get("numero_documento")
+                )
+                if doc_ref and doc_ref not in result["signed"]:
+                    result["signed"].append(str(doc_ref))
+        elif not result.get("already_signed"):
+            result["errors"].append("Documentos permanecem pendentes após releitura do bloco.")
+        return result
 
     def _execute_sign(self, sign_url: str, doc_id: str) -> dict:
         """GET the sign page and submit it."""
@@ -5605,6 +5838,8 @@ class SEIClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         r = auth._follow(self.client, r, self.base_url)
+        with contextlib.suppress(Exception):
+            r.encoding = "iso-8859-1"
 
         # Debug logging for diagnosis
         _log.debug("[sign] response URL: %s", r.url)
@@ -5635,7 +5870,7 @@ class SEIClient:
         # Also check for inline "já foi assinado" which may not be in a standard div
         if "já foi assinado" in plain_text.lower() and not any("já foi assinado" in m.lower() for m in found_messages):
             match = re.search(
-                r"Documento\s+\d+\s+já\s+foi\s+assinado.*?(?:\.|$)",
+                r"\bDocumento\s+\d+\s+já\s+foi\s+assinado.*?(?:\.|$)",
                 plain_text,
                 re.IGNORECASE,
             )
@@ -5679,22 +5914,17 @@ class SEIClient:
             if any(p in r.text.lower() for p in success_patterns):
                 result["signed"].append(doc_ids)
 
-        # If SEI returned to the sign form without explicit success, treat it as failure.
-        # This usually means invalid orgao/cargo/senha or another missing field.
-        # IMPORTANT: "já foi assinado" detection has PRIORITY over URL-based checks,
-        # because SEI may return to the sign form URL even when the document was
-        # already signed — the response body contains the actual status.
+        # IMPORTANT: returning to frmAssinaturas is not conclusive by itself.
+        # The server may still have applied the signature, and callers can
+        # verify externally by re-reading the block/document state.
         if not result["signed"] and not result["already_signed"] and not result["errors"]:
             if "já foi assinado" in r.text:
-                match = re.search(r'Documento\s+\d+\s+já foi assinado[^<]*', r.text)
+                match = re.search(r'\bDocumento\s+\d+\s+já\s+foi\s+assinado[^<]*', r.text, re.IGNORECASE)
                 msg = match.group().strip() if match else f"Documentos {doc_ids} já assinados"
                 result["already_signed"].append(msg)
-            elif returned_to_sign_form:
-                result["errors"].append(
-                    "SEI retornou ao formulário de assinatura sem confirmar a operação."
-                )
-            else:
+            elif not returned_to_sign_form:
                 result["signed"].append(doc_ids)
+        result["returned_to_sign_form"] = returned_to_sign_form
 
         self._control_html = None
         return result

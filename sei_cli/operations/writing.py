@@ -4,17 +4,24 @@ import html
 import re
 from typing import Any
 
-from sei_cli.config import append_created_document_log, append_created_process_log
+from sei_cli.config import (
+    append_created_document_log,
+    append_created_process_log,
+    load_created_documents,
+)
 
 from .contracts import NextAction
 from .errors import UnsupportedStateError, WorkflowViolationError
 from .reading import (
     _context,
     _error_result,
+    _normalize_marker_item,
     _process_unit_preflight,
     _resolve_document_ids,
+    _resolve_marker_reference,
     _resolve_process_id,
     _result,
+    process_marker_preview,
 )
 
 
@@ -117,6 +124,20 @@ def _resolve_requested_access_level(value: str) -> str | None:
     if normalized in {"", "inherit", "herdar", "processo"}:
         return None
     return value
+
+
+def _resolve_created_document_context(document_ref: str) -> tuple[str | None, str | None]:
+    normalized = str(document_ref).strip()
+    for item in reversed(load_created_documents()):
+        if normalized in {
+            str(item.get("id_documento") or "").strip(),
+            str(item.get("numero_documento") or "").strip(),
+        }:
+            return (
+                str(item.get("id_documento") or "").strip() or None,
+                str(item.get("id_procedimento") or "").strip() or None,
+            )
+    return None, None
 
 
 def _prune_access_warnings(
@@ -677,6 +698,11 @@ def document_create_confirm(
                 interessados=interessados,
                 extra_fields=extra_fields,
             )
+            if not getattr(created, "id_documento", ""):
+                raise WorkflowViolationError(
+                    "SEI não retornou id_documento após a criação do documento.",
+                    details={"id_procedimento": id_procedimento, "tipo_documento": tipo_documento},
+                )
             metadata_warnings = _prune_access_warnings(
                 metadata.get("warnings", []),
                 selected_hypothesis=selected_hypothesis,
@@ -1303,6 +1329,422 @@ def signature_block_add_document_preview(
         )
 
 
+def signature_block_recall_preview(
+    client: Any,
+    block_numero: str,
+) -> dict[str, Any]:
+    operation = "signature-block-recall-preview"
+    resolved_ids: dict[str, Any] = {"block_numero": block_numero}
+    try:
+        context = _context(client)
+        block_result = __import__("sei_cli.operations.reading", fromlist=["signature_block_read"]).signature_block_read(
+            client,
+            block_numero,
+        )
+        if not block_result.get("ok"):
+            block_result["operation"] = operation
+            return block_result
+
+        bloco = block_result["data"]["bloco"]
+        estado = str(bloco.get("estado") or "")
+        normalized_state = estado.casefold()
+        action_name: str | None = None
+        action_label: str | None = None
+        warnings: list[str] = []
+
+        if normalized_state == "disponibilizado":
+            action_name = "cancelar_disponibilizacao"
+            action_label = "Cancelar disponibilização do bloco"
+        elif normalized_state == "recebido":
+            action_name = "devolver"
+            action_label = "Devolver bloco para a unidade de origem"
+            warnings.append("Bloco em estado 'Recebido' será devolvido para a unidade de origem.")
+        else:
+            raise UnsupportedStateError(
+                f"Bloco {block_numero} está em estado '{estado}' e não pode ser recolhido por esta canônica.",
+                details={"block_numero": block_numero, "estado": estado},
+            )
+
+        return _result(
+            operation=operation,
+            context=block_result["context"],
+            resolved_ids=resolved_ids,
+            data={
+                "bloco": bloco,
+                "mutation_preview": {
+                    "block_numero": block_numero,
+                    "current_state": estado,
+                    "action": action_name,
+                    "action_label": action_label,
+                },
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="signature-block-recall-confirm",
+                    label=action_label or "Recolher bloco",
+                    params={"block_numero": block_numero},
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def signature_block_recall_confirm(
+    client: Any,
+    block_numero: str,
+    *,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "signature-block-recall-confirm"
+    resolved_ids: dict[str, Any] = {"block_numero": block_numero}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para recolher o bloco.",
+                details={"expected_flag": "--confirm"},
+            )
+
+        preview = signature_block_recall_preview(client, block_numero)
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+
+        context = preview["context"]
+        mutation_preview = preview["data"]["mutation_preview"]
+        action_name = mutation_preview["action"]
+        if action_name == "cancelar_disponibilizacao":
+            mutation = client.cancelar_disponibilizacao_block(block_numero)
+        elif action_name == "devolver":
+            mutation = client.devolver_block(block_numero)
+        else:
+            raise UnsupportedStateError(
+                f"Ação de recolhimento '{action_name}' não suportada.",
+                details={"block_numero": block_numero, "action": action_name},
+            )
+
+        if not mutation.get("ok"):
+            raise WorkflowViolationError(
+                mutation.get("message", "SEI não confirmou o recolhimento do bloco."),
+                details={"block_numero": block_numero, "action": action_name},
+            )
+
+        verification = __import__("sei_cli.operations.reading", fromlist=["signature_block_read"]).signature_block_read(
+            client,
+            block_numero,
+        )
+
+        verification_state = None
+        if verification.get("ok"):
+            verification_state = verification["data"]["bloco"].get("estado")
+            invalid_after = (
+                action_name == "cancelar_disponibilizacao" and str(verification_state or "").casefold() == "disponibilizado"
+            ) or (
+                action_name == "devolver" and str(verification_state or "").casefold() == "recebido"
+            )
+            if invalid_after:
+                raise WorkflowViolationError(
+                    "SEI retornou sucesso, mas o estado do bloco não mudou após releitura.",
+                    details={
+                        "block_numero": block_numero,
+                        "action": action_name,
+                        "state_after": verification_state,
+                    },
+                )
+
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "mutation": {
+                    "action": action_name,
+                    "message": mutation.get("message"),
+                },
+                "verification": {
+                    "available": verification.get("ok", False),
+                    "state_after": verification_state,
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="signature-block-read",
+                    label="Ler bloco após recolhimento",
+                    params={"block_numero": block_numero},
+                )
+            ],
+            warnings=[],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def signature_block_refresh_preview(
+    client: Any,
+    block_numero: str,
+    *,
+    add_document_ids: list[str] | None = None,
+    remove_document_ids: list[str] | None = None,
+    redisponibilizar: bool = True,
+) -> dict[str, Any]:
+    operation = "signature-block-refresh-preview"
+    resolved_ids: dict[str, Any] = {"block_numero": block_numero}
+    try:
+        context = _context(client)
+        block_result = __import__("sei_cli.operations.reading", fromlist=["signature_block_read"]).signature_block_read(
+            client,
+            block_numero,
+        )
+        if not block_result.get("ok"):
+            block_result["operation"] = operation
+            return block_result
+
+        bloco = block_result["data"]["bloco"]
+        estado = str(bloco.get("estado") or "")
+        normalized_state = estado.casefold()
+        current_documents = block_result["data"].get("documents", [])
+        current_ids = {
+            str(value).strip()
+            for item in current_documents
+            for value in (item.get("documento_id"), item.get("numero_sei"), item.get("numero_documento"))
+            if value is not None and str(value).strip()
+        }
+        add_list = [item.strip() for item in (add_document_ids or []) if item and item.strip()]
+        remove_list = [item.strip() for item in (remove_document_ids or []) if item and item.strip()]
+        already_present = [item for item in add_list if item in current_ids]
+        missing_for_removal = [item for item in remove_list if item not in current_ids]
+
+        warnings: list[str] = []
+        recall_required = normalized_state == "disponibilizado"
+        recall_action = "cancelar_disponibilizacao" if recall_required else None
+        if normalized_state == "recebido":
+            raise UnsupportedStateError(
+                f"Bloco {block_numero} está em estado '{estado}' e não pode ser administrado pela unidade atual.",
+                details={"block_numero": block_numero, "estado": estado},
+            )
+        if normalized_state not in {"gerado", "disponibilizado"}:
+            raise UnsupportedStateError(
+                f"Bloco {block_numero} está em estado '{estado}' e não pode ser atualizado por esta canônica.",
+                details={"block_numero": block_numero, "estado": estado},
+            )
+        if recall_required:
+            warnings.append("Bloco disponibilizado será recolhido antes da atualização.")
+        if already_present:
+            warnings.append("Alguns documentos solicitados para inclusão já constam no bloco.")
+        if missing_for_removal:
+            warnings.append("Alguns documentos solicitados para remoção não constam no bloco.")
+        if not add_list and not remove_list:
+            warnings.append("Nenhuma alteração de documentos foi informada; a canônica só executará recolhimento/redisponibilização se necessário.")
+
+        resolved_ids["add_document_ids"] = add_list
+        resolved_ids["remove_document_ids"] = remove_list
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "bloco": bloco,
+                "mutation_preview": {
+                    "block_numero": block_numero,
+                    "current_state": estado,
+                    "recall_required": recall_required,
+                    "recall_action": recall_action,
+                    "documents_to_add": add_list,
+                    "documents_to_remove": remove_list,
+                    "already_present": already_present,
+                    "missing_for_removal": missing_for_removal,
+                    "redisponibilizar": redisponibilizar,
+                },
+                "current_documents_total": len(current_documents),
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="signature-block-refresh-confirm",
+                    label="Atualizar bloco e redisponibilizar",
+                    params={
+                        "block_numero": block_numero,
+                        "add_document_ids": add_list,
+                        "remove_document_ids": remove_list,
+                        "redisponibilizar": redisponibilizar,
+                    },
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def signature_block_refresh_confirm(
+    client: Any,
+    block_numero: str,
+    *,
+    add_document_ids: list[str] | None = None,
+    remove_document_ids: list[str] | None = None,
+    redisponibilizar: bool = True,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "signature-block-refresh-confirm"
+    resolved_ids: dict[str, Any] = {"block_numero": block_numero}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para atualizar o bloco.",
+                details={"expected_flag": "--confirm"},
+            )
+
+        preview = signature_block_refresh_preview(
+            client,
+            block_numero,
+            add_document_ids=add_document_ids,
+            remove_document_ids=remove_document_ids,
+            redisponibilizar=redisponibilizar,
+        )
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+
+        context = preview["context"]
+        mutation_preview = preview["data"]["mutation_preview"]
+        add_list = mutation_preview["documents_to_add"]
+        remove_list = mutation_preview["documents_to_remove"]
+        results: dict[str, Any] = {"recall": None, "removed": [], "added": [], "redisponibilizacao": None}
+
+        if mutation_preview["recall_required"]:
+            recall = signature_block_recall_confirm(client, block_numero, confirm=True)
+            if not recall.get("ok"):
+                recall["operation"] = operation
+                return recall
+            results["recall"] = recall["data"]["mutation"]
+
+        current_block = __import__("sei_cli.operations.reading", fromlist=["signature_block_read"]).signature_block_read(
+            client,
+            block_numero,
+        )
+        if not current_block.get("ok"):
+            current_block["operation"] = operation
+            return current_block
+        block_unit = current_block.get("context", {}).get("unidade_sigla") or context.get("unidade_sigla")
+
+        for doc_ref in remove_list:
+            current_docs = current_block["data"].get("documents", [])
+            match = next(
+                (
+                    item for item in current_docs
+                    if doc_ref in {
+                        str(item.get("documento_id") or "").strip(),
+                        str(item.get("numero_sei") or "").strip(),
+                        str(item.get("numero_documento") or "").strip(),
+                    }
+                ),
+                None,
+            )
+            if not match:
+                continue
+            _best_effort_switch_to_unit(client, block_unit)
+            mutation = client.remove_document_from_block(str(match.get("documento_id")), block_numero)
+            if not mutation.get("ok"):
+                raise WorkflowViolationError(
+                    mutation.get("message", "SEI não confirmou a remoção do documento do bloco."),
+                    details={"block_numero": block_numero, "documento_ref": doc_ref},
+                )
+            results["removed"].append({"documento_ref": doc_ref, "message": mutation.get("message")})
+            current_block = __import__("sei_cli.operations.reading", fromlist=["signature_block_read"]).signature_block_read(
+                client,
+                block_numero,
+            )
+            if not current_block.get("ok"):
+                current_block["operation"] = operation
+                return current_block
+
+        for doc_ref in add_list:
+            _best_effort_switch_to_unit(client, block_unit)
+            logged_doc_id, logged_process_id = _resolve_created_document_context(doc_ref)
+            add_result = signature_block_add_document_confirm(
+                client,
+                block_numero,
+                logged_doc_id or doc_ref,
+                process_id=logged_process_id,
+                disponibilizar=False,
+                confirm=True,
+            )
+            if not add_result.get("ok"):
+                add_result["operation"] = operation
+                return add_result
+            results["added"].append(
+                {
+                    "documento_ref": doc_ref,
+                    "resolved_id_documento": add_result["resolved_ids"].get("id_documento"),
+                }
+            )
+
+        if redisponibilizar:
+            _best_effort_switch_to_unit(client, block_unit)
+            mutation = client.disponibilizar_block(block_numero)
+            if not mutation.get("ok"):
+                raise WorkflowViolationError(
+                    mutation.get("message", "SEI não confirmou a disponibilização do bloco."),
+                    details={"block_numero": block_numero},
+                )
+            results["redisponibilizacao"] = {"message": mutation.get("message")}
+
+        verification = __import__("sei_cli.operations.reading", fromlist=["signature_block_read"]).signature_block_read(
+            client,
+            block_numero,
+        )
+        if not verification.get("ok"):
+            verification["operation"] = operation
+            return verification
+
+        resolved_ids["add_document_ids"] = add_list
+        resolved_ids["remove_document_ids"] = remove_list
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "mutation": results,
+                "verification": {
+                    "state_after": verification["data"]["bloco"].get("estado"),
+                    "documents_total": verification["data"].get("documents_total"),
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="signature-block-read",
+                    label="Ler bloco atualizado",
+                    params={"block_numero": block_numero},
+                )
+            ],
+            warnings=[],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
 def signature_block_add_document_confirm(
     client: Any,
     block_numero: str,
@@ -1561,30 +2003,43 @@ def signature_block_sign_confirm(
         context = preview["context"]
         results: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
-        for item in selected_documents:
-            doc_id = item.get("resolved_id_documento") or item.get("documento_id")
-            process_ref = item.get("processo")
-            process_id = item.get("resolved_id_procedimento")
-            if not doc_id or not process_ref:
-                errors.append(
-                    {
-                        "documento_id": doc_id,
-                        "processo": process_ref,
-                        "error": "Documento pendente sem identificação suficiente para assinatura.",
-                    }
-                )
-                continue
-            if not process_id:
-                process_id, _numero_processo = _resolve_process_id(client, process_ref)
-            result = client.sign_document(doc_id, process_id)
-            result["documento_id"] = doc_id
-            result["processo"] = process_ref
+        sign_block = getattr(client, "sign_block", None)
+        selected_indices = [
+            int(item["seq"])
+            for item in selected_documents
+            if item.get("seq") and str(item.get("seq")).isdigit()
+        ]
+        if callable(sign_block) and selected_indices:
+            result = sign_block(block_numero, doc_indices=selected_indices)
+            result["block_numero"] = block_numero
+            result["document_indices"] = selected_indices
             results.append(result)
-            if result.get("already_signed"):
-                # already_signed is a success — the document IS signed, goal achieved
-                pass
-            elif result.get("error") or result.get("errors"):
+            if not result.get("already_signed") and (result.get("error") or result.get("errors")):
                 errors.append(result)
+        else:
+            for item in selected_documents:
+                doc_id = item.get("resolved_id_documento") or item.get("documento_id")
+                process_ref = item.get("processo")
+                process_id = item.get("resolved_id_procedimento")
+                if not doc_id or not process_ref:
+                    errors.append(
+                        {
+                            "documento_id": doc_id,
+                            "processo": process_ref,
+                            "error": "Documento pendente sem identificação suficiente para assinatura.",
+                        }
+                    )
+                    continue
+                if not process_id:
+                    process_id, _numero_processo = _resolve_process_id(client, process_ref)
+                result = client.sign_document(doc_id, process_id)
+                result["documento_id"] = doc_id
+                result["processo"] = process_ref
+                results.append(result)
+                if result.get("already_signed"):
+                    pass
+                elif result.get("error") or result.get("errors"):
+                    errors.append(result)
 
         if errors:
             first_error = next(
@@ -1667,5 +2122,253 @@ def signature_block_sign_confirm(
             operation=operation,
             context=locals().get("context"),
             resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_marker_set_preview(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    marker: str,
+    texto: str | None = None,
+    mode: str = "summary",
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sample_size: int = 3,
+) -> dict[str, Any]:
+    operation = "process-marker-set-preview"
+    try:
+        base = process_marker_preview(
+            client,
+            numero_ou_id,
+            marker=marker,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            sample_size=sample_size,
+            suggested_text=texto,
+        )
+        if not base.get("ok"):
+            base["operation"] = operation
+            return base
+        selected_marker = base["data"].get("selected_marker")
+        if not selected_marker:
+            raise WorkflowViolationError(
+                f"Marcador '{marker}' não encontrado no catálogo atual da unidade.",
+                details={"marker": marker},
+            )
+
+        marker_text = (texto or "").strip() or base["data"].get("suggested_marker_text") or ""
+        warnings = list(base.get("warnings", []))
+        warnings.append("Usar apenas processos de teste nesta fase de desenvolvimento.")
+        if base["data"].get("current_marker"):
+            warnings.append(
+                "A visão atual já exibe marcador no processo; gestão granular de múltiplos marcadores ainda será tratada em outra canônica."
+            )
+
+        return _result(
+            operation=operation,
+            context=base["context"],
+            resolved_ids=base["resolved_ids"],
+            data={
+                **base["data"],
+                "selected_marker": selected_marker,
+                "marker_text": marker_text,
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-marker-set-confirm",
+                    label="Aplicar marcador ao processo",
+                    params={
+                        "numero_ou_id": base["resolved_ids"].get("id_procedimento") or numero_ou_id,
+                        "marker": selected_marker.get("marcador_id"),
+                        "texto": marker_text,
+                    },
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("base", {}).get("context"),
+            resolved_ids=locals().get("base", {}).get("resolved_ids"),
+            exc=exc,
+        )
+
+
+def process_marker_set_confirm(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    marker: str,
+    texto: str | None = None,
+    confirm: bool = False,
+    mode: str = "summary",
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sample_size: int = 3,
+) -> dict[str, Any]:
+    operation = "process-marker-set-confirm"
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmação explícita obrigatória para aplicar marcador.",
+                details={"expected_flag": "--confirm"},
+            )
+
+        preview = process_marker_set_preview(
+            client,
+            numero_ou_id,
+            marker=marker,
+            texto=texto,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            sample_size=sample_size,
+        )
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+
+        process_id = preview["resolved_ids"]["id_procedimento"]
+        selected_marker = preview["data"]["selected_marker"]
+        marker_text = preview["data"].get("marker_text") or ""
+        ok = client.set_marcador(process_id, str(selected_marker["marcador_id"]), marker_text)
+        if not ok:
+            raise WorkflowViolationError(
+                "SEI não confirmou a aplicação do marcador no processo.",
+                details={"id_procedimento": process_id, "marcador_id": selected_marker["marcador_id"]},
+            )
+
+        return _result(
+            operation=operation,
+            context=preview["context"],
+            resolved_ids=preview["resolved_ids"],
+            data={
+                "processo": preview["data"].get("processo"),
+                "selected_marker": selected_marker,
+                "marker_text": marker_text,
+                "mutation": {
+                    "applied": True,
+                    "message": f"Marcador {selected_marker['marcador_id']} aplicado ao processo {process_id}.",
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="process-marker-preview",
+                    label="Revisar marcador e contexto do processo",
+                    params={"numero_ou_id": process_id},
+                ),
+                NextAction(
+                    action="process-read",
+                    label="Reler processo",
+                    params={"numero_ou_id": process_id},
+                ),
+            ],
+            warnings=preview.get("warnings", []),
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("preview", {}).get("context"),
+            resolved_ids=locals().get("preview", {}).get("resolved_ids"),
+            exc=exc,
+        )
+
+
+def process_marker_remove_preview(client: Any, numero_ou_id: str) -> dict[str, Any]:
+    operation = "process-marker-remove-preview"
+    try:
+        base = process_marker_preview(client, numero_ou_id)
+        if not base.get("ok"):
+            base["operation"] = operation
+            return base
+        warnings = list(base.get("warnings", []))
+        warnings.append(
+            "Esta canônica remove o marcador disponível pelo fluxo atual do processo; múltiplos marcadores ainda não têm gestão granular."
+        )
+        if not base["data"].get("current_marker"):
+            warnings.append("A visão atual do processo não exibe marcador associado.")
+        return _result(
+            operation=operation,
+            context=base["context"],
+            resolved_ids=base["resolved_ids"],
+            data={
+                "processo": base["data"].get("processo"),
+                "current_marker": base["data"].get("current_marker"),
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-marker-remove-confirm",
+                    label="Remover marcador do processo",
+                    params={"numero_ou_id": base["resolved_ids"].get("id_procedimento") or numero_ou_id},
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("base", {}).get("context"),
+            resolved_ids=locals().get("base", {}).get("resolved_ids"),
+            exc=exc,
+        )
+
+
+def process_marker_remove_confirm(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-marker-remove-confirm"
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmação explícita obrigatória para remover marcador.",
+                details={"expected_flag": "--confirm"},
+            )
+
+        preview = process_marker_remove_preview(client, numero_ou_id)
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+        process_id = preview["resolved_ids"]["id_procedimento"]
+        ok = client.remove_marcador(process_id)
+        if not ok:
+            raise WorkflowViolationError(
+                "SEI não confirmou a remoção do marcador do processo.",
+                details={"id_procedimento": process_id},
+            )
+
+        return _result(
+            operation=operation,
+            context=preview["context"],
+            resolved_ids=preview["resolved_ids"],
+            data={
+                "processo": preview["data"].get("processo"),
+                "mutation": {
+                    "removed": True,
+                    "message": f"Marcador removido do processo {process_id}.",
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="process-marker-preview",
+                    label="Revisar processo após remoção",
+                    params={"numero_ou_id": process_id},
+                )
+            ],
+            warnings=preview.get("warnings", []),
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("preview", {}).get("context"),
+            resolved_ids=locals().get("preview", {}).get("resolved_ids"),
             exc=exc,
         )

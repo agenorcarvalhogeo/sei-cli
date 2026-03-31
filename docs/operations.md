@@ -187,6 +187,16 @@ Backlog adicional de bloco:
 - permitir adicionar/remover unidades destino de um bloco de assinatura de forma canônica
 - usar isso para cenários de assinatura por unidade destinatária sem recriar bloco
 - manter leitura/revisão de destinos antes de mutar o bloco
+- suportar ciclo de vida reutilizável do bloco:
+  - ir para a unidade dona do bloco
+  - cancelar disponibilizacao quando o bloco estiver disponibilizado
+  - ajustar o conjunto de documentos no bloco
+  - disponibilizar novamente para a unidade destinataria
+  - usar isso para preparar um bloco reutilizavel com novos documentos pendentes
+- backlog: `signature-block-recall-preview`
+- backlog: `signature-block-recall-confirm`
+- backlog: `signature-block-refresh-preview`
+- backlog: `signature-block-refresh-confirm`
 
 #### Fase 3. Assinatura canonica
 
@@ -237,6 +247,98 @@ Pos-condicoes obrigatorias:
 - cargo divergente no formulario
 - assinatura parcial com falha no meio do lote
 - retorno do bloco apos assinatura
+- bloco disponibilizado em outra unidade exigindo recolhimento antes de manutencao
+- parser da arvore do processo marcando `assinado=false` para documentos ja assinados
+
+## Proximo Escopo: Marcadores de Processo
+
+Esta frente agora passa a ter uma camada canônica inicial focada no fluxo por processo específico.
+
+### Objetivo
+
+- contextualizar rapidamente do que trata o processo
+- sugerir texto curto de marcador a partir da leitura canônica do processo
+- aplicar marcador ao processo com `preview` + `confirm`
+- remover marcador pelo fluxo atual do processo
+
+### Primeira leva implementada
+
+- `marker-catalog`
+- `process-marker-preview`
+- `process-marker-set-preview`
+- `process-marker-set-confirm`
+- `process-marker-remove-preview`
+- `process-marker-remove-confirm`
+
+### Regra de uso nesta fase
+
+- usar apenas processos de teste para validação real
+- a sugestão de texto do marcador é derivada de `process-summary`
+- a canônica atual cobre o fluxo dentro do processo específico
+
+### Segunda fase planejada
+
+- gestão granular de múltiplos marcadores no mesmo processo
+- leitura do histórico de marcadores
+- alteração de texto de marcador existente
+- mutação em lote pelo Controle de Processos:
+  - selecionar um ou mais processos
+  - adicionar marcador
+  - remover marcador
+- leitura mais precisa de prazo/manifestações para enriquecer a sugestão do texto do marcador
+
+### Fluxo canonico adicional: bloco reutilizavel
+
+Este fluxo ficou validado como necessidade operacional real.
+
+Objetivo:
+
+- reaproveitar o mesmo bloco de assinatura ao longo do processo
+- recolher o bloco quando necessario
+- trocar os documentos contidos
+- redisponibilizar para a unidade que vai assinar
+
+Sequencia desejada:
+
+1. `signature-block-read`
+2. `signature-block-recall-preview`
+3. `signature-block-recall-confirm`
+4. `signature-block-add-document-preview`
+5. `signature-block-add-document-confirm`
+6. `signature-block-remove-document-confirm`
+7. `signature-block-disponibilizar-confirm`
+8. `signature-block-sign-preview`
+9. `signature-block-sign-confirm`
+
+Pre-condicoes importantes:
+
+- a manutencao do bloco deve ocorrer na unidade dona do bloco
+- se o bloco estiver disponibilizado, a canônica deve orientar recolhimento/cancelamento antes da mutacao
+- a canônica deve deixar claro quando a unidade atual só pode assinar e quando pode administrar o bloco
+
+### Regra operacional: assinatura local vs assinatura por bloco
+
+Existem dois fluxos distintos e eles nao devem ser misturados:
+
+1. Assinatura por bloco disponibilizado
+
+- usar quando o signatario nao tem acesso a unidade geradora do documento
+- o documento e colocado em bloco de assinatura
+- o bloco e disponibilizado para a outra unidade
+- a assinatura deve ocorrer na unidade destinataria, pelo fluxo `signature-block-sign-*`
+
+2. Assinatura local da unidade geradora
+
+- usar quando o proprio usuario da unidade geradora vai assinar
+- se o documento estiver em bloco disponibilizado, primeiro e necessario cancelar a disponibilizacao do bloco
+- depois disso a assinatura deve ocorrer no ambiente da unidade geradora, pelo fluxo normal de assinatura de documento
+- nesse caso, nao usar `signature-block-sign-*`
+
+Consequencias para testes e canônicas:
+
+- todo teste de `signature-block-sign-*` precisa considerar a unidade destinataria do bloco disponibilizado
+- todo teste de assinatura local precisa garantir que o bloco nao esteja disponibilizado
+- quando houver erro de assinatura, o diagnostico deve primeiro verificar se o fluxo escolhido bate com a logistica do bloco
 
 ### Backlog imediato acoplado a esta fase
 

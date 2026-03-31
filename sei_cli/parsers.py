@@ -531,7 +531,27 @@ def parse_block_documents(content: str, base_url: str) -> list[BlockDocument]:
         processo = _norm(tds[2].text_content()) if len(tds) > 2 else ""
         document_lines = _cell_lines(tds[3]) if len(tds) > 3 else []
         document_candidates = _cell_metadata_candidates(tds[3]) if len(tds) > 3 else []
-        doc_id = document_lines[0] if document_lines else ""
+        visible_doc_id = document_lines[0] if document_lines else ""
+
+        # Extract real id_documento from href #ID-{id}-{bloco} or ?id_documento=
+        # When the real internal ID differs from the visible text, the visible
+        # text is the numero_sei.
+        real_doc_id = visible_doc_id
+        numero_sei_value: str | None = None
+        for anchor in row.xpath(".//a[@href]"):
+            href = anchor.attrib.get("href", "")
+            id_match = re.search(r"#ID-(\d+)-\d+", href)
+            if id_match:
+                real_doc_id = id_match.group(1)
+                if real_doc_id != visible_doc_id and re.fullmatch(r"\d+", visible_doc_id):
+                    numero_sei_value = visible_doc_id
+                break
+            id_doc_match = re.search(r"[?&]id_documento=(\d+)", href)
+            if id_doc_match:
+                real_doc_id = id_doc_match.group(1)
+                break
+
+        doc_id = real_doc_id
         numero_documento = _extract_document_number(
             doc_id=doc_id,
             visible_lines=document_lines,
@@ -553,7 +573,7 @@ def parse_block_documents(content: str, base_url: str) -> list[BlockDocument]:
         imgs = row.xpath(".//img[@title]")
         assinado = any("Assinatura" in (i.attrib.get("title", "")) for i in imgs)
         
-        docs.append(BlockDocument(
+        bd_kwargs: dict[str, Any] = dict(
             seq=seq,
             processo=processo,
             documento_id=doc_id,
@@ -563,7 +583,10 @@ def parse_block_documents(content: str, base_url: str) -> list[BlockDocument]:
             numero_documento=numero_documento,
             data_documento=data_documento,
             assinado=assinado,
-        ))
+        )
+        if numero_sei_value:
+            bd_kwargs["numero_sei"] = numero_sei_value
+        docs.append(BlockDocument(**bd_kwargs))
     
     return docs
 

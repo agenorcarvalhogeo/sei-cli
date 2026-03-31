@@ -18,8 +18,14 @@ from sei_cli.operations import (
     document_quality_check,
     document_read,
     inbox_snapshot,
+    marker_catalog,
     process_create_confirm,
     process_create_preview,
+    process_marker_preview,
+    process_marker_remove_confirm,
+    process_marker_remove_preview,
+    process_marker_set_confirm,
+    process_marker_set_preview,
     process_open,
     process_report,
     process_read,
@@ -28,6 +34,10 @@ from sei_cli.operations import (
     signature_block_add_document_confirm,
     signature_block_add_document_preview,
     signature_block_list,
+    signature_block_recall_confirm,
+    signature_block_recall_preview,
+    signature_block_refresh_confirm,
+    signature_block_refresh_preview,
     signature_block_read,
     signature_block_sign_confirm,
     signature_block_sign_preview,
@@ -52,7 +62,26 @@ class FakeClient:
     def __init__(self) -> None:
         self.switched_to: str | None = None
         self.last_block_add: dict[str, Any] | None = None
+        self.last_block_recall: dict[str, Any] | None = None
         self.signed_documents: list[dict[str, Any]] = []
+        self.marker_catalog = [
+            {"id": "10", "nome": "LIVROS"},
+            {"id": "11", "nome": "Férias / Dispensas"},
+            {"id": "12", "nome": "Informações"},
+            {"id": "13", "nome": "Materiais Quartel"},
+        ]
+        self.process_markers: dict[str, dict[str, str]] = {
+            "47607237": {"id": "11", "nome": "Férias / Dispensas", "texto": "Sd José Junior 15/03 - 13/04"}
+        }
+        self.blocks: list[Block] = [
+            Block(
+                numero="774681",
+                estado="Recebido",
+                unidade_origem="OP 3",
+                unidade_destino="CMDO",
+                descricao="Assinaturas pendentes",
+            )
+        ]
         self.block_documents_map: dict[str, list[BlockDocument]] = {
             "774681": [
                 BlockDocument(
@@ -125,15 +154,39 @@ class FakeClient:
         return ProcessList(recebidos=recebidos, gerados=gerados)
 
     def list_blocks(self) -> list[Block]:
-        return [
-            Block(
-                numero="774681",
-                estado="Recebido",
-                unidade_origem="OP 3",
-                unidade_destino="CMDO",
-                descricao="Assinaturas pendentes",
-            )
-        ]
+        return list(self.blocks)
+
+    def list_marcadores(self) -> list[dict[str, str]]:
+        return list(self.marker_catalog)
+
+    def set_marcador(self, id_procedimento: str, marcador_id: str, texto: str = "") -> bool:
+        marker = next((item for item in self.marker_catalog if item["id"] == marcador_id), None)
+        if not marker:
+            return False
+        self.process_markers[id_procedimento] = {
+            "id": marcador_id,
+            "nome": marker["nome"],
+            "texto": texto,
+        }
+        return True
+
+    def remove_marcador(self, id_procedimento: str) -> bool:
+        self.process_markers.pop(id_procedimento, None)
+        return True
+
+    def cancelar_disponibilizacao_block(self, block_numero: str) -> dict[str, Any]:
+        self.last_block_recall = {"block_numero": block_numero, "action": "cancelar_disponibilizacao"}
+        for block in self.blocks:
+            if block.numero == block_numero:
+                block.estado = "Gerado"
+                return {"ok": True, "message": f"Bloco {block_numero} — estado: {block.estado}"}
+        return {"ok": False, "message": f"Bloco {block_numero} não encontrado"}
+
+    def devolver_block(self, block_numero: str) -> dict[str, Any]:
+        self.last_block_recall = {"block_numero": block_numero, "action": "devolver"}
+        self.blocks = [block for block in self.blocks if block.numero != block_numero]
+        self.block_documents_map.pop(block_numero, None)
+        return {"ok": True, "message": f"Bloco {block_numero} devolvido com sucesso"}
 
     def search(self, query: str) -> str:
         if query == "08810058.000128/2026-69":
@@ -339,6 +392,20 @@ class FakeClient:
             "ok": True,
             "message": f"Documento {id_documento} incluído no bloco {block_numero}",
         }
+
+    def remove_document_from_block(self, id_documento: str, block_numero: str) -> dict[str, Any]:
+        docs = self.block_documents_map.get(block_numero, [])
+        self.block_documents_map[block_numero] = [
+            doc for doc in docs if doc.documento_id != id_documento and doc.numero_sei != id_documento
+        ]
+        return {"ok": True, "message": f"Documento {id_documento} removido do bloco {block_numero}"}
+
+    def disponibilizar_block(self, block_numero: str) -> dict[str, Any]:
+        for block in self.blocks:
+            if block.numero == block_numero:
+                block.estado = "Disponibilizado"
+                return {"ok": True, "message": f"Bloco {block_numero} — estado: {block.estado}"}
+        return {"ok": False, "message": f"Bloco {block_numero} não encontrado"}
 
     def sign_document(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
         self.signed_documents.append(
@@ -599,6 +666,35 @@ class FakeClientLegacySwitch(FakeClient):
         return True
 
 
+class EmptyCreateDocumentClient(FakeClient):
+    def create_document(
+        self,
+        id_procedimento: str,
+        tipo: str,
+        *,
+        nivel_acesso: str = "0",
+        texto_inicial: str = "N",
+        descricao: str = "",
+        interessados: str = "",
+        extra_fields: dict[str, str] | None = None,
+    ) -> DocumentCreated:
+        self.last_created_document = {
+            "id_procedimento": id_procedimento,
+            "tipo": tipo,
+            "nivel_acesso": nivel_acesso,
+            "texto_inicial": texto_inicial,
+            "descricao": descricao,
+            "interessados": interessados,
+            "extra_fields": extra_fields or {},
+        }
+        return DocumentCreated(
+            id_documento="",
+            id_procedimento=id_procedimento,
+            tipo=tipo,
+            editor_url=None,
+        )
+
+
 def test_inbox_snapshot_contract() -> None:
     result = inbox_snapshot(FakeClient())
 
@@ -667,6 +763,23 @@ def test_document_read_resolves_human_number_from_internal_ids() -> None:
     assert result["resolved_ids"]["numero_documento"] == "39860248"
 
 
+class SignedMarkerDocumentClient(FakeClient):
+    def read_document(self, id_documento: str, id_procedimento: str) -> str:
+        if (id_documento, id_procedimento) == ("48568466", "47607237"):
+            return (
+                "Despacho de teste.\n"
+                "Assinado eletronicamente por LEO ZENON TASSI, 2º Tenente QOEM BM.\n"
+            )
+        return super().read_document(id_documento, id_procedimento)
+
+
+def test_document_read_marks_document_signed_from_text_marker() -> None:
+    result = document_read(SignedMarkerDocumentClient(), "48568466", id_procedimento="47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["documento"]["assinado"] is True
+
+
 def test_document_read_not_found() -> None:
     result = document_read(FakeClient(), "00000000")
 
@@ -725,6 +838,66 @@ def test_process_summary_contract() -> None:
     assert result["data"]["read_summary"]["documents_failed_total"] == 0
     assert result["data"]["key_documents"]
     assert result["data"]["action_items"]
+
+
+def test_marker_catalog_contract() -> None:
+    result = marker_catalog(FakeClient())
+
+    assert result["ok"] is True
+    assert result["operation"] == "marker-catalog"
+    assert result["data"]["markers_total"] == 4
+    assert result["data"]["markers"][0]["marcador_id"] == "10"
+
+
+def test_process_marker_preview_contract() -> None:
+    result = process_marker_preview(FakeClient(), "47607237", marker="Férias / Dispensas")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-marker-preview"
+    assert result["data"]["selected_marker"]["marcador_id"] == "11"
+    assert result["data"]["suggested_marker_text"]
+
+
+def test_process_marker_set_preview_contract() -> None:
+    result = process_marker_set_preview(FakeClient(), "47607237", marker="12")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-marker-set-preview"
+    assert result["data"]["selected_marker"]["marcador_id"] == "12"
+    assert result["data"]["confirmation_required"] is True
+
+
+def test_process_marker_set_confirm_contract() -> None:
+    client = FakeClient()
+    result = process_marker_set_confirm(
+        client,
+        "47607237",
+        marker="12",
+        texto="Processo apenas informativo.",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-marker-set-confirm"
+    assert client.process_markers["47607237"]["id"] == "12"
+    assert client.process_markers["47607237"]["texto"] == "Processo apenas informativo."
+
+
+def test_process_marker_remove_preview_contract() -> None:
+    result = process_marker_remove_preview(FakeClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-marker-remove-preview"
+    assert result["data"]["confirmation_required"] is True
+
+
+def test_process_marker_remove_confirm_contract() -> None:
+    client = FakeClient()
+    result = process_marker_remove_confirm(client, "47607237", confirm=True)
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-marker-remove-confirm"
+    assert "47607237" not in client.process_markers
 
 
 def test_process_create_preview_contract() -> None:
@@ -957,6 +1130,19 @@ def test_document_create_confirm_requires_confirmation() -> None:
 
     assert result["ok"] is False
     assert result["error"]["code"] == "workflow_violation"
+
+
+def test_document_create_confirm_fails_when_document_id_is_missing() -> None:
+    result = document_create_confirm(
+        EmptyCreateDocumentClient(),
+        "47607237",
+        "despacho",
+        confirm=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+    assert "não retornou id_documento" in result["error"]["message"]
 
 
 def test_document_edit_preview_contract() -> None:
@@ -1203,6 +1389,152 @@ def test_signature_block_add_document_preview_contract() -> None:
     assert result["data"]["bloco"]["numero"] == "774681"
     assert result["data"]["documento"]["id_documento"] == "48568468"
     assert any("Recebido" in warning for warning in result["warnings"])
+
+
+class DisponibilizedBlockClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = [
+            Block(
+                numero="871299",
+                estado="Disponibilizado",
+                unidade_origem="PABM APODI",
+                unidade_destino="PAD-PDF",
+                descricao="Bloco em circulação",
+            )
+        ]
+        self.block_documents_map = {
+            "871299": [
+                BlockDocument(
+                    seq="1",
+                    processo="08810254.000117/2026-62",
+                    documento_id="48783191",
+                    tipo_documento="Despacho",
+                    assinante="LEO ZENON TASSI / 2º Tenente QOEM BM",
+                    numero_sei="40381240",
+                    numero_documento="40381240",
+                    assinado=False,
+                )
+            ]
+        }
+
+
+class RefreshBlockClient(DisponibilizedBlockClient):
+    def cancel_disponibilizacao_block(self, block_numero: str) -> dict[str, Any]:
+        return self.cancelar_disponibilizacao_block(block_numero)
+
+
+def test_signature_block_recall_preview_for_received_block() -> None:
+    result = signature_block_recall_preview(FakeClient(), "774681")
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-recall-preview"
+    assert result["data"]["mutation_preview"]["action"] == "devolver"
+    assert any("Recebido" in warning for warning in result["warnings"])
+
+
+def test_signature_block_recall_preview_for_disponibilized_block() -> None:
+    result = signature_block_recall_preview(DisponibilizedBlockClient(), "871299")
+
+    assert result["ok"] is True
+    assert result["data"]["mutation_preview"]["action"] == "cancelar_disponibilizacao"
+    assert result["warnings"] == []
+
+
+def test_signature_block_recall_confirm_for_received_block() -> None:
+    client = FakeClient()
+    result = signature_block_recall_confirm(client, "774681", confirm=True)
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-recall-confirm"
+    assert client.last_block_recall == {"block_numero": "774681", "action": "devolver"}
+    assert result["data"]["mutation"]["action"] == "devolver"
+
+
+def test_signature_block_recall_confirm_for_disponibilized_block() -> None:
+    client = DisponibilizedBlockClient()
+    result = signature_block_recall_confirm(client, "871299", confirm=True)
+
+    assert result["ok"] is True
+    assert client.last_block_recall == {"block_numero": "871299", "action": "cancelar_disponibilizacao"}
+    assert result["data"]["verification"]["state_after"] == "Gerado"
+
+
+def test_signature_block_recall_confirm_requires_confirmation() -> None:
+    result = signature_block_recall_confirm(FakeClient(), "774681")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
+
+
+def test_signature_block_refresh_preview_contract() -> None:
+    result = signature_block_refresh_preview(
+        DisponibilizedBlockClient(),
+        "871299",
+        add_document_ids=["39860250"],
+        remove_document_ids=["40381240"],
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-refresh-preview"
+    assert result["data"]["mutation_preview"]["recall_required"] is True
+    assert result["data"]["mutation_preview"]["documents_to_add"] == ["39860250"]
+    assert result["data"]["mutation_preview"]["documents_to_remove"] == ["40381240"]
+
+
+def test_signature_block_refresh_confirm_contract() -> None:
+    client = RefreshBlockClient()
+    result = signature_block_refresh_confirm(
+        client,
+        "871299",
+        add_document_ids=["39860250"],
+        remove_document_ids=["40381240"],
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "signature-block-refresh-confirm"
+    assert result["data"]["mutation"]["recall"]["action"] == "cancelar_disponibilizacao"
+    assert result["data"]["mutation"]["removed"]
+    assert result["data"]["mutation"]["added"]
+    assert result["data"]["mutation"]["redisponibilizacao"]["message"]
+
+
+def test_signature_block_refresh_confirm_uses_created_document_log(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sei_cli.operations.writing.load_created_documents",
+        lambda: [
+            {
+                "id_documento": "48784646",
+                "id_procedimento": "48756457",
+                "numero_documento": "48784646",
+            }
+        ],
+    )
+    client = RefreshBlockClient()
+    result = signature_block_refresh_confirm(
+        client,
+        "871299",
+        add_document_ids=["48784646"],
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["mutation"]["added"][0]["resolved_id_documento"] == "48784646"
+    assert client.last_block_add is not None
+    assert client.last_block_add["id_procedimento"] == "48756457"
+    assert client.last_block_add["id_documento"] == "48784646"
+
+
+def test_signature_block_refresh_confirm_requires_confirmation() -> None:
+    result = signature_block_refresh_confirm(
+        DisponibilizedBlockClient(),
+        "871299",
+        add_document_ids=["39860250"],
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
 
 
 def test_signature_block_add_document_confirm_contract() -> None:
@@ -1832,6 +2164,72 @@ def test_relatorio_read_cli_json(monkeypatch) -> None:
     assert payload["data"]["relatorio"]["fiscal"] == "João Silva"
 
 
+def test_marker_catalog_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["marker-catalog", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "marker-catalog"
+
+
+def test_process_marker_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["process-marker-preview", "47607237", "--marker", "12", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-marker-preview"
+
+
+def test_process_marker_set_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-marker-set-confirm",
+            "47607237",
+            "--marker",
+            "12",
+            "--texto",
+            "Processo apenas informativo.",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-marker-set-confirm"
+
+
+def test_process_marker_remove_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["process-marker-remove-confirm", "47607237", "--confirm", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-marker-remove-confirm"
+
+
 def test_signature_block_list_cli_json(monkeypatch) -> None:
     monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
 
@@ -1904,6 +2302,36 @@ def test_signature_block_add_document_confirm_cli_json(monkeypatch) -> None:
     assert payload["ok"] is True
     assert payload["operation"] == "signature-block-add-document-confirm"
     assert payload["resolved_ids"]["id_documento"] == "48568468"
+
+
+def test_signature_block_recall_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["signature-block-recall-preview", "774681", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "signature-block-recall-preview"
+
+
+def test_signature_block_recall_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["signature-block-recall-confirm", "774681", "--confirm", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "signature-block-recall-confirm"
 
 
 def test_signature_block_sign_preview_cli_json(monkeypatch) -> None:
