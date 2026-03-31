@@ -84,6 +84,25 @@ def test_parse_marcadores_list() -> None:
     assert marcadores[0].cor == "marcador_preto"
 
 
+def test_parse_marcadores_list_ignores_numeric_id_column_as_description() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr class="infraTrClara">
+          <td><input type="checkbox" value="66588"/></td>
+          <td><img src="svg/marcador_ciano.svg?18"/></td>
+          <td>Informações</td>
+          <td>66588</td>
+        </tr>
+      </table>
+    </body></html>
+    """
+    marcadores = parse_marcadores_list(html, BASE)
+    assert len(marcadores) == 1
+    assert marcadores[0].nome == "Informações"
+    assert marcadores[0].descricao == ""
+
+
 def test_parse_marcador_form() -> None:
     html = """
     <html><body>

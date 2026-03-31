@@ -788,8 +788,19 @@ def parse_marcadores_list(content: str, base_url: str) -> list[Marcador]:
             if mid:
                 marcador_id = marcador_id or mid
 
-        nome = _norm(tds[1].text_content())
-        descricao = _norm(tds[2].text_content()) if len(tds) > 2 else ""
+        # Column layout may vary. In the real SEI layout the numeric marker ID
+        # may appear as a visible column, so we should avoid treating a pure
+        # numeric cell as descrição.
+        nome = ""
+        descricao = ""
+        for idx, td in enumerate(tds):
+            text = _norm(td.text_content())
+            if text and idx > 0:
+                if not nome and not text.isdigit():
+                    nome = text
+                elif not descricao and not text.isdigit():
+                    descricao = text
+                    break
         cor = None
         img = row.xpath(".//img[@src]/@src")
         if img:

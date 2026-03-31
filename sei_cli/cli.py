@@ -17,17 +17,25 @@ from sei_cli.operations import (
     document_create_preview as op_document_create_preview,
     document_edit_confirm as op_document_edit_confirm,
     document_edit_preview as op_document_edit_preview,
+    document_pdf_confirm as op_document_pdf_confirm,
+    document_pdf_preview as op_document_pdf_preview,
     document_quality_check as op_document_quality_check,
     document_read as op_document_read,
     inbox_snapshot as op_inbox_snapshot,
     marker_catalog as op_marker_catalog,
     process_create_confirm as op_process_create_confirm,
     process_create_preview as op_process_create_preview,
+    process_pdf_confirm as op_process_pdf_confirm,
+    process_pdf_preview as op_process_pdf_preview,
+    process_marker_history as op_process_marker_history,
     process_marker_preview as op_process_marker_preview,
+    process_marker_read as op_process_marker_read,
     process_marker_remove_confirm as op_process_marker_remove_confirm,
     process_marker_remove_preview as op_process_marker_remove_preview,
     process_marker_set_confirm as op_process_marker_set_confirm,
     process_marker_set_preview as op_process_marker_set_preview,
+    process_marker_update_confirm as op_process_marker_update_confirm,
+    process_marker_update_preview as op_process_marker_update_preview,
     process_open as op_process_open,
     process_read as op_process_read,
     process_report as op_process_report,
@@ -1382,6 +1390,25 @@ def process_marker_preview_cmd(
     _emit_operation_result(result, as_json)
 
 
+@cli.command("process-marker-read")
+@click.argument("numero_ou_id")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_marker_read_cmd(numero_ou_id: str, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_process_marker_read(client, numero_ou_id)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-marker-history")
+@click.argument("numero_ou_id")
+@click.option("--marker", default=None, help="ID ou nome do marcador")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_marker_history_cmd(numero_ou_id: str, marker: str | None, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_process_marker_history(client, numero_ou_id, marker=marker)
+    _emit_operation_result(result, as_json)
+
+
 @cli.command("process-marker-set-preview")
 @click.argument("numero_ou_id")
 @click.option("--marker", required=True, help="ID ou nome do marcador")
@@ -1453,20 +1480,62 @@ def process_marker_set_confirm_cmd(
 
 @cli.command("process-marker-remove-preview")
 @click.argument("numero_ou_id")
+@click.option("--marker", default=None, help="ID ou nome do marcador a remover")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
-def process_marker_remove_preview_cmd(numero_ou_id: str, as_json: bool) -> None:
+def process_marker_remove_preview_cmd(numero_ou_id: str, marker: str | None, as_json: bool) -> None:
     with SEIClient() as client:
-        result = op_process_marker_remove_preview(client, numero_ou_id)
+        result = op_process_marker_remove_preview(client, numero_ou_id, marker=marker)
     _emit_operation_result(result, as_json)
 
 
 @cli.command("process-marker-remove-confirm")
 @click.argument("numero_ou_id")
+@click.option("--marker", default=None, help="ID ou nome do marcador a remover")
 @click.option("--confirm", is_flag=True, help="Confirma a remoção do marcador")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
-def process_marker_remove_confirm_cmd(numero_ou_id: str, confirm: bool, as_json: bool) -> None:
+def process_marker_remove_confirm_cmd(numero_ou_id: str, marker: str | None, confirm: bool, as_json: bool) -> None:
     with SEIClient() as client:
-        result = op_process_marker_remove_confirm(client, numero_ou_id, confirm=confirm)
+        result = op_process_marker_remove_confirm(client, numero_ou_id, marker=marker, confirm=confirm)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-marker-update-preview")
+@click.argument("numero_ou_id")
+@click.option("--marker", default=None, help="ID ou nome do marcador a alterar")
+@click.option("--texto", default=None, help="Novo texto do marcador")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_marker_update_preview_cmd(
+    numero_ou_id: str,
+    marker: str | None,
+    texto: str | None,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_marker_update_preview(client, numero_ou_id, marker=marker, texto=texto)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-marker-update-confirm")
+@click.argument("numero_ou_id")
+@click.option("--marker", default=None, help="ID ou nome do marcador a alterar")
+@click.option("--texto", required=True, help="Novo texto do marcador")
+@click.option("--confirm", is_flag=True, help="Confirma a alteração do marcador")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_marker_update_confirm_cmd(
+    numero_ou_id: str,
+    marker: str | None,
+    texto: str,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_marker_update_confirm(
+            client,
+            numero_ou_id,
+            marker=marker,
+            texto=texto,
+            confirm=confirm,
+        )
     _emit_operation_result(result, as_json)
 
 
@@ -1721,6 +1790,77 @@ def document_edit_confirm_cmd(
 def document_quality_check_cmd(numero_ou_id: str, process_id: str | None, as_json: bool) -> None:
     with SEIClient() as client:
         result = op_document_quality_check(client, numero_ou_id, process_id=process_id)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-pdf-preview")
+@click.argument("numero_ou_id")
+@click.option("-o", "--output", default=None, help="Caminho local do PDF")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_pdf_preview_cmd(numero_ou_id: str, output: str | None, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_process_pdf_preview(client, numero_ou_id, output_path=output)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-pdf-confirm")
+@click.argument("numero_ou_id")
+@click.option("-o", "--output", default=None, help="Caminho local do PDF")
+@click.option("--confirm", is_flag=True, help="Confirma a geração do PDF")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_pdf_confirm_cmd(
+    numero_ou_id: str,
+    output: str | None,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_pdf_confirm(client, numero_ou_id, output_path=output, confirm=confirm)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("document-pdf-preview")
+@click.argument("numero_ou_id")
+@click.option("--process-id", default=None, help="ID interno do processo")
+@click.option("-o", "--output", default=None, help="Caminho local do PDF")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def document_pdf_preview_cmd(
+    numero_ou_id: str,
+    process_id: str | None,
+    output: str | None,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_document_pdf_preview(
+            client,
+            numero_ou_id,
+            process_id=process_id,
+            output_path=output,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("document-pdf-confirm")
+@click.argument("numero_ou_id")
+@click.option("--process-id", default=None, help="ID interno do processo")
+@click.option("-o", "--output", default=None, help="Caminho local do PDF")
+@click.option("--confirm", is_flag=True, help="Confirma a geração do PDF")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def document_pdf_confirm_cmd(
+    numero_ou_id: str,
+    process_id: str | None,
+    output: str | None,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_document_pdf_confirm(
+            client,
+            numero_ou_id,
+            process_id=process_id,
+            output_path=output,
+            confirm=confirm,
+        )
     _emit_operation_result(result, as_json)
 
 

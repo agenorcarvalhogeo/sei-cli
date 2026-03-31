@@ -3733,33 +3733,312 @@ class SEIClient:
         # or shows the form again (error)
         return marcador_id in r_save.text or 'andamento_marcador_gerenciar' in str(r_save.url)
 
-    def remove_marcador(self, id_procedimento: str) -> bool:
-        """Remove marker from a process."""
-        rp = self._navigate_process_page(id_procedimento)
-        rm_url = self._extract_action_url(rp.text, "andamento_marcador_remover")
-        if not rm_url:
-            control_html = self._ensure_control()
-            rm_url = self._extract_action_url(control_html, "andamento_marcador_remover")
-        if not rm_url:
-            raise RuntimeError("Ação de remoção de marcador não encontrada")
+    def remove_marcador(self, id_procedimento: str, marcador_id: str | None = None) -> bool:
+        """Remove marker from a process.
 
-        rr = self._get(rm_url)
-        rsoup = BeautifulSoup(rr.text, "lxml")
-        form = rsoup.find("form")
-        if form:
-            action = urljoin(str(rr.url), form.get("action", ""))
-            data: dict[str, str] = {}
-            for inp in form.find_all("input"):
-                n = inp.get("name", "")
-                if n:
-                    data[n] = inp.get("value", "")
-            rr = self._post(action, data)
+        SEI's removal flow uses the ``frmGerenciarMarcador`` form on the
+        ``andamento_marcador_gerenciar`` page.  The JS ``acaoRemover()`` sets
+        ``hdnInfraItemId`` to the marker ID, changes the form action to
+        ``andamento_marcador_remover``, and submits.  We replicate that here.
+        """
+        self._navigate_process_page(id_procedimento)
+        control_html = self._ensure_control()
 
+        # Find the gerenciar URL specific to this process.
+        ger_url = None
+        for m in re.finditer(
+            r'controlador\.php\?acao=andamento_marcador_gerenciar[^"]*'
+            r'id_procedimento=' + re.escape(id_procedimento) + r'[^"]*',
+            control_html,
+        ):
+            ger_url = urljoin(self._sei_url(""), m.group().replace("&amp;", "&"))
+            break
+        if not ger_url:
+            raise RuntimeError(
+                "Processo não possui marcador para remover "
+                f"(andamento_marcador_gerenciar para {id_procedimento} não encontrado)"
+            )
+
+        rr = self._get(ger_url)
+        soup = BeautifulSoup(rr.text, "lxml")
+        form = soup.find("form", id="frmGerenciarMarcador")
+        if not form:
+            raise RuntimeError("Formulário frmGerenciarMarcador não encontrado")
+
+        # Extract the remove action URL from JS: acaoRemover sets form.action
+        rm_action_match = re.search(
+            r"acaoRemover.*?action='([^']+)'", rr.text, re.DOTALL
+        )
+        if not rm_action_match:
+            raise RuntimeError("URL de remoção não encontrada no JS acaoRemover")
+        rm_action = urljoin(self._sei_url(""), rm_action_match.group(1).replace("&amp;", "&"))
+
+        # Find the marker checkbox to remove. If marcador_id is not provided,
+        # preserve current behavior and remove the first available marker.
+        checkbox = None
+        if marcador_id:
+            checkbox = form.find("input", {"type": "checkbox", "value": marcador_id})
+            if checkbox is None:
+                raise RuntimeError(
+                    f"Marcador {marcador_id} não encontrado no formulário de gerenciamento"
+                )
+        if checkbox is None:
+            checkbox = form.find("input", {"type": "checkbox"})
+        if not checkbox:
+            raise RuntimeError("Nenhum marcador encontrado no formulário de gerenciamento")
+        marker_id = checkbox.get("value", "")
+
+        # Build form data
+        data: dict[str, str] = {}
+        for inp in form.find_all("input"):
+            n = inp.get("name", "")
+            if n:
+                data[n] = inp.get("value", "")
+        data["hdnInfraItemId"] = marker_id
+
+        rr_post = self._post(rm_action, data)
         self._control_html = None
-        lower = rr.text.lower()
-        if "erro" in lower or "falha" in lower:
-            return False
-        return True
+
+        # Verify: the response should be the gerenciar page with 0 markers,
+        # or the URL should contain resultado=1.
+        if "resultado=1" in str(rr_post.url):
+            return True
+        # Fallback: check if marker still in gerenciar page
+        soup_resp = BeautifulSoup(rr_post.text, "lxml")
+        form_resp = soup_resp.find("form", id="frmGerenciarMarcador")
+        if form_resp and not form_resp.find("input", {"type": "checkbox"}):
+            return True
+        return False
+
+    def _get_process_marker_manage_page(
+        self,
+        id_procedimento: str,
+    ) -> tuple[str, BeautifulSoup, Any]:
+        self._navigate_process_page(id_procedimento)
+        control_html = self._ensure_control()
+
+        ger_url = None
+        for m in re.finditer(
+            r'controlador\.php\?acao=andamento_marcador_gerenciar[^"]*'
+            r'id_procedimento=' + re.escape(id_procedimento) + r'[^"]*',
+            control_html,
+        ):
+            ger_url = urljoin(self._sei_url(""), m.group().replace("&amp;", "&"))
+            break
+        if not ger_url:
+            raise RuntimeError(
+                "Processo não expôs ação de gerenciamento de marcador "
+                f"para {id_procedimento}"
+            )
+
+        rr = self._get(ger_url)
+        soup = BeautifulSoup(rr.text, "lxml")
+        form = soup.find("form", id="frmGerenciarMarcador")
+        if not form:
+            raise RuntimeError("Formulário frmGerenciarMarcador não encontrado")
+        return rr.text, soup, form
+
+    @staticmethod
+    def _extract_marker_manage_action(content: str, action_name: str) -> str | None:
+        base = "https://sei.rn.gov.br/sei/"
+        patterns = [
+            rf"{re.escape(action_name)}.*?action='([^']+)'",
+            rf"{re.escape(action_name)}.*?action=\"([^\"]+)\"",
+            rf"acao=.*?andamento_marcador_{re.escape(action_name.lower().replace('acao', ''))}[^\"']+",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content, re.DOTALL)
+            if not match:
+                continue
+            value = match.group(1) if match.groups() else match.group(0)
+            return urljoin(base, value.replace("&amp;", "&"))
+        return None
+
+    @staticmethod
+    def _collect_marker_row_texts(row: Any) -> list[str]:
+        texts: list[str] = []
+        for chunk in row.stripped_strings:
+            value = " ".join(str(chunk).split()).strip()
+            if not value:
+                continue
+            if value not in texts:
+                texts.append(value)
+        return texts
+
+    def list_process_markers(self, id_procedimento: str) -> list[dict[str, Any]]:
+        try:
+            content, _soup, form = self._get_process_marker_manage_page(id_procedimento)
+        except RuntimeError:
+            # No marker management action available → process has no markers.
+            return []
+        history_action = self._extract_marker_manage_action(content, "acaoHistorico")
+        alter_action = self._extract_marker_manage_action(content, "acaoAlterar")
+        items: list[dict[str, Any]] = []
+
+        for checkbox in form.find_all("input", {"type": "checkbox"}):
+            marker_id = (checkbox.get("value") or "").strip()
+            if not marker_id:
+                continue
+            row = checkbox.find_parent("tr")
+            texts = self._collect_marker_row_texts(row or form)
+            texts = [item for item in texts if item != marker_id]
+            nome = texts[0] if texts else None
+            texto = texts[1] if len(texts) > 1 else ""
+            items.append(
+                {
+                    "marcador_id": marker_id,
+                    "id": marker_id,
+                    "nome": nome,
+                    "texto": texto,
+                    "history_url": history_action,
+                    "edit_url": alter_action,
+                }
+            )
+        return items
+
+    def update_marcador(
+        self,
+        id_procedimento: str,
+        marcador_id: str,
+        texto: str,
+    ) -> bool:
+        content, soup, form = self._get_process_marker_manage_page(id_procedimento)
+        checkbox = form.find("input", {"type": "checkbox", "value": marcador_id})
+        if checkbox is None:
+            raise RuntimeError(
+                f"Marcador {marcador_id} não encontrado no formulário de gerenciamento"
+            )
+
+        # The alterar URL is an <a href> on the gerenciar page, NOT a JS form action.
+        alter_url = None
+        pattern = (
+            r'controlador\.php\?acao=andamento_marcador_alterar[^"]*'
+            r'id_marcador=' + re.escape(marcador_id) + r'[^"]*'
+        )
+        match = re.search(pattern, content)
+        if match:
+            alter_url = urljoin(self._sei_url(""), match.group().replace("&amp;", "&"))
+        if not alter_url:
+            raise RuntimeError("URL de alteração não encontrada para marcador " + marcador_id)
+
+        rr_edit = self._get(alter_url)
+        soup_edit = BeautifulSoup(rr_edit.text, "lxml")
+        edit_form = soup_edit.find("form", id="frmAndamentoMarcadorCadastro")
+        if not edit_form:
+            raise RuntimeError("Formulário de alteração do marcador não encontrado")
+
+        action_attr = edit_form.get("action")
+        if not action_attr:
+            raise RuntimeError("Formulário de alteração sem action")
+        save_url = urljoin(self._sei_url(""), action_attr)
+
+        data: dict[str, str] = {}
+        for inp in edit_form.find_all("input"):
+            name = inp.get("name", "")
+            if name:
+                data[name] = inp.get("value", "")
+        for area in edit_form.find_all("textarea"):
+            name = area.get("name", "")
+            if name:
+                data[name] = area.text or ""
+        select = edit_form.find("select", {"name": "selMarcador"})
+        if select is not None:
+            selected = select.find("option", selected=True) or select.find("option", {"value": marcador_id})
+            if selected is not None:
+                data["selMarcador"] = selected.get("value", marcador_id)
+        data["hdnIdMarcador"] = marcador_id
+        data["txaTexto"] = texto
+        data["sbmSalvar"] = data.get("sbmSalvar") or "Salvar"
+
+        rr_save = self._post(save_url, data)
+        self._control_html = None
+        if "andamento_marcador_gerenciar" in str(rr_save.url):
+            return True
+        return texto.strip() in rr_save.text
+
+    def marker_history(
+        self,
+        id_procedimento: str,
+        marcador_id: str | None = None,
+    ) -> list[dict[str, str]]:
+        content, soup, form = self._get_process_marker_manage_page(id_procedimento)
+
+        # The history page is accessed via the "Listar" button which navigates to
+        # andamento_marcador_listar (a location.href redirect, not a JS function).
+        listar_url = None
+        match = re.search(
+            r"controlador\.php\?acao=andamento_marcador_listar[^'\"]+",
+            content,
+        )
+        if match:
+            listar_url = urljoin(self._sei_url(""), match.group().replace("&amp;", "&"))
+        if not listar_url:
+            raise RuntimeError(
+                "URL de histórico (andamento_marcador_listar) não encontrada "
+                f"para processo {id_procedimento}"
+            )
+
+        rr = self._get(listar_url)
+        soup_history = BeautifulSoup(rr.text, "lxml")
+        entries: list[dict[str, str]] = []
+
+        # Columns: Data/Hora | Usuário | Operação | Marcador | Texto
+        for row in soup_history.find_all("tr"):
+            tds = row.find_all("td")
+            if len(tds) < 4:
+                continue
+            texts = [td.get_text(strip=True) for td in tds]
+            # Skip header row
+            lower = " ".join(texts).casefold()
+            if "data" in lower and ("usuario" in lower or "usuário" in lower):
+                continue
+
+            timestamp = texts[0]
+            usuario = texts[1] if len(texts) > 1 else ""
+            acao_raw = texts[2] if len(texts) > 2 else ""
+            marcador_nome = texts[3] if len(texts) > 3 else ""
+            marker_text = texts[4] if len(texts) > 4 else ""
+
+            # Filter by marcador_id: resolve id → name from current markers
+            if marcador_id:
+                checkbox = form.find("input", {"type": "checkbox", "value": marcador_id})
+                if checkbox:
+                    row_el = checkbox.find_parent("tr")
+                    if row_el:
+                        row_texts = self._collect_marker_row_texts(row_el)
+                        target_name = next(
+                            (t for t in row_texts if t and not t.isdigit()),
+                            "",
+                        )
+                        if target_name and marcador_nome != target_name:
+                            continue
+
+            # Parse operation code
+            acao_map = {"I": "Inclusão", "A": "Alteração", "R": "Remoção"}
+            acao = acao_map.get(acao_raw.strip(), acao_raw)
+
+            date_only = ""
+            time_only = ""
+            ts_match = re.match(
+                r"(\d{2}/\d{2}/\d{4})(?:\s+(\d{2}:\d{2}(?::\d{2})?))?", timestamp
+            )
+            if ts_match:
+                date_only = ts_match.group(1) or ""
+                time_only = ts_match.group(2) or ""
+
+            entry = {
+                "data": timestamp,
+                "data_only": date_only,
+                "hora": time_only,
+                "usuario": usuario,
+                "acao": acao,
+                "acao_raw": acao_raw.strip(),
+                "marcador": marcador_nome,
+                "marker_text": marker_text,
+                "raw_columns": texts,
+            }
+            entries.append(entry)
+        return entries
 
     # --- Document creation & editing ---
 

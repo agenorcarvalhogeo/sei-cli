@@ -1587,34 +1587,51 @@ def _resolve_marker_reference(markers: list[dict[str, Any]], marker_ref: str | N
 
 
 def _build_marker_suggested_text(summary_data: dict[str, Any]) -> str:
-    summary = (summary_data.get("summary") or "").strip()
-    if summary:
-        return summary
-
+    process_data = summary_data.get("processo") or {}
     parts: list[str] = []
     process_kind = summary_data.get("process_kind_guess")
-    if process_kind:
-        parts.append(f"Processo classificado como {process_kind}.")
+    process_type = process_data.get("tipo")
+    if process_type:
+        parts.append(process_type)
+    elif process_kind:
+        parts.append(str(process_kind).replace("_", " "))
     involved = summary_data.get("involved_military") or []
     if involved:
         names = ", ".join(
             person.get("display_name") or person.get("name") or ""
-            for person in involved[:3]
+            for person in involved[:2]
             if person.get("display_name") or person.get("name")
         )
         if names:
-            parts.append(f"Militares envolvidos: {names}.")
+            parts.append(names)
     deadlines = summary_data.get("deadlines") or []
     if deadlines:
-        parts.append(f"Prazo(s): {', '.join(deadlines[:2])}.")
+        parts.append(f"prazo {', '.join(deadlines[:1])}")
     if summary_data.get("action_required"):
         action_kind = summary_data.get("dominant_action_kind") or "manifestacao"
-        parts.append(f"Exige providencia do usuario: {action_kind}.")
+        parts.append(f"aguarda {action_kind}")
     elif summary_data.get("requires_response"):
-        parts.append("Processo demanda resposta do usuario.")
+        parts.append("demanda resposta")
     elif summary_data.get("information_only"):
-        parts.append("Processo aparenta ser apenas informativo.")
-    return " ".join(parts).strip()
+        parts.append("somente informação")
+
+    short = " — ".join(part.strip(" .") for part in parts if part).strip()
+    if short:
+        return short
+
+    summary = " ".join((summary_data.get("summary") or "").split()).strip()
+    if summary:
+        return summary[:180].rstrip(" .,;") + ("..." if len(summary) > 180 else "")
+    return ""
+
+
+def _list_process_markers(client: Any, id_procedimento: str) -> list[dict[str, Any]]:
+    if not hasattr(client, "list_process_markers"):
+        return []
+    return [
+        _normalize_marker_item(item) | {"texto": item.get("texto", "")}
+        for item in client.list_process_markers(id_procedimento)
+    ]
 
 
 def marker_catalog(client: Any) -> dict[str, Any]:
@@ -1673,6 +1690,7 @@ def process_marker_preview(
     summary_data = base_result["data"]
     marker_text = (suggested_text or "").strip() or _build_marker_suggested_text(summary_data)
     process_data = summary_data.get("processo", {})
+    current_markers = _list_process_markers(client, base_result["resolved_ids"]["id_procedimento"])
     current_marker = process_data.get("marcador")
 
     return _result(
@@ -1683,6 +1701,7 @@ def process_marker_preview(
             "processo": process_data,
             "preflight": summary_data.get("preflight", {}),
             "current_marker": current_marker,
+            "current_markers": current_markers,
             "summary": summary_data.get("summary"),
             "action_items": summary_data.get("action_items", []),
             "requires_response": summary_data.get("requires_response"),
@@ -1706,6 +1725,121 @@ def process_marker_preview(
         ],
         warnings=warnings,
     )
+
+
+def process_marker_read(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    mode: str = "summary",
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sample_size: int = 3,
+) -> dict[str, Any]:
+    operation = "process-marker-read"
+    base_result = process_marker_preview(
+        client,
+        numero_ou_id,
+        mode=mode,
+        date_from=date_from,
+        date_to=date_to,
+        sample_size=sample_size,
+    )
+    if not base_result["ok"]:
+        base_result["operation"] = operation
+        return base_result
+
+    current_markers = base_result["data"].get("current_markers", [])
+    return _result(
+        operation=operation,
+        context=base_result["context"],
+        resolved_ids=base_result["resolved_ids"],
+        data={
+            "processo": base_result["data"].get("processo"),
+            "preflight": base_result["data"].get("preflight"),
+            "current_marker": base_result["data"].get("current_marker"),
+            "current_markers_total": len(current_markers),
+            "current_markers": current_markers,
+            "available_markers_total": base_result["data"].get("available_markers_total"),
+            "available_markers": base_result["data"].get("available_markers"),
+            "summary": base_result["data"].get("summary"),
+        },
+        next_actions=[
+            NextAction(
+                action="process-marker-history",
+                label="Ler histórico de marcador do processo",
+                params={"numero_ou_id": base_result["resolved_ids"].get("id_procedimento") or numero_ou_id},
+            ),
+            NextAction(
+                action="process-marker-update-preview",
+                label="Preparar alteração do texto de um marcador existente",
+                params={"numero_ou_id": base_result["resolved_ids"].get("id_procedimento") or numero_ou_id},
+            ),
+        ],
+        warnings=base_result.get("warnings", []),
+    )
+
+
+def process_marker_history(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    marker: str | None = None,
+) -> dict[str, Any]:
+    operation = "process-marker-history"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        id_procedimento, numero_processo = _resolve_process_id(client, numero_ou_id)
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id,
+        }
+        current_markers = _list_process_markers(client, id_procedimento)
+        selected_marker = _resolve_marker_reference(current_markers, marker)
+        if marker and not selected_marker:
+            raise ProcessNotFoundError(f"Marcador '{marker}' não encontrado no processo.")
+        entries = client.marker_history(
+            id_procedimento,
+            marcador_id=(selected_marker or {}).get("marcador_id"),
+        )
+        users = sorted({item.get("usuario") for item in entries if item.get("usuario")})
+        actions = sorted({item.get("acao") for item in entries if item.get("acao")})
+        latest_entry = entries[0] if entries else None
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "selected_marker": selected_marker,
+                "current_markers_total": len(current_markers),
+                "current_markers": current_markers,
+                "history_total": len(entries),
+                "history": entries,
+                "history_summary": {
+                    "users": users,
+                    "actions": actions,
+                    "latest_entry": latest_entry,
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="process-marker-update-preview",
+                    label="Preparar alteração do texto do marcador",
+                    params={
+                        "numero_ou_id": id_procedimento,
+                        "marker": (selected_marker or {}).get("marcador_id"),
+                    },
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
 
 
 def process_report(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from pathlib import Path
 import re
 from typing import Any
 
@@ -15,12 +16,15 @@ from .errors import UnsupportedStateError, WorkflowViolationError
 from .reading import (
     _context,
     _error_result,
+    _list_process_markers,
     _normalize_marker_item,
     _process_unit_preflight,
+    _resolve_document_id_with_process,
     _resolve_document_ids,
     _resolve_marker_reference,
     _resolve_process_id,
     _result,
+    process_marker_read,
     process_marker_preview,
 )
 
@@ -117,6 +121,36 @@ def _build_access_policy(
         "requires_hypothesis": nivel_codigo != "0",
     }
     return policy, warnings
+
+
+def _default_process_pdf_path(id_procedimento: str, output_path: str | None) -> str:
+    return output_path or f"/tmp/sei_{id_procedimento}.pdf"
+
+
+def _default_document_pdf_path(id_documento: str, output_path: str | None) -> str:
+    return output_path or f"/tmp/sei_doc_{id_documento}.pdf"
+
+
+def _resolve_process_marker(
+    client: Any,
+    id_procedimento: str,
+    marker: str | None,
+) -> dict[str, Any]:
+    current_markers = _list_process_markers(client, id_procedimento)
+    selected_marker = _resolve_marker_reference(current_markers, marker)
+    if marker and not selected_marker:
+        raise WorkflowViolationError(
+            f"Marcador '{marker}' não encontrado no processo.",
+            details={"id_procedimento": id_procedimento, "marker": marker},
+        )
+    if not selected_marker and current_markers:
+        selected_marker = current_markers[0]
+    if not selected_marker:
+        raise WorkflowViolationError(
+            "Processo não possui marcador gerenciável no momento.",
+            details={"id_procedimento": id_procedimento},
+        )
+    return selected_marker
 
 
 def _resolve_requested_access_level(value: str) -> str | None:
@@ -1215,6 +1249,368 @@ def document_edit_confirm(
         )
 
 
+def process_marker_update_preview(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    marker: str | None = None,
+    texto: str | None = None,
+) -> dict[str, Any]:
+    operation = "process-marker-update-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        read_result = process_marker_read(client, numero_ou_id)
+        if not read_result.get("ok"):
+            read_result["operation"] = operation
+            return read_result
+        id_procedimento = read_result["resolved_ids"]["id_procedimento"]
+        resolved_ids = dict(read_result["resolved_ids"])
+        selected_marker = _resolve_process_marker(client, id_procedimento, marker)
+        suggested_text = (texto or "").strip() or selected_marker.get("texto") or ""
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "processo": read_result["data"].get("processo"),
+                "selected_marker": selected_marker,
+                "current_markers_total": read_result["data"].get("current_markers_total"),
+                "current_markers": read_result["data"].get("current_markers"),
+                "mutation_preview": {
+                    "marcador_id": selected_marker.get("marcador_id"),
+                    "current_text": selected_marker.get("texto") or "",
+                    "new_text": suggested_text,
+                },
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-marker-update-confirm",
+                    label="Alterar o texto do marcador do processo",
+                    params={
+                        "numero_ou_id": id_procedimento,
+                        "marker": selected_marker.get("marcador_id"),
+                        "texto": suggested_text,
+                    },
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_marker_update_confirm(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    marker: str | None = None,
+    texto: str = "",
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-marker-update-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para alterar o texto do marcador.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = process_marker_update_preview(client, numero_ou_id, marker=marker, texto=texto)
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+        selected_marker = preview["data"]["selected_marker"]
+        new_text = preview["data"]["mutation_preview"]["new_text"]
+        id_procedimento = preview["resolved_ids"]["id_procedimento"]
+        resolved_ids = dict(preview["resolved_ids"])
+        applied = client.update_marcador(
+            id_procedimento,
+            selected_marker["marcador_id"],
+            new_text,
+        )
+        if not applied:
+            raise WorkflowViolationError(
+                "SEI não confirmou a alteração do texto do marcador.",
+                details={
+                    "id_procedimento": id_procedimento,
+                    "marcador_id": selected_marker["marcador_id"],
+                },
+            )
+        return _result(
+            operation=operation,
+            context=preview["context"],
+            resolved_ids=resolved_ids,
+            data={
+                "selected_marker": selected_marker,
+                "mutation": {
+                    "applied": True,
+                    "marcador_id": selected_marker["marcador_id"],
+                    "new_text": new_text,
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="process-marker-read",
+                    label="Rever marcadores do processo",
+                    params={"numero_ou_id": id_procedimento},
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_pdf_preview(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    operation = "process-pdf-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        id_procedimento, numero_processo = _resolve_process_id(client, numero_ou_id)
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        process_data = None
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            process_result = process_marker_read(client, id_procedimento)
+            if process_result.get("ok"):
+                process_data = process_result["data"].get("processo")
+                numero_processo = numero_processo or process_result["resolved_ids"].get("numero_processo")
+        target_path = _default_process_pdf_path(id_procedimento, output_path)
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id,
+        }
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "processo": process_data,
+                "preflight": preflight,
+                "download_preview": {
+                    "kind": "process_pdf",
+                    "output_path": target_path,
+                    "will_overwrite": Path(target_path).exists(),
+                },
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-pdf-confirm",
+                    label="Gerar PDF do processo",
+                    params={"numero_ou_id": id_procedimento, "output_path": target_path},
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_pdf_confirm(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    output_path: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-pdf-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para gerar PDF do processo.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = process_pdf_preview(client, numero_ou_id, output_path=output_path)
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+        id_procedimento = preview["resolved_ids"]["id_procedimento"]
+        target_path = preview["data"]["download_preview"]["output_path"]
+        path = client.download_pdf(id_procedimento, output_path=target_path)
+        file_path = Path(path)
+        resolved_ids = dict(preview["resolved_ids"])
+        return _result(
+            operation=operation,
+            context=_context(client),
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": preview["data"]["preflight"],
+                "download": {
+                    "kind": "process_pdf",
+                    "path": path,
+                    "size_bytes": file_path.stat().st_size if file_path.exists() else None,
+                },
+            },
+            next_actions=[],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def document_pdf_preview(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    process_id: str | None = None,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    operation = "document-pdf-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        if process_id:
+            id_documento, _docs = _resolve_document_id_with_process(
+                client,
+                numero_ou_id,
+                id_procedimento=process_id,
+            )
+            id_procedimento = process_id
+            numero_documento = numero_ou_id
+        else:
+            id_documento, id_procedimento, numero_documento = _resolve_document_ids(
+                client,
+                numero_ou_id,
+                id_procedimento=None,
+            )
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        document_data = None
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            read_result = __import__("sei_cli.operations.reading", fromlist=["document_read"]).document_read(
+                client,
+                id_documento,
+                id_procedimento=id_procedimento,
+            )
+            if read_result.get("ok"):
+                document_data = read_result["data"].get("documento")
+                numero_documento = numero_documento or read_result["resolved_ids"].get("numero_documento")
+        target_path = _default_document_pdf_path(id_documento, output_path)
+        resolved_ids = {
+            "id_documento": id_documento,
+            "id_procedimento": id_procedimento,
+            "numero_documento": numero_documento or numero_ou_id,
+        }
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "documento": document_data,
+                "preflight": preflight,
+                "download_preview": {
+                    "kind": "document_pdf",
+                    "output_path": target_path,
+                    "will_overwrite": Path(target_path).exists(),
+                },
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="document-pdf-confirm",
+                    label="Gerar PDF do documento",
+                    params={
+                        "numero_ou_id": id_documento,
+                        "process_id": id_procedimento,
+                        "output_path": target_path,
+                    },
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def document_pdf_confirm(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    process_id: str | None = None,
+    output_path: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "document-pdf-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para gerar PDF do documento.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = document_pdf_preview(
+            client,
+            numero_ou_id,
+            process_id=process_id,
+            output_path=output_path,
+        )
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+        id_documento = preview["resolved_ids"]["id_documento"]
+        id_procedimento = preview["resolved_ids"]["id_procedimento"]
+        target_path = preview["data"]["download_preview"]["output_path"]
+        path = client.download_document_pdf(id_documento, id_procedimento, output_path=target_path)
+        file_path = Path(path)
+        resolved_ids = dict(preview["resolved_ids"])
+        return _result(
+            operation=operation,
+            context=_context(client),
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": preview["data"]["preflight"],
+                "download": {
+                    "kind": "document_pdf",
+                    "path": path,
+                    "size_bytes": file_path.stat().st_size if file_path.exists() else None,
+                },
+            },
+            next_actions=[],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
 def signature_block_add_document_preview(
     client: Any,
     block_numero: str,
@@ -2279,18 +2675,30 @@ def process_marker_set_confirm(
         )
 
 
-def process_marker_remove_preview(client: Any, numero_ou_id: str) -> dict[str, Any]:
+def process_marker_remove_preview(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    marker: str | None = None,
+) -> dict[str, Any]:
     operation = "process-marker-remove-preview"
     try:
-        base = process_marker_preview(client, numero_ou_id)
+        base = process_marker_preview(client, numero_ou_id, marker=marker)
         if not base.get("ok"):
             base["operation"] = operation
             return base
         warnings = list(base.get("warnings", []))
+        selected_marker = base["data"].get("selected_marker")
+        current_marker = base["data"].get("current_marker")
         warnings.append(
-            "Esta canônica remove o marcador disponível pelo fluxo atual do processo; múltiplos marcadores ainda não têm gestão granular."
+            "A remoção seletiva por marcador foi priorizada; histórico e múltiplos marcadores continuam como próxima fase."
         )
-        if not base["data"].get("current_marker"):
+        if marker and not selected_marker:
+            raise WorkflowViolationError(
+                f"Marcador '{marker}' não encontrado para remoção.",
+                details={"marker": marker},
+            )
+        if not current_marker and not selected_marker:
             warnings.append("A visão atual do processo não exibe marcador associado.")
         return _result(
             operation=operation,
@@ -2298,14 +2706,18 @@ def process_marker_remove_preview(client: Any, numero_ou_id: str) -> dict[str, A
             resolved_ids=base["resolved_ids"],
             data={
                 "processo": base["data"].get("processo"),
-                "current_marker": base["data"].get("current_marker"),
+                "current_marker": current_marker,
+                "selected_marker": selected_marker,
                 "confirmation_required": True,
             },
             next_actions=[
                 NextAction(
                     action="process-marker-remove-confirm",
                     label="Remover marcador do processo",
-                    params={"numero_ou_id": base["resolved_ids"].get("id_procedimento") or numero_ou_id},
+                    params={
+                        "numero_ou_id": base["resolved_ids"].get("id_procedimento") or numero_ou_id,
+                        "marker": (selected_marker or {}).get("marcador_id") if selected_marker else marker,
+                    },
                 )
             ],
             warnings=warnings,
@@ -2323,6 +2735,7 @@ def process_marker_remove_confirm(
     client: Any,
     numero_ou_id: str,
     *,
+    marker: str | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
     operation = "process-marker-remove-confirm"
@@ -2333,16 +2746,18 @@ def process_marker_remove_confirm(
                 details={"expected_flag": "--confirm"},
             )
 
-        preview = process_marker_remove_preview(client, numero_ou_id)
+        preview = process_marker_remove_preview(client, numero_ou_id, marker=marker)
         if not preview.get("ok"):
             preview["operation"] = operation
             return preview
         process_id = preview["resolved_ids"]["id_procedimento"]
-        ok = client.remove_marcador(process_id)
+        selected_marker = preview["data"].get("selected_marker") or {}
+        marcador_id = selected_marker.get("marcador_id")
+        ok = client.remove_marcador(process_id, marcador_id=marcador_id)
         if not ok:
             raise WorkflowViolationError(
                 "SEI não confirmou a remoção do marcador do processo.",
-                details={"id_procedimento": process_id},
+                details={"id_procedimento": process_id, "marcador_id": marcador_id},
             )
 
         return _result(
@@ -2351,9 +2766,14 @@ def process_marker_remove_confirm(
             resolved_ids=preview["resolved_ids"],
             data={
                 "processo": preview["data"].get("processo"),
+                "selected_marker": selected_marker or None,
                 "mutation": {
                     "removed": True,
-                    "message": f"Marcador removido do processo {process_id}.",
+                    "message": (
+                        f"Marcador {marcador_id} removido do processo {process_id}."
+                        if marcador_id
+                        else f"Marcador removido do processo {process_id}."
+                    ),
                 },
             },
             next_actions=[

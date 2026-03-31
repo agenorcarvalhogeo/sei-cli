@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from click.testing import CliRunner
@@ -15,17 +16,25 @@ from sei_cli.operations import (
     document_create_preview,
     document_edit_confirm,
     document_edit_preview,
+    document_pdf_confirm,
+    document_pdf_preview,
     document_quality_check,
     document_read,
     inbox_snapshot,
     marker_catalog,
+    process_marker_history,
     process_create_confirm,
     process_create_preview,
+    process_pdf_confirm,
+    process_pdf_preview,
     process_marker_preview,
+    process_marker_read,
     process_marker_remove_confirm,
     process_marker_remove_preview,
     process_marker_set_confirm,
     process_marker_set_preview,
+    process_marker_update_confirm,
+    process_marker_update_preview,
     process_open,
     process_report,
     process_read,
@@ -64,6 +73,7 @@ class FakeClient:
         self.last_block_add: dict[str, Any] | None = None
         self.last_block_recall: dict[str, Any] | None = None
         self.signed_documents: list[dict[str, Any]] = []
+        self.generated_pdf_paths: list[str] = []
         self.marker_catalog = [
             {"id": "10", "nome": "LIVROS"},
             {"id": "11", "nome": "Férias / Dispensas"},
@@ -72,6 +82,16 @@ class FakeClient:
         ]
         self.process_markers: dict[str, dict[str, str]] = {
             "47607237": {"id": "11", "nome": "Férias / Dispensas", "texto": "Sd José Junior 15/03 - 13/04"}
+        }
+        self.marker_history_map: dict[tuple[str, str], list[dict[str, str]]] = {
+            ("47607237", "11"): [
+                {
+                    "data": "31/03/2026 11:00",
+                    "usuario": "Fulano",
+                    "acao": "Aplicado",
+                    "detalhes": "Sd José Junior 15/03 - 13/04",
+                }
+            ]
         }
         self.blocks: list[Block] = [
             Block(
@@ -170,9 +190,58 @@ class FakeClient:
         }
         return True
 
-    def remove_marcador(self, id_procedimento: str) -> bool:
+    def remove_marcador(self, id_procedimento: str, marcador_id: str | None = None) -> bool:
+        current = self.process_markers.get(id_procedimento)
+        if marcador_id and current and current.get("id") != marcador_id:
+            return False
         self.process_markers.pop(id_procedimento, None)
         return True
+
+    def list_process_markers(self, id_procedimento: str) -> list[dict[str, str]]:
+        current = self.process_markers.get(id_procedimento)
+        if not current:
+            return []
+        return [
+            {
+                "id": current["id"],
+                "marcador_id": current["id"],
+                "nome": current["nome"],
+                "texto": current["texto"],
+            }
+        ]
+
+    def update_marcador(self, id_procedimento: str, marcador_id: str, texto: str) -> bool:
+        current = self.process_markers.get(id_procedimento)
+        if not current or current.get("id") != marcador_id:
+            return False
+        current["texto"] = texto
+        self.marker_history_map.setdefault((id_procedimento, marcador_id), []).append(
+            {
+                "data": "31/03/2026 12:00",
+                "usuario": "Fulano",
+                "acao": "Alterado",
+                "detalhes": texto,
+            }
+        )
+        return True
+
+    def marker_history(self, id_procedimento: str, marcador_id: str | None = None) -> list[dict[str, str]]:
+        current = self.process_markers.get(id_procedimento)
+        if marcador_id is None and current:
+            marcador_id = current["id"]
+        entries = list(self.marker_history_map.get((id_procedimento, marcador_id or ""), []))
+        normalized: list[dict[str, str]] = []
+        for item in entries:
+            normalized.append(
+                {
+                    **item,
+                    "data_only": item["data"].split()[0] if item.get("data") else "",
+                    "hora": item["data"].split()[1] if len(item.get("data", "").split()) > 1 else "",
+                    "marker_text": item.get("detalhes", ""),
+                    "raw_columns": [item.get("data", ""), item.get("usuario", ""), item.get("acao", ""), item.get("detalhes", "")],
+                }
+            )
+        return normalized
 
     def cancelar_disponibilizacao_block(self, block_numero: str) -> dict[str, Any]:
         self.last_block_recall = {"block_numero": block_numero, "action": "cancelar_disponibilizacao"}
@@ -358,6 +427,18 @@ class FakeClient:
                 Militar(nome="Maria Souza", posto="SD BM", funcao="Condutor", status="extraordinario"),
             ],
         )
+
+    def download_pdf(self, id_procedimento: str, output_path: str | None = None, id_documento: str | None = None) -> str:
+        path = output_path or tempfile.mktemp(prefix="sei_", suffix=".pdf")
+        Path(path).write_bytes(b"%PDF-1.4 fake process pdf")
+        self.generated_pdf_paths.append(path)
+        return path
+
+    def download_document_pdf(self, id_documento: str, id_procedimento: str, output_path: str | None = None) -> str:
+        path = output_path or tempfile.mktemp(prefix="sei_doc_", suffix=".pdf")
+        Path(path).write_bytes(b"%PDF-1.4 fake document pdf")
+        self.generated_pdf_paths.append(path)
+        return path
 
     def get_block_documents(self, block_numero: str) -> list[BlockDocument]:
         return list(self.block_documents_map.get(block_numero, []))
@@ -856,6 +937,29 @@ def test_process_marker_preview_contract() -> None:
     assert result["operation"] == "process-marker-preview"
     assert result["data"]["selected_marker"]["marcador_id"] == "11"
     assert result["data"]["suggested_marker_text"]
+    assert "Leitura" not in result["data"]["suggested_marker_text"]
+
+
+def test_process_marker_read_contract() -> None:
+    result = process_marker_read(FakeClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-marker-read"
+    assert result["data"]["current_markers_total"] == 1
+    assert result["data"]["current_markers"][0]["texto"] == "Sd José Junior 15/03 - 13/04"
+
+
+def test_process_marker_history_contract() -> None:
+    result = process_marker_history(FakeClient(), "47607237", marker="11")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-marker-history"
+    assert result["data"]["selected_marker"]["marcador_id"] == "11"
+    assert result["data"]["history_total"] == 1
+    assert result["data"]["history"][0]["acao"] == "Aplicado"
+    assert result["data"]["history"][0]["data_only"] == "31/03/2026"
+    assert result["data"]["history"][0]["hora"] == "11:00"
+    assert result["data"]["history_summary"]["actions"] == ["Aplicado"]
 
 
 def test_process_marker_set_preview_contract() -> None:
@@ -891,6 +995,13 @@ def test_process_marker_remove_preview_contract() -> None:
     assert result["data"]["confirmation_required"] is True
 
 
+def test_process_marker_remove_preview_selects_marker_by_name() -> None:
+    result = process_marker_remove_preview(FakeClient(), "47607237", marker="Férias / Dispensas")
+
+    assert result["ok"] is True
+    assert result["data"]["selected_marker"]["marcador_id"] == "11"
+
+
 def test_process_marker_remove_confirm_contract() -> None:
     client = FakeClient()
     result = process_marker_remove_confirm(client, "47607237", confirm=True)
@@ -898,6 +1009,38 @@ def test_process_marker_remove_confirm_contract() -> None:
     assert result["ok"] is True
     assert result["operation"] == "process-marker-remove-confirm"
     assert "47607237" not in client.process_markers
+
+
+def test_process_marker_remove_confirm_uses_selected_marker() -> None:
+    client = FakeClient()
+    result = process_marker_remove_confirm(client, "47607237", marker="11", confirm=True)
+
+    assert result["ok"] is True
+    assert result["data"]["selected_marker"]["marcador_id"] == "11"
+
+
+def test_process_marker_update_preview_contract() -> None:
+    result = process_marker_update_preview(FakeClient(), "47607237", marker="11")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-marker-update-preview"
+    assert result["data"]["selected_marker"]["marcador_id"] == "11"
+    assert result["data"]["mutation_preview"]["current_text"] == "Sd José Junior 15/03 - 13/04"
+
+
+def test_process_marker_update_confirm_contract() -> None:
+    client = FakeClient()
+    result = process_marker_update_confirm(
+        client,
+        "47607237",
+        marker="11",
+        texto="Aguardando manifestação até 15/04.",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-marker-update-confirm"
+    assert client.process_markers["47607237"]["texto"] == "Aguardando manifestação até 15/04."
 
 
 def test_process_create_preview_contract() -> None:
@@ -918,6 +1061,61 @@ def test_process_create_preview_contract() -> None:
     assert result["data"]["access_policy"]["available_hypotheses"]
     assert result["data"]["access_policy"]["selected_hypothesis"]["value"] == "LGPD"
     assert result["warnings"]
+
+
+def test_process_pdf_preview_contract(tmp_path) -> None:
+    output = tmp_path / "processo.pdf"
+    result = process_pdf_preview(FakeClient(), "47607237", output_path=str(output))
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-pdf-preview"
+    assert result["resolved_ids"]["id_procedimento"] == "47607237"
+    assert result["data"]["download_preview"]["output_path"] == str(output)
+
+
+def test_process_pdf_confirm_contract(tmp_path) -> None:
+    client = FakeClient()
+    output = tmp_path / "processo.pdf"
+    result = process_pdf_confirm(client, "47607237", output_path=str(output), confirm=True)
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-pdf-confirm"
+    assert result["data"]["download"]["path"] == str(output)
+    assert output.exists()
+
+
+def test_document_pdf_preview_contract(tmp_path) -> None:
+    output = tmp_path / "documento.pdf"
+    result = document_pdf_preview(
+        FakeClient(),
+        "39860248",
+        process_id="47607237",
+        output_path=str(output),
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "document-pdf-preview"
+    assert result["resolved_ids"]["id_documento"] == "48568466"
+    assert result["resolved_ids"]["id_procedimento"] == "47607237"
+    assert result["resolved_ids"]["numero_documento"] == "39860248"
+    assert result["data"]["download_preview"]["output_path"] == str(output)
+
+
+def test_document_pdf_confirm_contract(tmp_path) -> None:
+    client = FakeClient()
+    output = tmp_path / "documento.pdf"
+    result = document_pdf_confirm(
+        client,
+        "39860248",
+        process_id="47607237",
+        output_path=str(output),
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "document-pdf-confirm"
+    assert result["data"]["download"]["path"] == str(output)
+    assert output.exists()
 
 
 def test_process_create_preview_exposes_hypotheses_when_non_public_access_is_requested() -> None:
@@ -2152,6 +2350,49 @@ def test_document_quality_check_cli_json(monkeypatch) -> None:
     assert "document_profile" in payload["data"]["quality_check"]
 
 
+def test_process_pdf_confirm_cli_json(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    output = tmp_path / "processo-cli.pdf"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["process-pdf-confirm", "47607237", "--output", str(output), "--confirm", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-pdf-confirm"
+    assert payload["data"]["download"]["path"] == str(output)
+
+
+def test_document_pdf_confirm_cli_json(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    output = tmp_path / "documento-cli.pdf"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "document-pdf-confirm",
+            "39860248",
+            "--process-id",
+            "47607237",
+            "--output",
+            str(output),
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "document-pdf-confirm"
+    assert payload["resolved_ids"]["id_documento"] == "48568466"
+
+
 def test_relatorio_read_cli_json(monkeypatch) -> None:
     monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
 
@@ -2191,6 +2432,36 @@ def test_process_marker_preview_cli_json(monkeypatch) -> None:
     assert payload["operation"] == "process-marker-preview"
 
 
+def test_process_marker_read_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["process-marker-read", "47607237", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-marker-read"
+    assert payload["data"]["current_markers_total"] == 1
+
+
+def test_process_marker_history_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["process-marker-history", "47607237", "--marker", "11", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-marker-history"
+    assert payload["data"]["history_total"] == 1
+    assert payload["data"]["history_summary"]["latest_entry"]["acao"] == "Aplicado"
+
+
 def test_process_marker_set_confirm_cli_json(monkeypatch) -> None:
     monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
 
@@ -2228,6 +2499,46 @@ def test_process_marker_remove_confirm_cli_json(monkeypatch) -> None:
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["operation"] == "process-marker-remove-confirm"
+
+
+def test_process_marker_remove_confirm_cli_json_with_marker(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["process-marker-remove-confirm", "47607237", "--marker", "11", "--confirm", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["selected_marker"]["marcador_id"] == "11"
+
+
+def test_process_marker_update_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-marker-update-confirm",
+            "47607237",
+            "--marker",
+            "11",
+            "--texto",
+            "Aguardando manifestação até 15/04.",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-marker-update-confirm"
+    assert payload["data"]["mutation"]["new_text"] == "Aguardando manifestação até 15/04."
 
 
 def test_signature_block_list_cli_json(monkeypatch) -> None:

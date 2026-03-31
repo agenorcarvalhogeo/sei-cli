@@ -239,6 +239,32 @@ Pos-condicoes obrigatorias:
 }
 ```
 
+## Marcadores — Diretriz de Produto
+
+Decisão operacional atual:
+
+- o fluxo principal de marcadores é por processo específico
+- o objetivo do marcador é ser significativo e contextual, não só categórico
+- bulk pelo Controle de Processos fica fora da prioridade imediata
+
+Implicações:
+
+- priorizar `process-marker-preview`, `process-marker-read`, `process-marker-history`,
+  `process-marker-set-*`, `process-marker-update-*` e `process-marker-remove-*`
+- o texto sugerido do marcador deve continuar curto, operacional e útil para triagem
+- histórico e alteração de texto no próprio processo têm mais valor do que mutação em lote
+
+Backlog rebaixado:
+
+- bulk de marcador pelo Controle de Processos
+- mutações em lote de múltiplos processos
+
+Próximos refinamentos desejáveis dentro desta frente:
+
+- histórico de marcador mais rico, quando a UI expuser mais metadados
+- melhoria incremental da sugestão de texto
+- manutenção segura de marcador existente sem remover/recriar desnecessariamente
+
 ### Riscos a tratar desde o inicio
 
 - bloco em unidade sem acesso
@@ -265,8 +291,12 @@ Esta frente agora passa a ter uma camada canônica inicial focada no fluxo por p
 
 - `marker-catalog`
 - `process-marker-preview`
+- `process-marker-read`
+- `process-marker-history`
 - `process-marker-set-preview`
 - `process-marker-set-confirm`
+- `process-marker-update-preview`
+- `process-marker-update-confirm`
 - `process-marker-remove-preview`
 - `process-marker-remove-confirm`
 
@@ -332,6 +362,36 @@ Existem dois fluxos distintos e eles nao devem ser misturados:
 - usar quando o proprio usuario da unidade geradora vai assinar
 - se o documento estiver em bloco disponibilizado, primeiro e necessario cancelar a disponibilizacao do bloco
 - depois disso a assinatura deve ocorrer no ambiente da unidade geradora, pelo fluxo normal de assinatura de documento
+
+## PDF Nativo — Camada Canônica
+
+Objetivo:
+
+- gerar PDF nativo do processo inteiro
+- gerar PDF nativo de um documento específico
+- explicitar preflight de unidade antes da geração
+- manter `preview` + `confirm` para a escrita local do arquivo
+
+Canônicas:
+
+- `process-pdf-preview`
+- `process-pdf-confirm`
+- `document-pdf-preview`
+- `document-pdf-confirm`
+
+Regra operacional:
+
+- se o processo ou documento estiver aberto apenas em outra unidade, a canônica deve refletir isso no `preflight`
+- a execução deve seguir a lógica real do SEI:
+  - navegar para o processo/documento
+  - acionar `Gerar PDF`
+  - confirmar `Gerar`
+  - baixar o arquivo final
+
+Observação:
+
+- os comandos legados `download-pdf` e `download-doc-pdf` continuam existindo
+- a skill e os fluxos guiados devem preferir a superfície canônica nova
 - nesse caso, nao usar `signature-block-sign-*`
 
 Consequencias para testes e canônicas:
