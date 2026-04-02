@@ -2796,6 +2796,16 @@ class SEIClient:
         # No iframe found — page might already be the inner content
         return outer_html
 
+    def _open_process_wrapper(self, id_procedimento: str) -> str:
+        """Open procedimento_trabalhar and return the wrapper HTML."""
+        self._ensure_session()
+        url = self._sei_url(
+            f"controlador.php?acao=procedimento_trabalhar"
+            f"&id_procedimento={id_procedimento}"
+        )
+        r = self._get(url)
+        return r.text
+
     def get_tramitar_form(self, id_procedimento: str, _proc_html: str | None = None) -> TramitarForm:
         """Open 'Enviar Processo' form and parse destination units/fields.
 
@@ -2811,8 +2821,112 @@ class SEIClient:
         tramitar = parse_tramitar_form(rsend.text, self._sei_url(""), str(rsend.url))
         return tramitar
 
+    def _resolve_unit_id_ajax(
+        self,
+        unidade: str,
+        ajax_url: str | None,
+        unit_descriptions: dict[str, str],
+    ) -> str:
+        """Resolve a unit name/alias to its SEI ID using AJAX as source of truth.
+
+        Priority:
+        1. If numeric ID → return as-is
+        2. AJAX auto-complete search (live data from SEI)
+        3. Fallback to static UNIT_IDS (only when AJAX unavailable)
+
+        Also populates *unit_descriptions* with id→description mappings
+        found via AJAX for later use in hdnUnidades.
+        """
+        import re as _re
+
+        kw = unidade.strip()
+        # If it's a numeric ID already, keep it
+        if kw.isdigit():
+            return kw
+
+        # --- Try AJAX resolution (source of truth) --------------------
+        if ajax_url:
+            # Build search keywords from the user-provided name.
+            # Replace hyphens/slashes with spaces (SEI AJAX searches by words).
+            kw_clean = kw.replace("-", " ").replace("/", " ").strip()
+            search_terms = [kw_clean]
+            # Also add the raw name in case it works
+            if kw_clean != kw:
+                search_terms.append(kw)
+            # Try individual meaningful words from UNIT_IDS alias
+            for name, uid in self.UNIT_IDS.items():
+                if kw.lower() == name.lower():
+                    words = [
+                        w for w in name.replace("-", " ").replace("/", " ").split()
+                        if len(w) > 2
+                        and w.upper() not in ("CBM", "COBM", "SEC", "RN")
+                    ]
+                    search_terms.extend(words)
+                    break
+
+            searched: set[str] = set()
+            kw_lower = kw.lower().replace("-", " ").replace("/", " ")
+            for term in search_terms:
+                if term.lower() in searched:
+                    continue
+                searched.add(term.lower())
+                # Try orgao=28 (CBM) first, then 0 (Todos) — CBM units
+                # only appear under orgao=28 in some SEI configurations.
+                for orgao in ("28", "0"):
+                    resp = self.client.post(
+                        ajax_url,
+                        content=(
+                            f"palavras_pesquisa={term}"
+                            f"&id_orgao={orgao}&unidade_atual=0"
+                        ).encode("latin-1"),
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "X-Requested-With": "XMLHttpRequest",
+                        },
+                    )
+                    items = _re.findall(
+                        r'<item[^>]*id="([^"]+)"[^>]*descricao="([^"]+)"',
+                        resp.text,
+                    )
+                    # Store all discovered descriptions
+                    for item_id, desc in items:
+                        unit_descriptions[item_id] = desc
+
+                    # Try to match: normalize both sides for comparison
+                    matches = []
+                    for iid, desc in items:
+                        desc_lower = desc.lower()
+                        # Normalize description: collapse " - " separators
+                        # so "PAD - PDF" matches "PAD PDF"
+                        desc_norm = _re.sub(r"\s*-\s*", " ", desc_lower)
+                        # Match if search keyword appears in description
+                        if kw_lower in desc_lower or kw_lower in desc_norm:
+                            matches.append((iid, desc))
+
+                    # Prefer CBM items
+                    cbm_matches = [
+                        (iid, desc) for iid, desc in matches if "CBM" in desc
+                    ]
+                    if len(cbm_matches) == 1:
+                        return cbm_matches[0][0]
+                    if len(cbm_matches) > 1:
+                        options = ", ".join(sorted({desc for _, desc in cbm_matches}))
+                        raise RuntimeError(
+                            f"Unidade '{unidade}' é ambígua. Especifique uma destas: {options}"
+                        )
+                    if len(matches) == 1:
+                        return matches[0][0]
+                    if len(matches) > 1:
+                        options = ", ".join(sorted({desc for _, desc in matches}))
+                        raise RuntimeError(
+                            f"Unidade '{unidade}' é ambígua. Especifique uma destas: {options}"
+                        )
+
+        # --- Fallback to static UNIT_IDS ------------------------------
+        return self._resolve_unit_id(unidade)
+
     def _resolve_unit_id(self, unidade: str) -> str:
-        """Resolve a unit name/alias to its SEI ID.
+        """Resolve a unit name/alias to its SEI ID (static fallback).
 
         Priority: exact ID → exact name → contains match.
         """
@@ -2832,9 +2946,10 @@ class SEIClient:
         if len(matches) == 1:
             return matches[0][1]
         if len(matches) > 1:
-            # Prefer shortest match (most specific)
-            matches.sort(key=lambda x: len(x[0]))
-            return matches[0][1]
+            options = ", ".join(sorted({name for name, _ in matches}))
+            raise RuntimeError(
+                f"Unidade '{unidade}' é ambígua. Especifique uma destas: {options}"
+            )
         raise RuntimeError(
             f"Unidade '{unidade}' não encontrada. "
             f"Opções: {', '.join(self.UNIT_IDS.keys())}"
@@ -2971,17 +3086,31 @@ class SEIClient:
     # boolean-returning unit switch flow.
     switch_unit_legacy = trocar_unidade
 
+    def check_reopen_available(self, id_procedimento: str) -> bool:
+        """Check if 'Reabrir Processo' is available without executing it.
+
+        Returns:
+            True if the reopen action is available.
+        """
+        try:
+            arvore_html = self._navigate_to_arvore_visualizar(id_procedimento)
+        except Exception:
+            return False
+        if not arvore_html:
+            return False
+        return bool(
+            re.search(
+                r"var\s+linkReabrirProcesso\s*=\s*'[^']+'",
+                arvore_html,
+            )
+        )
+
     def reabrir_processo(self, id_procedimento: str) -> bool:
         """Reopen a process that was closed/concluded in the current unit.
 
-        SEI's 'Reabrir Processo' button uses ``onclick="reabrirProcesso();"``
-        which reads a JS variable ``linkReabrirProcesso`` defined inline in the
-        ``arvore_visualizar`` page (loaded in ``ifrConteudoVisualizacao``).
-
-        The method tries three strategies:
-        1. Extract ``var linkReabrirProcesso = '...'`` from ``arvore_visualizar``
-        2. Scan ``Nos[0]`` toolbar in ``ifrArvore`` for href fallback
-        3. AJAX fallback via ``controlador_ajax.php``
+        Source of truth: ``arvore_visualizar`` defines the inline JS variable
+        ``linkReabrirProcesso`` when the current unit can reopen the concluded
+        process. ``procedimento_visualizar`` does not expose this action.
 
         Args:
             id_procedimento: Process internal ID.
@@ -2992,105 +3121,69 @@ class SEIClient:
         Raises:
             RuntimeError: If the reopen action is not available or fails.
         """
-        self._ensure_session()
-
-        # Navigate to the process wrapper page (procedimento_trabalhar)
-        wrapper_url = self._sei_url(
-            f"controlador.php?acao=procedimento_trabalhar"
-            f"&id_procedimento={id_procedimento}"
-        )
-        rw = self._get(wrapper_url)
-        if "login.php" in str(rw.url) or "pwdSenha" in rw.text:
+        arvore_html = self._navigate_to_arvore_visualizar(id_procedimento)
+        if not arvore_html:
             raise RuntimeError(
-                f"Processo {id_procedimento} não encontrado ou sessão expirada"
+                f"Não foi possível acessar a árvore do processo {id_procedimento}."
             )
 
-        # --- Strategy 1: Extract linkReabrirProcesso from arvore_visualizar ---
-        # The wrapper page (procedimento_trabalhar) has two iframes:
-        #   ifrArvore -> procedimento_visualizar (tree JS with Nos[])
-        #   ifrConteudoVisualizacao -> arvore_visualizar (toolbar with JS vars)
-        # ifrConteudoVisualizacao starts as about:blank and is loaded via JS,
-        # so we must follow the chain: wrapper -> ifrArvore -> find
-        # arvore_visualizar URL -> fetch it -> extract linkReabrirProcesso.
-        wsoup = BeautifulSoup(rw.text, "lxml")
-        arvore_iframe = wsoup.find("iframe", {"name": "ifrArvore"})
-
-        reabrir_url = None
-        arvore_html = ""
-        if arvore_iframe and arvore_iframe.get("src"):
-            arv_url = urljoin(self._sei_url(""), arvore_iframe["src"])
-            ra = self._get(arv_url)
-            arvore_html = ra.text
-
-            # The procedimento_visualizar page references arvore_visualizar
-            vis_m = re.search(
-                r'(controlador\.php\?acao=arvore_visualizar[^"\'\\]+)',
-                arvore_html,
-            )
-            if vis_m:
-                vis_url = urljoin(
-                    self._sei_url(""),
-                    vis_m.group(1).replace("&amp;", "&"),
-                )
-                rv = self._get(vis_url)
-                # Match: var linkReabrirProcesso = 'controlador.php?...';
-                link_m = re.search(
-                    r"var\s+linkReabrirProcesso\s*=\s*'([^']+)'",
-                    rv.text,
-                )
-                if link_m:
-                    reabrir_url = link_m.group(1).replace("&amp;", "&")
-
-        # --- Strategy 2: Scan Nos[0] in ifrArvore (legacy fallback) ---
-        if not reabrir_url and arvore_html:
-            start = arvore_html.find("Nos[0]")
-            end = arvore_html.find("Nos[1]", start) if start != -1 else -1
-            nos0 = arvore_html[start:end].replace('\\"', '"') if start != -1 else ""
-
-            reabrir_m = re.search(
-                r'href="(controlador\.php\?acao=procedimento_reabrir[^"]*)"',
-                nos0,
-            )
-            if not reabrir_m:
-                reabrir_m = re.search(
-                    r'"(controlador\.php\?acao=procedimento_reabrir[^"]+)"',
-                    arvore_html,
-                )
-            if reabrir_m:
-                reabrir_url = reabrir_m.group(1).replace("&amp;", "&")
-
-        # Execute the reopen if we found a URL
-        if reabrir_url:
-            r = self._get(self._sei_url(reabrir_url))
-            self._control_html = None
-            url_str = str(r.url)
-            if ("arvore_visualizar" in url_str
-                    or "procedimento_trabalhar" in url_str
-                    or "procedimento_controlar" in url_str):
-                return True
-            lower = r.text.lower()
-            if "erro" in lower or "falha" in lower:
-                raise RuntimeError("SEI retornou erro ao reabrir processo")
-            return True
-
-        # --- Strategy 3: AJAX fallback ---
-        unit_id = self._current_unit_id or ""
-        ajax_url = self._sei_url(
-            f"controlador_ajax.php?acao_ajax=procedimento_reabrir"
-            f"&id_procedimento={id_procedimento}"
-            f"&infra_sistema=100000100"
-            + (f"&infra_unidade_atual={unit_id}" if unit_id else "")
+        link_m = re.search(
+            r"var\s+linkReabrirProcesso\s*=\s*'([^']+)'",
+            arvore_html,
         )
-        r_ajax = self._get(ajax_url)
+        if not link_m:
+            raise RuntimeError(
+                f"Ação 'Reabrir Processo' não encontrada para o processo {id_procedimento}. "
+                "O processo pode já estar aberto nessa unidade ou você não tem permissão."
+            )
+
+        reabrir_url = link_m.group(1).replace("&amp;", "&")
+        r = self._get(self._sei_url(reabrir_url))
         self._control_html = None
-        ajax_text = r_ajax.text.strip()
-        if ajax_text and "erro" not in ajax_text.lower() and "falha" not in ajax_text.lower():
+        rsoup = BeautifulSoup(r.text, "lxml")
+        validation = rsoup.find("textarea", {"id": "txaInfraValidacao"})
+        if validation and validation.get_text(strip=True):
+            raise RuntimeError(validation.get_text(" ", strip=True))
+
+        post_html = self._open_process_page(id_procedimento)
+        if (
+            self._extract_action_url(post_html, "procedimento_concluir")
+            or self._extract_action_url(post_html, "procedimento_enviar")
+        ):
             return True
 
-        raise RuntimeError(
-            f"Ação 'Reabrir Processo' não encontrada para o processo {id_procedimento}. "
-            "O processo pode já estar aberto nessa unidade ou você não tem permissão."
+        raise RuntimeError("SEI não confirmou a reabertura do processo.")
+
+    def list_process_history_units(self, id_procedimento: str) -> list[str]:
+        """List unique units that appear in the process history."""
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            return []
+        hist_url_match = re.search(
+            r'(controlador\.php\?acao=procedimento_consultar_historico[^"\'<>\s]+)',
+            arvore_html,
         )
+        if not hist_url_match:
+            return []
+        try:
+            r = self._get(self._sei_url(hist_url_match.group(1)))
+        except Exception:
+            return []
+        soup = BeautifulSoup(r.text, "lxml")
+        table = soup.find("table")
+        if not table:
+            return []
+        units: list[str] = []
+        seen: set[str] = set()
+        for row in table.find_all("tr")[1:]:
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            unidade = cells[1].get_text(strip=True)
+            if unidade and unidade not in seen:
+                seen.add(unidade)
+                units.append(unidade)
+        return units
 
     # ------------------------------------------------------------------
     # Concluir Processo
@@ -3099,6 +3192,10 @@ class SEIClient:
     def concluir_processos(
         self,
         id_procedimentos: "str | list[str]",
+        *,
+        reabrir_em: str | None = None,
+        reabrir_dias: str | None = None,
+        reabrir_dias_uteis: bool = False,
     ) -> dict:
         """Conclude one or more processes in the current unit.
 
@@ -3210,7 +3307,32 @@ class SEIClient:
                     confirm_data[name] = val
 
             # Set conclusion type (S = definitive, V = with scheduled reopening)
-            confirm_data["rdoConcluir"] = "S"
+            if reabrir_em or reabrir_dias:
+                confirm_data["rdoConcluir"] = "V"
+            else:
+                confirm_data["rdoConcluir"] = "S"
+            if reabrir_em or reabrir_dias:
+                fields = {"radio": "rdoPrazoReaberturaProgramada"}
+                for inp in form2.find_all("input"):
+                    name = inp.get("name", "")
+                    lname = name.lower()
+                    if "txtprazoreaberturaprogramada" in lname:
+                        fields["data"] = name
+                    elif "txtdiasreaberturaprogramada" in lname:
+                        fields["dias"] = name
+                    elif "chksindiasuteisreaberturaprogramada" in lname:
+                        fields["uteis"] = name
+                extra_pairs: list[tuple[str, str]] = []
+                self._apply_schedule_fields(
+                    extra_pairs,
+                    fields,
+                    data=reabrir_em,
+                    dias=reabrir_dias,
+                    dias_uteis=reabrir_dias_uteis,
+                    label="reabertura programada",
+                )
+                for key, value in extra_pairs:
+                    confirm_data[key] = value
             confirm_data["sbmSalvar"] = "Salvar"
 
             # Submit confirmation
@@ -3230,7 +3352,14 @@ class SEIClient:
 
         return result
 
-    def concluir_processo(self, id_procedimento: str) -> bool:
+    def concluir_processo(
+        self,
+        id_procedimento: str,
+        *,
+        reabrir_em: str | None = None,
+        reabrir_dias: str | None = None,
+        reabrir_dias_uteis: bool = False,
+    ) -> bool:
         """Conclude a single process. Convenience wrapper around concluir_processos.
 
         Args:
@@ -3242,7 +3371,12 @@ class SEIClient:
         Raises:
             RuntimeError: If conclusion failed.
         """
-        result = self.concluir_processos(id_procedimento)
+        result = self.concluir_processos(
+            id_procedimento,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+        )
         if id_procedimento in result["concluded"]:
             return True
         error = result["errors"].get(id_procedimento, "Unknown error")
@@ -3253,6 +3387,12 @@ class SEIClient:
         id_procedimento: str,
         unidades_destino: "str | list[str]",
         manter_aberto: bool = True,
+        retorno_em: str | None = None,
+        retorno_dias: str | None = None,
+        retorno_dias_uteis: bool = False,
+        reabrir_em: str | None = None,
+        reabrir_dias: str | None = None,
+        reabrir_dias_uteis: bool = False,
     ) -> bool:
         """Send process to one or more destination units.
 
@@ -3285,10 +3425,7 @@ class SEIClient:
         if isinstance(unidades_destino, str):
             unidades_destino = [unidades_destino]
 
-        # Resolve each unit to its numeric SEI ID
-        unit_ids = [self._resolve_unit_id(u) for u in unidades_destino]
-
-        # Navigate to the enviar form
+        # Navigate to the enviar form FIRST (we need AJAX to resolve IDs)
         proc_html = self._open_process_page(id_procedimento)
         send_url = self._extract_action_url(proc_html, "procedimento_enviar")
         if not send_url:
@@ -3302,38 +3439,43 @@ class SEIClient:
 
         form_action = form.get("action", "").replace("&amp;", "&")
         submit_url = urljoin(self._sei_url(""), form_action)
+        tramitar_form = parse_tramitar_form(r_form.text, self._sei_url(""), str(r_form.url))
 
-        # --- Resolve unit descriptions via AJAX auto-complete ----------
+        # --- Resolve units via AJAX auto-complete (source of truth) ----
         # Extract the AJAX URL from the form page JS
         ajax_match = _re.search(
             r"(controlador_ajax\.php\?acao_ajax="
             r"unidade_auto_completar_envio_processo[^']+)",
             r_form.text,
         )
+        ajax_url = (
+            self.base_url + "/" + ajax_match.group(1) if ajax_match else None
+        )
+
+        # Resolve each unit name/alias to its numeric SEI ID via AJAX,
+        # falling back to UNIT_IDS only when AJAX is unavailable.
+        unit_ids: list[str] = []
         unit_descriptions: dict[str, str] = {}
-        if ajax_match:
-            ajax_url = self.base_url + "/" + ajax_match.group(1)
-            searched: set[str] = set()
+        for dest_name in unidades_destino:
+            resolved_id = self._resolve_unit_id_ajax(
+                dest_name, ajax_url, unit_descriptions,
+            )
+            unit_ids.append(resolved_id)
+
+        # Enrich descriptions for numeric IDs that skipped AJAX resolution
+        if ajax_url:
             for uid in unit_ids:
-                if uid in unit_descriptions:
-                    continue
-                keywords = self._unit_search_keywords(uid)
-                for kw in keywords:
-                    if kw in searched:
-                        continue
-                    searched.add(kw)
-                    # Try with orgao=0 (Todos) first, then orgao=28 (CBM)
-                    for orgao in ("0", "28"):
+                if uid not in unit_descriptions:
+                    keywords = self._unit_search_keywords(uid)
+                    for kw in keywords:
                         resp = self.client.post(
                             ajax_url,
                             content=(
                                 f"palavras_pesquisa={kw}"
-                                f"&id_orgao={orgao}&unidade_atual=0"
+                                f"&id_orgao=0&unidade_atual=0"
                             ).encode("latin-1"),
                             headers={
-                                "Content-Type": (
-                                    "application/x-www-form-urlencoded"
-                                ),
+                                "Content-Type": "application/x-www-form-urlencoded",
                                 "X-Requested-With": "XMLHttpRequest",
                             },
                         )
@@ -3344,8 +3486,6 @@ class SEIClient:
                             unit_descriptions[item_id] = desc
                         if uid in unit_descriptions:
                             break
-                    if uid in unit_descriptions:
-                        break
 
         # infraLupa separators (ISO-8859-1)
         SEP_ENTRY = "\xa5"  # ¥ — between entries
@@ -3385,6 +3525,23 @@ class SEIClient:
             chk_value = chk.get("value") if chk and chk.get("value") else "on"
             pairs.append(("chkSinManterAberto", chk_value))
 
+        self._apply_schedule_fields(
+            pairs,
+            tramitar_form.retorno_programado_fields,
+            data=retorno_em,
+            dias=retorno_dias,
+            dias_uteis=retorno_dias_uteis,
+            label="retorno programado",
+        )
+        self._apply_schedule_fields(
+            pairs,
+            tramitar_form.reabertura_programada_fields,
+            data=reabrir_em,
+            dias=reabrir_dias,
+            dias_uteis=reabrir_dias_uteis,
+            label="reabertura programada",
+        )
+
         # Submit button
         pairs.append(("sbmEnviar", "Enviar"))
 
@@ -3397,6 +3554,102 @@ class SEIClient:
         if "enviar processo" in lower:
             return False
         return True
+
+    def _apply_schedule_fields(
+        self,
+        pairs: list[tuple[str, str]],
+        fields: dict[str, str],
+        *,
+        data: str | None = None,
+        dias: str | None = None,
+        dias_uteis: bool = False,
+        label: str,
+    ) -> None:
+        if not data and not dias:
+            return
+        if data and dias:
+            raise RuntimeError(f"{label.capitalize()} aceita data ou dias, não ambos.")
+        if not fields:
+            raise RuntimeError(f"Formulário não expôs campos para {label}.")
+        radio = fields.get("radio")
+        if not radio:
+            raise RuntimeError(f"Formulário sem rádio de seleção para {label}.")
+        if data:
+            data_field = fields.get("data")
+            if not data_field:
+                raise RuntimeError(f"Formulário sem campo de data para {label}.")
+            pairs.append((radio, "1"))
+            pairs.append((data_field, data))
+        elif dias:
+            dias_field = fields.get("dias")
+            if not dias_field:
+                raise RuntimeError(f"Formulário sem campo de dias para {label}.")
+            pairs.append((radio, "2"))
+            pairs.append((dias_field, dias))
+            if dias_uteis and fields.get("uteis"):
+                pairs.append((fields["uteis"], "S"))
+
+    def get_concluir_form(self, id_procedimento: str) -> dict[str, Any]:
+        """Open conclude form and expose supported scheduled-reopen fields."""
+        html = self._ensure_control()
+        data: dict[str, str] = {}
+        soup = BeautifulSoup(html, "lxml")
+        form = soup.find("form", id="frmProcedimentoControlar")
+        if not form:
+            raise RuntimeError("Control form not found")
+        for inp in form.find_all("input", type="hidden"):
+            name = inp.get("name", "")
+            if name:
+                data[name] = inp.get("value", "")
+
+        recebidos = set(data.get("hdnRecebidosItens", "").split(",")) - {""}
+        gerados = set(data.get("hdnGeradosItens", "").split(",")) - {""}
+        if id_procedimento in recebidos:
+            data["hdnRecebidosItensSelecionados"] = id_procedimento
+            data["hdnGeradosItensSelecionados"] = ""
+        elif id_procedimento in gerados:
+            data["hdnRecebidosItensSelecionados"] = ""
+            data["hdnGeradosItensSelecionados"] = id_procedimento
+        else:
+            raise RuntimeError("Process not on control page")
+
+        concluir_m = re.search(r"controlador\.php\?acao=procedimento_concluir[^'\"]+", html)
+        if not concluir_m:
+            raise RuntimeError("Concluir URL not found")
+        r_confirm = self._post(self._sei_url(concluir_m.group().replace("&amp;", "&")), data)
+        soup2 = BeautifulSoup(r_confirm.text, "lxml")
+        form2 = soup2.find("form", id="frmDesentranharDocumento")
+        if not form2:
+            raise RuntimeError("Confirmation form not found")
+
+        fields = {"radio": "rdoPrazoReaberturaProgramada"}
+        for inp in form2.find_all("input"):
+            name = inp.get("name", "")
+            lname = name.lower()
+            if "txtprazoreaberturaprogramada" in lname:
+                fields["data"] = name
+            elif "txtdiasreaberturaprogramada" in lname:
+                fields["dias"] = name
+            elif "chksindiasuteisreaberturaprogramada" in lname:
+                fields["uteis"] = name
+
+        return {
+            "action": form2.get("action", "").replace("&amp;", "&"),
+            "hidden_fields": {
+                inp.get("name", ""): inp.get("value", "")
+                for inp in form2.find_all("input")
+                if inp.get("name")
+            },
+            "reabertura_programada_fields": fields if any(k in fields for k in ("data", "dias", "uteis")) else {},
+            "supports_reopen_schedule": bool(any(k in fields for k in ("data", "dias"))),
+        }
+
+    def list_process_open_units(self, id_procedimento: str) -> list[str]:
+        """Best-effort list of units where the process is currently open."""
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            return []
+        return self._find_open_units_from_history(arvore_html)
 
     def _unit_search_keywords(self, unit_id: str) -> list[str]:
         """Generate search keywords to find a unit via AJAX by ID.
@@ -4838,12 +5091,24 @@ class SEIClient:
         )
         page_url_raw: str | None = None
 
+        use_apenas_mode = False  # Track if we need rdoTipo=A fallback
+
         if id_documento:
-            # Single document: find URL with id_documento
+            # Single document: try URL with id_documento first
             for url in candidates:
                 if f'id_documento={id_documento}' in url:
                     page_url_raw = url
                     break
+            if page_url_raw is None:
+                # Fallback: use process-level gerar_pdf URL with rdoTipo=A (Apenas)
+                # The id_documento-specific link only exists for the currently
+                # selected document in the SEI tree. For others, we use the
+                # process-level link and POST with hdnDocumentosApenas.
+                for url in candidates:
+                    if f'id_procedimento={id_procedimento}' in url and 'id_documento=' not in url:
+                        page_url_raw = url
+                        use_apenas_mode = True
+                        break
             if page_url_raw is None:
                 raise RuntimeError(
                     f"Link 'Gerar PDF' não encontrado para documento {id_documento}. "
@@ -4888,6 +5153,10 @@ class SEIClient:
             'hdnFlagGerar': '1',
             'rdoTipo': 'T',
         }
+        if use_apenas_mode:
+            # Single-doc fallback: use "Apenas" mode to generate only this document
+            post_data['rdoTipo'] = 'A'
+            post_data['hdnDocumentosApenas'] = id_documento  # type: ignore[assignment]
         r_post = self._post(action_url, post_data)
 
         # Step 6: Extract iframe src from JavaScript
@@ -5266,12 +5535,16 @@ class SEIClient:
                     pass  # Best effort — don't mask the real exception
 
     def _navigate_to_arvore(self, id_procedimento: str) -> str | None:
-        """Navigate to a process and return the arvore (tree) HTML.
+        """Navigate to a process and return the ``ifrArvore`` HTML.
 
         Strategy (fast → slow):
         1. Direct URL with id_procedimento (works when session has valid hash)
         2. Via _navigate_to_process_page (uses hashed links from control page)
         3. Via search() — pesquisa rápida generates its own valid hashes
+
+        This returns the tree/frame HTML that references
+        ``controlador.php?acao=arvore_visualizar...``. It is not the
+        ``arvore_visualizar`` page itself.
 
         Works regardless of whether the process is in the current unit's list.
         """
@@ -5321,6 +5594,43 @@ class SEIClient:
             pass
 
         return None
+
+    def _navigate_to_arvore_visualizar(self, id_procedimento: str) -> str | None:
+        """Navigate from ``ifrArvore`` to the process ``arvore_visualizar`` page.
+
+        Chain:
+        ``procedimento_trabalhar`` -> ``ifrArvore`` -> ``arvore_visualizar``
+
+        The returned HTML is the page that contains inline JS variables such as
+        ``linkReabrirProcesso`` and ``linkCienciaProcesso``.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            return None
+
+        # Some callers may already have the selected arvore_visualizar HTML.
+        # Check for characteristic JS vars from arvore_visualizar (e.g.
+        # linkReabrirProcesso, linkConcluirProcesso, linkEncaminharEmail).
+        # linkArvoreNavegar lives in procedimento_visualizar and must NOT
+        # trigger a short-circuit.
+        if re.search(
+            r"var\s+link(?:Reabrir|Concluir|Encaminhar|Assinar|Excluir)\w*\s*=\s*'[^']+'",
+            arvore_html,
+        ):
+            return arvore_html
+
+        vis_match = re.search(
+            rf"(controlador\.php\?acao=arvore_visualizar[^\"'\s]*"
+            rf"id_procedimento={re.escape(id_procedimento)}[^\"'\s]*)",
+            arvore_html,
+        )
+        if not vis_match:
+            return None
+
+        vis_url_raw = vis_match.group(1).replace("&amp;", "&")
+        vis_url_raw = re.sub(r"&id_documento=\d+", "", vis_url_raw)
+        r_vis = self._get(urljoin(self._sei_url(""), vis_url_raw))
+        return r_vis.text
 
     def _find_in_acompanhamento(self, id_procedimento: str) -> str | None:
         """Search for a process link in Acompanhamento Especial."""
