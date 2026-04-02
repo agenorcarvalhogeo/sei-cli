@@ -238,21 +238,37 @@ class SEIClient:
         # Resolve relative URL
         full_url = urljoin(self._sei_url("inicializar.php"), location)
         r2 = self.client.get(full_url)
-        if r2.status_code != 200 or "Controle de Processos" not in r2.text:
+        if r2.status_code != 200:
             return None
-        # inicializar.php may redirect to acao=principal (frameset) instead of
-        # acao=procedimento_controlar (process table). Navigate one step further.
-        if "acao=principal" in str(r2.url) or "tblProcessosRecebidos" not in r2.text:
-            unit_id = self._current_unit_id or ""
-            ctrl_url = self._sei_url(
-                f"controlador.php?acao=procedimento_controlar&infra_sistema=100000100"
-                + (f"&infra_unidade_atual={unit_id}" if unit_id else "")
+
+        # Direct hit: already on the process control page
+        if "frmProcedimentoControlar" in r2.text:
+            return r2.text
+
+        # SEI 4+ often lands on acao=principal (wrapper page).
+        # Extract the procedimento_controlar link with its valid infra_hash.
+        import re as _re
+        # Try iframe src first (some SEI versions embed the control page)
+        iframe_match = _re.search(
+            r'<iframe[^>]+src=["\']([^"\'>]*procedimento_controlar[^"\'>]*)["\']',
+            r2.text,
+        )
+        if iframe_match:
+            ctrl_url = urljoin(self._sei_url(""), iframe_match.group(1).replace("&amp;", "&"))
+        else:
+            # Fallback: find any procedimento_controlar link in the HTML
+            link_match = _re.search(
+                r'controlador\.php\?acao=procedimento_controlar[^"\'\'\s]*',
+                r2.text,
             )
-            r3 = self.client.get(ctrl_url)
-            if r3.status_code == 200 and "tblProcessosRecebidos" in r3.text:
-                return r3.text
-            return None
-        return r2.text
+            if not link_match:
+                return None
+            ctrl_url = self._sei_url(link_match.group(0).replace("&amp;", "&"))
+
+        r3 = self.client.get(ctrl_url)
+        if r3.status_code == 200 and "frmProcedimentoControlar" in r3.text:
+            return r3.text
+        return None
 
     def _ensure_session(self) -> str:
         """Restore session with minimal overhead.
