@@ -31,6 +31,7 @@ from .reading import (
     environment_triage_preview,
     process_marker_read,
     process_marker_preview,
+    process_summary,
 )
 
 
@@ -751,6 +752,562 @@ def _resolve_document_type(client: Any, id_procedimento: str, tipo_documento: st
             "available_types": [item.nome for item in available],
         },
     )
+
+
+def _reverse_unit_name(client: Any, unit_id: str) -> str:
+    for name, uid in getattr(client, "UNIT_IDS", {}).items():
+        if uid == unit_id:
+            return name
+    return unit_id
+
+
+def _resolve_forward_destinations(
+    client: Any,
+    destinos: list[str],
+    ajax_url: str | None = None,
+) -> list[dict[str, str]]:
+    resolved: list[dict[str, str]] = []
+    seen: set[str] = set()
+    unit_descriptions: dict[str, str] = {}
+    for destino in destinos:
+        if ajax_url:
+            unit_id = client._resolve_unit_id_ajax(
+                destino, ajax_url, unit_descriptions,
+            )
+        else:
+            unit_id = client._resolve_unit_id(destino)
+        if unit_id in seen:
+            continue
+        seen.add(unit_id)
+        # Use AJAX description if available, else static reverse lookup
+        nome = unit_descriptions.get(unit_id) or _reverse_unit_name(client, unit_id)
+        resolved.append(
+            {
+                "requested": destino,
+                "id_unidade": unit_id,
+                "nome": nome,
+            }
+        )
+    return resolved
+
+
+def _find_reopen_candidate_unit(
+    client: Any,
+    id_procedimento: str,
+    *,
+    preferred_unit: str | None = None,
+) -> tuple[str | None, list[str]]:
+    tried: list[str] = []
+    current_unit = client.status().unidade_sigla
+    if preferred_unit:
+        tried.append(preferred_unit)
+        client.switch_unit(preferred_unit)
+        if client.check_reopen_available(id_procedimento):
+            return preferred_unit, tried
+
+    current_after = client.status().unidade_sigla
+    if current_after not in tried:
+        tried.append(current_after)
+        if client.check_reopen_available(id_procedimento):
+            return current_after, tried
+
+    available_units = {u.sigla for u in client.list_units()}
+    for unit in client.list_process_history_units(id_procedimento):
+        if unit in tried or unit not in available_units:
+            continue
+        tried.append(unit)
+        client.switch_unit(unit)
+        if client.check_reopen_available(id_procedimento):
+            return unit, tried
+
+    return None, tried
+
+
+def process_forward_preview(
+    client: Any,
+    numero_ou_id_processo: str,
+    *,
+    destinos: list[str],
+    manter_aberto: bool = True,
+    retorno_em: str | None = None,
+    retorno_dias: str | None = None,
+    retorno_dias_uteis: bool = False,
+    reabrir_em: str | None = None,
+    reabrir_dias: str | None = None,
+    reabrir_dias_uteis: bool = False,
+    review_mode: str = "deep",
+) -> dict[str, Any]:
+    operation = "process-forward-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not destinos:
+            raise WorkflowViolationError("Pelo menos uma unidade destino deve ser informada.")
+        if retorno_em and retorno_dias:
+            raise WorkflowViolationError("Retorno programado aceita data ou dias, não ambos.")
+        if reabrir_em and reabrir_dias:
+            raise WorkflowViolationError("Reabertura programada aceita data ou dias, não ambos.")
+        if manter_aberto and (reabrir_em or reabrir_dias):
+            raise WorkflowViolationError("Reabertura programada só faz sentido quando o processo for fechado na unidade atual.")
+
+        context = _context(client)
+        id_procedimento, numero_processo = _resolve_process_id(client, numero_ou_id_processo)
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        warnings: list[str] = []
+
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+
+            tramitar_form = client.get_tramitar_form(id_procedimento)
+            resolved_destinos = _resolve_forward_destinations(
+                client, destinos, ajax_url=tramitar_form.ajax_url,
+            )
+            review_data = None
+            if review_mode != "fast":
+                summary_mode = "all" if review_mode == "deep" else "summary"
+                summary_sample = 5 if review_mode == "deep" else 3
+                summary_result = process_summary(
+                    client,
+                    id_procedimento,
+                    mode=summary_mode,
+                    sample_size=summary_sample,
+                )
+                if summary_result.get("ok"):
+                    review_data = summary_result["data"]
+                else:
+                    warnings.append("Nao foi possivel contextualizar o processo antes do encaminhamento.")
+
+            scheduled_reopen_supported = bool(tramitar_form.reabertura_programada_fields)
+            scheduled_return_supported = bool(tramitar_form.retorno_programado_fields)
+            if (reabrir_em or reabrir_dias) and not scheduled_reopen_supported:
+                warnings.append("Formulario atual nao expôs campo de reabertura programada.")
+            if (retorno_em or retorno_dias) and not scheduled_return_supported:
+                warnings.append("Formulario atual nao expôs campo de retorno programado.")
+
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id_processo,
+            "destination_unit_ids": [item["id_unidade"] for item in resolved_destinos],
+        }
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": {
+                    **preflight,
+                    "current_unit": context.get("unidade_sigla"),
+                },
+                "processo": {
+                    "id_procedimento": id_procedimento,
+                    "numero": numero_processo or numero_ou_id_processo,
+                },
+                "review_mode": review_mode,
+                "review": review_data,
+                "forward_policy": {
+                    "manter_aberto": manter_aberto,
+                    "fechar_na_unidade_atual": not manter_aberto,
+                    "retorno_em": retorno_em,
+                    "retorno_dias": retorno_dias,
+                    "retorno_dias_uteis": retorno_dias_uteis,
+                    "reabrir_em": reabrir_em,
+                    "reabrir_dias": reabrir_dias,
+                    "reabrir_dias_uteis": reabrir_dias_uteis,
+                    "scheduled_return_supported": scheduled_return_supported,
+                    "scheduled_reopen_supported": scheduled_reopen_supported,
+                },
+                "available_form_fields": {
+                    "destino_field": tramitar_form.destino_field,
+                    "manter_aberto_field": tramitar_form.manter_aberto_field,
+                    "retorno_programado_fields": tramitar_form.retorno_programado_fields,
+                    "reabertura_programada_fields": tramitar_form.reabertura_programada_fields,
+                },
+                "destinations": resolved_destinos,
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-forward-confirm",
+                    label="Encaminhar o processo para as unidades destino",
+                    params={
+                        "numero_ou_id_processo": id_procedimento,
+                        "destinos": [item["id_unidade"] for item in resolved_destinos],
+                        "manter_aberto": manter_aberto,
+                        "retorno_em": retorno_em,
+                        "retorno_dias": retorno_dias,
+                        "retorno_dias_uteis": retorno_dias_uteis,
+                        "reabrir_em": reabrir_em,
+                        "reabrir_dias": reabrir_dias,
+                        "reabrir_dias_uteis": reabrir_dias_uteis,
+                    },
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_forward_confirm(
+    client: Any,
+    numero_ou_id_processo: str,
+    *,
+    destinos: list[str],
+    manter_aberto: bool = True,
+    retorno_em: str | None = None,
+    retorno_dias: str | None = None,
+    retorno_dias_uteis: bool = False,
+    reabrir_em: str | None = None,
+    reabrir_dias: str | None = None,
+    reabrir_dias_uteis: bool = False,
+    review_mode: str = "deep",
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-forward-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para encaminhar processo.",
+                details={"expected_flag": "--confirm"},
+            )
+
+        preview = process_forward_preview(
+            client,
+            numero_ou_id_processo,
+            destinos=destinos,
+            manter_aberto=manter_aberto,
+            retorno_em=retorno_em,
+            retorno_dias=retorno_dias,
+            retorno_dias_uteis=retorno_dias_uteis,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+            review_mode=review_mode,
+        )
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+
+        id_procedimento = preview["resolved_ids"]["id_procedimento"]
+        context = preview["context"]
+        target_destinos = [item["id_unidade"] for item in preview["data"]["destinations"]]
+        result = client.enviar_processo(
+            id_procedimento,
+            target_destinos,
+            manter_aberto=manter_aberto,
+            retorno_em=retorno_em,
+            retorno_dias=retorno_dias,
+            retorno_dias_uteis=retorno_dias_uteis,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+        )
+        if not result:
+            raise WorkflowViolationError("SEI nao confirmou o encaminhamento do processo.")
+
+        open_units = client.list_process_open_units(id_procedimento)
+        current_unit = context.get("unidade_sigla")
+        resolved_ids = dict(preview["resolved_ids"])
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": preview["data"]["preflight"],
+                "processo": preview["data"]["processo"],
+                "forward_policy": preview["data"]["forward_policy"],
+                "destinations": preview["data"]["destinations"],
+                "status_after": {
+                    "open_units": open_units,
+                    "current_unit_still_open": bool(current_unit and current_unit in open_units),
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="process-open",
+                    label="Reabrir processo para verificar estado apos encaminhamento",
+                    params={"numero_ou_id": id_procedimento},
+                )
+            ],
+            warnings=preview.get("warnings", []),
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("preview", {}).get("context") if "preview" in locals() else locals().get("context"),
+            resolved_ids=resolved_ids or locals().get("preview", {}).get("resolved_ids"),
+            exc=exc,
+        )
+
+
+def process_conclude_preview(
+    client: Any,
+    numero_ou_id_processo: str,
+    *,
+    reabrir_em: str | None = None,
+    reabrir_dias: str | None = None,
+    reabrir_dias_uteis: bool = False,
+) -> dict[str, Any]:
+    operation = "process-conclude-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if reabrir_em and reabrir_dias:
+            raise WorkflowViolationError("Conclusão com reabertura aceita data ou dias, não ambos.")
+        context = _context(client)
+        id_procedimento, numero_processo = _resolve_process_id(client, numero_ou_id_processo)
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            form_info = client.get_concluir_form(id_procedimento)
+
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id_processo,
+        }
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": {**preflight, "current_unit": context.get("unidade_sigla")},
+                "processo": {"id_procedimento": id_procedimento, "numero": numero_processo or numero_ou_id_processo},
+                "conclude_policy": {
+                    "mode": "reopen_on_date" if reabrir_em else "reopen_in_days" if reabrir_dias else "definitive",
+                    "reabrir_em": reabrir_em,
+                    "reabrir_dias": reabrir_dias,
+                    "reabrir_dias_uteis": reabrir_dias_uteis,
+                    "scheduled_reopen_supported": form_info.get("supports_reopen_schedule", False),
+                },
+                "available_form_fields": {
+                    "reabertura_programada_fields": form_info.get("reabertura_programada_fields", {}),
+                    "rdoConcluir": "rdoConcluir",
+                },
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-conclude-confirm",
+                    label="Concluir processo nesta unidade",
+                    params={
+                        "numero_ou_id_processo": id_procedimento,
+                        "reabrir_em": reabrir_em,
+                        "reabrir_dias": reabrir_dias,
+                        "reabrir_dias_uteis": reabrir_dias_uteis,
+                    },
+                )
+            ],
+            warnings=[] if not (reabrir_em or reabrir_dias) or form_info.get("supports_reopen_schedule") else [
+                "Formulário atual não expôs campos de reabertura programada."
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_conclude_confirm(
+    client: Any,
+    numero_ou_id_processo: str,
+    *,
+    reabrir_em: str | None = None,
+    reabrir_dias: str | None = None,
+    reabrir_dias_uteis: bool = False,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-conclude-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para concluir processo.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = process_conclude_preview(
+            client,
+            numero_ou_id_processo,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+        )
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+        id_procedimento = preview["resolved_ids"]["id_procedimento"]
+        ok = client.concluir_processo(
+            id_procedimento,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+        )
+        if not ok:
+            raise WorkflowViolationError("SEI nao confirmou a conclusão do processo.")
+        resolved_ids = dict(preview["resolved_ids"])
+        return _result(
+            operation=operation,
+            context=preview["context"],
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": preview["data"]["preflight"],
+                "processo": preview["data"]["processo"],
+                "conclude_policy": preview["data"]["conclude_policy"],
+            },
+            next_actions=[
+                NextAction(
+                    action="process-reopen-preview",
+                    label="Verificar se a reabertura está disponível nesta unidade",
+                    params={"numero_ou_id_processo": id_procedimento},
+                )
+            ],
+            warnings=preview.get("warnings", []),
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("preview", {}).get("context") if "preview" in locals() else locals().get("context"),
+            resolved_ids=resolved_ids or locals().get("preview", {}).get("resolved_ids"),
+            exc=exc,
+        )
+
+
+def process_reopen_preview(
+    client: Any,
+    numero_ou_id_processo: str,
+    *,
+    unit: str | None = None,
+) -> dict[str, Any]:
+    operation = "process-reopen-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        id_procedimento, numero_processo = _resolve_process_id(client, numero_ou_id_processo)
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            available = False
+            reason = "reopen_action_not_available_in_accessible_units"
+            candidate_unit = None
+            tried_units: list[str] = []
+            try:
+                candidate_unit, tried_units = _find_reopen_candidate_unit(
+                    client,
+                    id_procedimento,
+                    preferred_unit=unit,
+                )
+                if candidate_unit:
+                    available = True
+                    reason = "reopen_action_available"
+                    context = _context(client)
+                    preflight["switched"] = preflight.get("switched") or (candidate_unit != preflight.get("current_unit"))
+                    preflight["switched_to"] = candidate_unit
+            except Exception:
+                available = False
+                tried_units = [unit] if unit else []
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id_processo,
+        }
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": {**preflight, "current_unit": context.get("unidade_sigla")},
+                "processo": {"id_procedimento": id_procedimento, "numero": numero_processo or numero_ou_id_processo},
+                "reopen_available": available,
+                "reason": reason,
+                "requested_unit": unit,
+                "candidate_unit": candidate_unit,
+                "tried_units": tried_units,
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-reopen-confirm",
+                    label="Reabrir processo nesta unidade",
+                    params={"numero_ou_id_processo": id_procedimento, "unit": candidate_unit or unit},
+                )
+            ] if available else [],
+            warnings=[] if available else [
+                "A reabertura só fica disponível na unidade onde o processo foi concluído."
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_reopen_confirm(
+    client: Any,
+    numero_ou_id_processo: str,
+    *,
+    unit: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-reopen-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para reabrir processo.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = process_reopen_preview(client, numero_ou_id_processo, unit=unit)
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+        if not preview["data"].get("reopen_available"):
+            raise WorkflowViolationError("Ação de reabrir não está disponível nesta unidade.")
+        id_procedimento = preview["resolved_ids"]["id_procedimento"]
+        ok = client.reabrir_processo(id_procedimento)
+        if not ok:
+            raise WorkflowViolationError("SEI não confirmou a reabertura do processo.")
+        resolved_ids = dict(preview["resolved_ids"])
+        return _result(
+            operation=operation,
+            context=preview["context"],
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": preview["data"]["preflight"],
+                "processo": preview["data"]["processo"],
+                "reopened": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-open",
+                    label="Abrir o processo reaberto",
+                    params={"numero_ou_id": id_procedimento},
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("preview", {}).get("context") if "preview" in locals() else locals().get("context"),
+            resolved_ids=resolved_ids or locals().get("preview", {}).get("resolved_ids"),
+            exc=exc,
+        )
 
 
 def document_create_preview(

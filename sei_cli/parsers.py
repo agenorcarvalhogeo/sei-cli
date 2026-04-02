@@ -745,15 +745,51 @@ def parse_tramitar_form(content: str, base_url: str, current_url: str) -> Tramit
                 destinos = opts
 
     manter_aberto_field = None
+    retorno_programado_fields: dict[str, str] = {}
+    reabertura_programada_fields: dict[str, str] = {}
     for chk in form.xpath(".//input[@type='checkbox']"):
         name = chk.attrib.get("name", "")
         lname = name.lower()
         if "manter" in lname or "aberto" in lname:
             manter_aberto_field = name
-            break
+        if "retorno" in lname and "uteis" in lname:
+            retorno_programado_fields["uteis"] = name
+        if "reabertura" in lname and "uteis" in lname:
+            reabertura_programada_fields["uteis"] = name
+
+    for inp in form.xpath(".//input"):
+        name = inp.attrib.get("name", "")
+        if not name:
+            continue
+        lname = name.lower()
+        itype = inp.attrib.get("type", "").lower()
+        if "retorno" in lname:
+            if lname.startswith("rdoprazoretornoprogramado"):
+                retorno_programado_fields["radio"] = name
+            elif "diasretornoprogramado" in lname:
+                retorno_programado_fields["dias"] = name
+            elif "prazoretornoprogramado" in lname:
+                retorno_programado_fields["data"] = name
+        if "reabertura" in lname:
+            if lname.startswith("rdoprazoreaberturaprogramada"):
+                reabertura_programada_fields["radio"] = name
+            elif "diasreaberturaprogramada" in lname:
+                reabertura_programada_fields["dias"] = name
+            elif "prazoreaberturaprogramada" in lname:
+                reabertura_programada_fields["data"] = name
 
     if not destino_field or not destinos:
         raise ValueError("Campo de unidade destino não encontrado na tramitação")
+
+    # Extract AJAX auto-complete URL for unit resolution
+    ajax_url: str | None = None
+    ajax_match = re.search(
+        r"(controlador_ajax\.php\?acao_ajax="
+        r"unidade_auto_completar_envio_processo[^']+)",
+        content,
+    )
+    if ajax_match:
+        ajax_url = base_url.rstrip("/") + "/" + ajax_match.group(1)
 
     return TramitarForm(
         action=urljoin(base_url, action),
@@ -761,7 +797,10 @@ def parse_tramitar_form(content: str, base_url: str, current_url: str) -> Tramit
         select_fields=select_fields,
         destino_field=destino_field,
         manter_aberto_field=manter_aberto_field,
+        retorno_programado_fields=retorno_programado_fields,
+        reabertura_programada_fields=reabertura_programada_fields,
         destinos=destinos,
+        ajax_url=ajax_url,
     )
 
 

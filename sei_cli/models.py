@@ -191,7 +191,10 @@ class TramitarForm:
     select_fields: dict[str, str]
     destino_field: str
     manter_aberto_field: str | None
+    retorno_programado_fields: dict[str, str] = field(default_factory=dict)
+    reabertura_programada_fields: dict[str, str] = field(default_factory=dict)
     destinos: list[TramitarDestino] = field(default_factory=list)
+    ajax_url: str | None = None
 
 
 @dataclass(slots=True)

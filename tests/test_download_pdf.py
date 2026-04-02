@@ -42,6 +42,24 @@ Nos[1] = {
 </body></html>
 """
 
+ARVORE_WITH_PROCESS_AND_OTHER_DOC_URL = """
+<html><body>
+<script>
+var Nos = [];
+Nos[0] = {
+  'acoes': [
+    '<a href="controlador.php?acao=procedimento_gerar_pdf&amp;acao_origem=arvore_visualizar&amp;id_procedimento=12345&amp;arvore=1&amp;infra_sistema=100000100&amp;infra_unidade_atual=110008367&amp;infra_hash=abcdef">Gerar PDF do Processo</a>'
+  ]
+};
+Nos[1] = {
+  'acoes': [
+    '<a href="controlador.php?acao=procedimento_gerar_pdf&amp;id_documento=11111&amp;id_procedimento=12345&amp;infra_hash=def456">Gerar PDF do Documento</a>'
+  ]
+};
+</script>
+</body></html>
+"""
+
 ARVORE_WITHOUT_PDF_URL = """
 <html><body>
 <script>
@@ -98,6 +116,7 @@ def make_client() -> SEIClient:
     client._batch_active = False
     client._hash_pool = {}
     return client
+
 
 # --- Tests ---
 
@@ -228,6 +247,32 @@ def test_download_document_pdf_success(tmp_path) -> None:
     assert mock_get.call_count == 2
     # Verify we picked the URL containing id_documento=99999
     assert "id_documento=99999" in mock_get.call_args_list[0][0][0]
+
+
+def test_download_document_pdf_falls_back_to_apenas_mode_when_direct_link_is_missing(tmp_path) -> None:
+    client = make_client()
+    output_path = str(tmp_path / "doc-fallback.pdf")
+
+    get_responses = [
+        FakeResponse(text=CONFIRM_FORM_HTML),
+        FakeResponse(content=PDF_BYTES, content_type="application/pdf"),
+    ]
+
+    def side_effect_get(url):
+        return get_responses.pop(0)
+
+    with patch.object(client, "_navigate_to_arvore", return_value=ARVORE_WITH_PROCESS_AND_OTHER_DOC_URL), \
+         patch.object(client, "_get", side_effect=side_effect_get) as mock_get, \
+         patch.object(client, "_post", return_value=FakeResponse(text=IFRAME_RESPONSE_HTML)) as mock_post:
+
+        result = client.download_document_pdf("99999", "12345", output_path=output_path)
+
+    assert result == output_path
+    assert "id_procedimento=12345" in mock_get.call_args_list[0][0][0]
+    assert "id_documento=" not in mock_get.call_args_list[0][0][0]
+    post_args = mock_post.call_args[0]
+    assert post_args[1]["rdoTipo"] == "A"
+    assert post_args[1]["hdnDocumentosApenas"] == "99999"
 
 
 def test_download_document_pdf_raises_when_url_missing() -> None:

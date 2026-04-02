@@ -54,6 +54,16 @@ def test_parse_tramitar_form() -> None:
           <option value="110008367" selected>CMDO PABM APODI</option>
         </select>
         <input type="checkbox" name="chkSinManterAberto" value="S" />
+        <input type="radio" name="rdoPrazoRetornoProgramado" value="1" />
+        <input type="text" name="txtPrazoRetornoProgramado" value="" />
+        <input type="radio" name="rdoPrazoRetornoProgramado" value="2" />
+        <input type="text" name="txtDiasRetornoProgramado" value="" />
+        <input type="checkbox" name="chkSinDiasUteisRetornoProgramado" value="S" />
+        <input type="radio" name="rdoPrazoReaberturaProgramada" value="1" />
+        <input type="text" name="txtPrazoReaberturaProgramada" value="" />
+        <input type="radio" name="rdoPrazoReaberturaProgramada" value="2" />
+        <input type="text" name="txtDiasReaberturaProgramada" value="" />
+        <input type="checkbox" name="chkSinDiasUteisReaberturaProgramada" value="S" />
       </form>
     </body></html>
     """
@@ -62,6 +72,14 @@ def test_parse_tramitar_form() -> None:
     assert form.manter_aberto_field == "chkSinManterAberto"
     assert len(form.destinos) == 2
     assert any(d.id_unidade == "110008367" for d in form.destinos)
+    assert form.retorno_programado_fields["radio"] == "rdoPrazoRetornoProgramado"
+    assert form.retorno_programado_fields["data"] == "txtPrazoRetornoProgramado"
+    assert form.retorno_programado_fields["dias"] == "txtDiasRetornoProgramado"
+    assert form.retorno_programado_fields["uteis"] == "chkSinDiasUteisRetornoProgramado"
+    assert form.reabertura_programada_fields["radio"] == "rdoPrazoReaberturaProgramada"
+    assert form.reabertura_programada_fields["data"] == "txtPrazoReaberturaProgramada"
+    assert form.reabertura_programada_fields["dias"] == "txtDiasReaberturaProgramada"
+    assert form.reabertura_programada_fields["uteis"] == "chkSinDiasUteisReaberturaProgramada"
 
 
 def test_parse_marcadores_list() -> None:

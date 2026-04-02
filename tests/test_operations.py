@@ -8,7 +8,7 @@ from typing import Any
 from click.testing import CliRunner
 
 from sei_cli.cli import cli
-from sei_cli.models import Block, BlockDocument, DocumentCreated, DocumentType, Process, ProcessList, SystemStatus, TreeDocument
+from sei_cli.models import Block, BlockDocument, DocumentCreated, DocumentType, Process, ProcessList, SystemStatus, TramitarDestino, TramitarForm, TreeDocument
 from sei_cli.models import EditorSection
 from sei_cli.operations import (
     block_review,
@@ -26,6 +26,10 @@ from sei_cli.operations import (
     marker_catalog,
     process_finalize_confirm,
     process_finalize_preview,
+    process_conclude_confirm,
+    process_conclude_preview,
+    process_forward_confirm,
+    process_forward_preview,
     process_marker_history,
     process_create_confirm,
     process_create_preview,
@@ -40,6 +44,8 @@ from sei_cli.operations import (
     process_marker_update_confirm,
     process_marker_update_preview,
     process_open,
+    process_reopen_confirm,
+    process_reopen_preview,
     process_report,
     process_read,
     process_summary,
@@ -60,6 +66,10 @@ from sei_cli.relatorio_parser import Militar, RelatorioServico
 
 
 class FakeClient:
+    UNIT_IDS = {
+        "PAD-PDF": "110006929",
+        "CMDO PABM APODI": "110008367",
+    }
     PROC_TYPES = {
         "ferias": "100000182",
         "informacao": "100000595",
@@ -79,6 +89,10 @@ class FakeClient:
         self.signed_documents: list[dict[str, Any]] = []
         self.authenticated_documents: list[dict[str, Any]] = []
         self.generated_pdf_paths: list[str] = []
+        self.forwarded_processes: list[dict[str, Any]] = []
+        self.concluded_processes: list[dict[str, Any]] = []
+        self.reopened_processes: list[str] = []
+        self.history_units: dict[str, list[str]] = {"47607237": ["CMDO PABM APODI", "PAD-PDF"]}
         self.marker_catalog = [
             {"id": "10", "nome": "LIVROS"},
             {"id": "11", "nome": "Férias / Dispensas"},
@@ -142,11 +156,19 @@ class FakeClient:
         self.switched_to = keyword
         return self.status()
 
+    def list_units(self) -> list[Any]:
+        return [
+            type("UnitObj", (), {"sigla": "OP 3"})(),
+            type("UnitObj", (), {"sigla": "CMDO PABM APODI"})(),
+            type("UnitObj", (), {"sigla": "PAD-PDF"})(),
+        ]
+
     def status(self) -> SystemStatus:
+        unit_sigla = self.switched_to or "OP 3"
         return SystemStatus(
             valid=True,
-            unidade_sigla="OP 3",
-            unidade_descricao="Operacional 3",
+            unidade_sigla=unit_sigla,
+            unidade_descricao=unit_sigla,
             usuario="Fulano",
             ultimo_acesso="29/03/2026 10:00",
         )
@@ -596,6 +618,152 @@ class FakeClient:
             "linkMarcador": "controlador.php?acao=andamento_marcador_gerenciar&id_procedimento=47607237",
         }
 
+    def _open_process_page(self, id_procedimento: str) -> str:
+        if id_procedimento == "47607237":
+            return """
+            <html><body>
+              <a href="controlador.php?acao=procedimento_reabrir&id_procedimento=47607237">Reabrir</a>
+              <a href="controlador.php?acao=procedimento_concluir&id_procedimento=47607237">Concluir</a>
+              <a href="controlador.php?acao=procedimento_enviar&id_procedimento=47607237">Enviar</a>
+            </body></html>
+            """
+        return "<html><body></body></html>"
+
+    def _extract_action_url(self, html: str, token: str) -> str | None:
+        if token == "procedimento_reabrir" and "procedimento_reabrir" in html:
+            return "https://sei.rn.gov.br/sei/controlador.php?acao=procedimento_reabrir&id_procedimento=47607237"
+        return None
+
+    def get_tramitar_form(self, id_procedimento: str, _proc_html: str | None = None) -> TramitarForm:
+        return TramitarForm(
+            action="https://sei.rn.gov.br/sei/controlador.php?acao=procedimento_enviar_executar",
+            hidden_fields={"infra_hash": "abc"},
+            select_fields={},
+            destino_field="selUnidades",
+            manter_aberto_field="chkSinManterAberto",
+            retorno_programado_fields={
+                "radio": "rdoPrazoRetornoProgramado",
+                "data": "txtPrazoRetornoProgramado",
+                "dias": "txtDiasRetornoProgramado",
+                "uteis": "chkSinDiasUteisRetornoProgramado",
+            },
+            reabertura_programada_fields={
+                "radio": "rdoPrazoReaberturaProgramada",
+                "data": "txtPrazoReaberturaProgramada",
+                "dias": "txtDiasReaberturaProgramada",
+                "uteis": "chkSinDiasUteisReaberturaProgramada",
+            },
+            destinos=[
+                TramitarDestino(id_unidade="110006929", nome="PAD-PDF"),
+                TramitarDestino(id_unidade="110008367", nome="CMDO PABM APODI"),
+            ],
+            ajax_url="https://sei.rn.gov.br/sei/controlador_ajax.php?acao_ajax=unidade_auto_completar_envio_processo",
+        )
+
+    def _resolve_unit_id(self, unidade: str) -> str:
+        mapping = {
+            "pad-pdf": "110006929",
+            "cmdo pabm apodi": "110008367",
+            "110006929": "110006929",
+            "110008367": "110008367",
+        }
+        return mapping[unidade.lower()]
+
+    def _resolve_unit_id_ajax(
+        self,
+        unidade: str,
+        _ajax_url: str | None,
+        descriptions: dict[str, str] | None = None,
+    ) -> str:
+        unit_id = self._resolve_unit_id(unidade)
+        if descriptions is not None:
+            reverse = {
+                "110006929": "PAD-PDF",
+                "110008367": "CMDO PABM APODI",
+            }
+            descriptions[unit_id] = reverse[unit_id]
+        return unit_id
+
+    def enviar_processo(
+        self,
+        id_procedimento: str,
+        unidades_destino: str | list[str],
+        manter_aberto: bool = True,
+        retorno_em: str | None = None,
+        retorno_dias: str | None = None,
+        retorno_dias_uteis: bool = False,
+        reabrir_em: str | None = None,
+        reabrir_dias: str | None = None,
+        reabrir_dias_uteis: bool = False,
+    ) -> bool:
+        if isinstance(unidades_destino, str):
+            unidades_destino = [unidades_destino]
+        self.forwarded_processes.append(
+            {
+                "id_procedimento": id_procedimento,
+                "unidades_destino": list(unidades_destino),
+                "manter_aberto": manter_aberto,
+                "retorno_em": retorno_em,
+                "retorno_dias": retorno_dias,
+                "retorno_dias_uteis": retorno_dias_uteis,
+                "reabrir_em": reabrir_em,
+                "reabrir_dias": reabrir_dias,
+                "reabrir_dias_uteis": reabrir_dias_uteis,
+            }
+        )
+        return True
+
+    def list_process_open_units(self, id_procedimento: str) -> list[str]:
+        if not self.forwarded_processes:
+            return ["OP 3"]
+        last = self.forwarded_processes[-1]
+        open_units = list(last["unidades_destino"])
+        if last["manter_aberto"]:
+            open_units.append("OP 3")
+        return open_units
+
+    def get_concluir_form(self, id_procedimento: str) -> dict[str, Any]:
+        assert id_procedimento == "47607237"
+        return {
+            "action": "controlador.php?acao=procedimento_concluir_executar&id_procedimento=47607237",
+            "hidden_fields": {"infra_hash": "abc"},
+            "reabertura_programada_fields": {
+                "radio": "rdoPrazoReaberturaProgramada",
+                "data": "txtPrazoReaberturaProgramada",
+                "dias": "txtDiasReaberturaProgramada",
+                "uteis": "chkSinDiasUteisReaberturaProgramada",
+            },
+            "supports_reopen_schedule": True,
+        }
+
+    def concluir_processo(
+        self,
+        id_procedimento: str,
+        *,
+        reabrir_em: str | None = None,
+        reabrir_dias: str | None = None,
+        reabrir_dias_uteis: bool = False,
+    ) -> bool:
+        self.concluded_processes.append(
+            {
+                "id_procedimento": id_procedimento,
+                "reabrir_em": reabrir_em,
+                "reabrir_dias": reabrir_dias,
+                "reabrir_dias_uteis": reabrir_dias_uteis,
+            }
+        )
+        return True
+
+    def reabrir_processo(self, id_procedimento: str) -> bool:
+        self.reopened_processes.append(id_procedimento)
+        return True
+
+    def check_reopen_available(self, id_procedimento: str) -> bool:
+        return id_procedimento == "47607237"
+
+    def list_process_history_units(self, id_procedimento: str) -> list[str]:
+        return list(self.history_units.get(id_procedimento, []))
+
     def create_process(
         self,
         tipo_processo_id: str,
@@ -824,6 +992,18 @@ class FakeClientLegacySwitch(FakeClient):
     def switch_unit(self, keyword: str) -> bool:
         self.switched_to = keyword
         return True
+
+
+class AmbiguousUnitClient(FakeClient):
+    def _resolve_unit_id_ajax(
+        self,
+        unidade: str,
+        _ajax_url: str | None,
+        descriptions: dict[str, str] | None = None,
+    ) -> str:
+        raise RuntimeError(
+            "Unidade 'CHEFIA SAT' é ambígua. Especifique uma destas: DAT-1CAT CHEFIA, DAT CHEFIA 1ºSAT/1ºCAT"
+        )
 
 
 class EmptyCreateDocumentClient(FakeClient):
@@ -1454,6 +1634,125 @@ def test_process_finalize_preview_strips_institutional_prefix_from_signer_name()
     assert result["ok"] is True
     doc = result["data"]["documents"][0]
     assert doc["expected_signer"]["name"] == "Leo Zenon Tassi"
+
+
+def test_process_forward_preview_contract() -> None:
+    result = process_forward_preview(
+        FakeClient(),
+        "47607237",
+        destinos=["PAD-PDF", "CMDO PABM APODI"],
+        manter_aberto=False,
+        retorno_dias="7",
+        retorno_dias_uteis=True,
+        reabrir_em="05/04/2026",
+        review_mode="summary",
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-forward-preview"
+    assert result["resolved_ids"]["destination_unit_ids"] == ["110006929", "110008367"]
+    assert result["data"]["forward_policy"]["fechar_na_unidade_atual"] is True
+    assert result["data"]["forward_policy"]["retorno_dias"] == "7"
+    assert result["data"]["forward_policy"]["retorno_dias_uteis"] is True
+    assert result["data"]["forward_policy"]["scheduled_reopen_supported"] is True
+    assert result["data"]["forward_policy"]["scheduled_return_supported"] is True
+    assert result["data"]["destinations"][0]["nome"] == "PAD-PDF"
+
+
+def test_process_forward_confirm_contract() -> None:
+    client = FakeClient()
+    result = process_forward_confirm(
+        client,
+        "47607237",
+        destinos=["PAD-PDF"],
+        manter_aberto=True,
+        retorno_em="10/04/2026",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-forward-confirm"
+    assert client.forwarded_processes == [
+        {
+            "id_procedimento": "47607237",
+            "unidades_destino": ["110006929"],
+            "manter_aberto": True,
+            "retorno_em": "10/04/2026",
+            "retorno_dias": None,
+            "retorno_dias_uteis": False,
+            "reabrir_em": None,
+            "reabrir_dias": None,
+            "reabrir_dias_uteis": False,
+        }
+    ]
+    assert result["data"]["status_after"]["current_unit_still_open"] is True
+
+
+def test_process_forward_preview_fails_closed_on_ambiguous_destination() -> None:
+    result = process_forward_preview(
+        AmbiguousUnitClient(),
+        "47607237",
+        destinos=["CHEFIA SAT"],
+    )
+
+    assert result["ok"] is False
+    assert "ambígua" in result["error"]["message"]
+
+
+def test_process_conclude_preview_contract() -> None:
+    result = process_conclude_preview(
+        FakeClient(),
+        "47607237",
+        reabrir_dias="5",
+        reabrir_dias_uteis=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-conclude-preview"
+    assert result["data"]["conclude_policy"]["reabrir_dias"] == "5"
+    assert result["data"]["conclude_policy"]["reabrir_dias_uteis"] is True
+    assert result["data"]["conclude_policy"]["scheduled_reopen_supported"] is True
+    assert result["data"]["available_form_fields"]["rdoConcluir"] == "rdoConcluir"
+
+
+def test_process_conclude_confirm_contract() -> None:
+    client = FakeClient()
+    result = process_conclude_confirm(
+        client,
+        "47607237",
+        reabrir_em="05/04/2026",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-conclude-confirm"
+    assert client.concluded_processes == [
+        {
+            "id_procedimento": "47607237",
+            "reabrir_em": "05/04/2026",
+            "reabrir_dias": None,
+            "reabrir_dias_uteis": False,
+        }
+    ]
+
+
+def test_process_reopen_preview_contract() -> None:
+    result = process_reopen_preview(FakeClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-reopen-preview"
+    assert result["data"]["reopen_available"] is True
+    assert result["data"]["candidate_unit"] == "OP 3"
+    assert result["data"]["confirmation_required"] is True
+
+
+def test_process_reopen_confirm_contract() -> None:
+    client = FakeClient()
+    result = process_reopen_confirm(client, "47607237", confirm=True)
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-reopen-confirm"
+    assert client.reopened_processes == ["47607237"]
 
 
 def test_process_create_preview_exposes_hypotheses_when_non_public_access_is_requested() -> None:
@@ -2788,6 +3087,112 @@ def test_process_finalize_confirm_cli_json(monkeypatch) -> None:
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["operation"] == "process-finalize-confirm"
+
+
+def test_process_forward_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-forward-preview",
+            "47607237",
+            "PAD-PDF",
+            "--fechar",
+            "--retorno-dias",
+            "7",
+            "--retorno-dias-uteis",
+            "--reabrir-em",
+            "05/04/2026",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-forward-preview"
+    assert payload["data"]["forward_policy"]["retorno_dias"] == "7"
+
+
+def test_process_forward_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-forward-confirm",
+            "47607237",
+            "PAD-PDF",
+            "--retorno-em",
+            "10/04/2026",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-forward-confirm"
+    assert payload["data"]["forward_policy"]["retorno_em"] == "10/04/2026"
+
+
+def test_process_conclude_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["process-conclude-preview", "47607237", "--reabrir-dias", "5", "--reabrir-dias-uteis", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-conclude-preview"
+    assert payload["data"]["conclude_policy"]["reabrir_dias"] == "5"
+
+
+def test_process_conclude_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["process-conclude-confirm", "47607237", "--reabrir-em", "05/04/2026", "--confirm", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-conclude-confirm"
+
+
+def test_process_reopen_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["process-reopen-preview", "47607237", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-reopen-preview"
+
+
+def test_process_reopen_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["process-reopen-confirm", "47607237", "--confirm", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-reopen-confirm"
 
 
 def test_relatorio_read_cli_json(monkeypatch) -> None:

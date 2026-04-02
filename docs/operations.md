@@ -259,6 +259,161 @@ Backlog rebaixado:
 - bulk de marcador pelo Controle de Processos
 - mutações em lote de múltiplos processos
 
+## Auditoria de Sessao e Login
+
+Objetivo:
+
+- eliminar relogins desnecessarios
+- reduzir perda de contexto de unidade/processo
+- medir o custo de navegacao por canônica
+- identificar fluxos que desviam da rota correta da UI do SEI
+
+Hipotese operacional:
+
+- quando a canônica segue a sequencia certa de rotas do SEI, a sessao se mantém
+- relogin recorrente normalmente indica rota errada, refresh inadequado, wrapper mal resolvido
+  ou restore de unidade inconsistente
+
+### Prioridade de auditoria
+
+1. leitura base
+2. troca/restauração de unidade
+3. bloco de assinatura
+4. criação/edição documental
+5. PDF nativo
+6. triagem de ambiente
+
+### Pontos de codigo sensiveis
+
+- `_try_inicializar`
+- `_navigate_to_arvore`
+- `_auto_unit_switch`
+- `switch_unit`
+- qualquer fluxo que reabra `principal`
+- qualquer fluxo que troque unidade e nao confirme restore
+- qualquer fluxo que reabra arvore/processo mais vezes do que a UI faria
+
+### Canônicas a verificar
+
+- `process-open`
+- `document-read`
+- `process-read`
+- `relatorio-read`
+- `document-create-*`
+- `document-edit-*`
+- `process-pdf-*`
+- `document-pdf-*`
+- `signature-block-*`
+- `process-finalize-*`
+- `environment-triage-*`
+
+### Sinais de erro critico
+
+- terminar em `login.php` sem expiracao real
+- relogin no meio de uma canônica
+- restore de unidade incorreto
+- segunda execucao funcionar melhor que a primeira sem motivo funcional
+- diferenca grande entre fluxo local e fluxo da UI
+
+### Regra de seguranca para testes reais
+
+- toda escrita deve usar apenas processos e documentos de teste
+- toda assinatura deve usar apenas processos, documentos e blocos de teste
+- nenhuma mutação real deve ocorrer em processo operacional fora do conjunto de teste
+
+## Encaminhamento, Conclusao e Reabertura
+
+### Encaminhamento de processo
+
+A canônica de encaminhamento precisa separar explicitamente dois conceitos
+que hoje nao podem ser tratados como o mesmo campo:
+
+- `retorno programado`
+- `reabertura programada`
+
+Diretriz:
+
+- o parser do formulario de envio deve expor campos separados
+- a canônica nao deve mais usar um `date_fields` generico
+- o contrato deve informar qual dos dois grupos o formulario real expôs
+- a camada de operacao deve validar que, em geral, o usuario informa um ou outro
+
+Superficie desejada:
+
+- `process-forward-preview`
+- `process-forward-confirm`
+
+Com politica:
+
+- `--retorno-em`
+- `--reabrir-em`
+- falhar fechado se ambos forem usados e o formulario nao suportar combinacao
+- preview deve refletir a semantica correta antes do `confirm`
+
+### Conclusao de processo
+
+O fluxo de conclusao tambem deve virar canônica completa.
+
+Capacidades desejadas:
+
+- concluir definitivo
+- concluir com reabertura programada por data
+- concluir com reabertura programada por prazo em dias
+
+Superficie desejada:
+
+- `process-conclude-preview`
+- `process-conclude-confirm`
+
+Contrato esperado:
+
+- `conclude_policy.mode = definitive | reopen_on_date | reopen_in_days`
+- `available_form_fields`
+- `scheduled_reopen_supported`
+
+### Reabertura de processo
+
+Reabrir processo concluido depende da unidade:
+
+- navegar para uma unidade que o usuario acesse
+- essa unidade precisa ser uma unidade onde o processo esteve e foi concluido
+- so nessa unidade a acao `reabrir` fica disponivel
+
+Superficie desejada:
+
+- `process-reopen-preview`
+- `process-reopen-confirm`
+
+Pre-condicoes:
+
+- resolver o processo
+- identificar unidades acessiveis onde a reabertura e possivel
+- explicitar em qual unidade a reabertura ocorrera
+
+Pos-condicoes:
+
+- confirmar que o processo voltou a ficar aberto nessa unidade
+
+### Bateria recomendada para validacao real
+
+- leitura base: `process-open`, `document-read`, `process-read`, `relatorio-read`
+- escrita documental: `document-create-*`, `document-edit-*`
+- PDF nativo: `process-pdf-*`, `document-pdf-*`
+- bloco de assinatura: `signature-block-read/review/refresh/sign`
+- finalizacao: `process-finalize-*`
+- triagem: `environment-triage-*`
+
+Para cada teste real, registrar:
+
+- comando
+- tempo total aproximado
+- unidade inicial
+- unidade final
+- se houve relogin
+- se houve troca de unidade
+- se precisou repetir a execucao
+- erro exato, se houver
+
 Próximos refinamentos desejáveis dentro desta frente:
 
 - histórico de marcador mais rico, quando a UI expuser mais metadados

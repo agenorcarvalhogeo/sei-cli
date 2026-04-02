@@ -27,10 +27,16 @@ from sei_cli.operations import (
     marker_catalog as op_marker_catalog,
     process_create_confirm as op_process_create_confirm,
     process_create_preview as op_process_create_preview,
+    process_conclude_confirm as op_process_conclude_confirm,
+    process_conclude_preview as op_process_conclude_preview,
     process_finalize_confirm as op_process_finalize_confirm,
     process_finalize_preview as op_process_finalize_preview,
+    process_forward_confirm as op_process_forward_confirm,
+    process_forward_preview as op_process_forward_preview,
     process_pdf_confirm as op_process_pdf_confirm,
     process_pdf_preview as op_process_pdf_preview,
+    process_reopen_confirm as op_process_reopen_confirm,
+    process_reopen_preview as op_process_reopen_preview,
     process_marker_history as op_process_marker_history,
     process_marker_preview as op_process_marker_preview,
     process_marker_read as op_process_marker_read,
@@ -1101,6 +1107,175 @@ def process_finalize_confirm_cmd(
             numero_ou_id_processo,
             document_ids=list(document_ids),
             force_sign_document_ids=list(force_sign_document_ids),
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-forward-preview")
+@click.argument("numero_ou_id_processo")
+@click.argument("destinos", nargs=-1, required=True)
+@click.option("--fechar", is_flag=True, help="Fechar o processo na unidade atual apos encaminhar")
+@click.option("--retorno-em", default=None, help="Data do retorno programado")
+@click.option("--retorno-dias", default=None, help="Prazo em dias para retorno programado")
+@click.option("--retorno-dias-uteis", is_flag=True, help="Usa dias uteis no retorno programado")
+@click.option("--reabrir-em", default=None, help="Data de reabertura programada")
+@click.option("--reabrir-dias", default=None, help="Prazo em dias para reabertura programada")
+@click.option("--reabrir-dias-uteis", is_flag=True, help="Usa dias uteis na reabertura programada")
+@click.option("--review-mode", type=click.Choice(["fast", "summary", "deep"]), default="deep", show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_forward_preview_cmd(
+    numero_ou_id_processo: str,
+    destinos: tuple[str, ...],
+    fechar: bool,
+    retorno_em: str | None,
+    retorno_dias: str | None,
+    retorno_dias_uteis: bool,
+    reabrir_em: str | None,
+    reabrir_dias: str | None,
+    reabrir_dias_uteis: bool,
+    review_mode: str,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_forward_preview(
+            client,
+            numero_ou_id_processo,
+            destinos=list(destinos),
+            manter_aberto=not fechar,
+            retorno_em=retorno_em,
+            retorno_dias=retorno_dias,
+            retorno_dias_uteis=retorno_dias_uteis,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+            review_mode=review_mode,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-forward-confirm")
+@click.argument("numero_ou_id_processo")
+@click.argument("destinos", nargs=-1, required=True)
+@click.option("--fechar", is_flag=True, help="Fechar o processo na unidade atual apos encaminhar")
+@click.option("--retorno-em", default=None, help="Data do retorno programado")
+@click.option("--retorno-dias", default=None, help="Prazo em dias para retorno programado")
+@click.option("--retorno-dias-uteis", is_flag=True, help="Usa dias uteis no retorno programado")
+@click.option("--reabrir-em", default=None, help="Data de reabertura programada")
+@click.option("--reabrir-dias", default=None, help="Prazo em dias para reabertura programada")
+@click.option("--reabrir-dias-uteis", is_flag=True, help="Usa dias uteis na reabertura programada")
+@click.option("--review-mode", type=click.Choice(["fast", "summary", "deep"]), default="deep", show_default=True)
+@click.option("--confirm", is_flag=True, help="Confirma o encaminhamento")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_forward_confirm_cmd(
+    numero_ou_id_processo: str,
+    destinos: tuple[str, ...],
+    fechar: bool,
+    retorno_em: str | None,
+    retorno_dias: str | None,
+    retorno_dias_uteis: bool,
+    reabrir_em: str | None,
+    reabrir_dias: str | None,
+    reabrir_dias_uteis: bool,
+    review_mode: str,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_forward_confirm(
+            client,
+            numero_ou_id_processo,
+            destinos=list(destinos),
+            manter_aberto=not fechar,
+            retorno_em=retorno_em,
+            retorno_dias=retorno_dias,
+            retorno_dias_uteis=retorno_dias_uteis,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+            review_mode=review_mode,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-conclude-preview")
+@click.argument("numero_ou_id_processo")
+@click.option("--reabrir-em", default=None, help="Data para reabrir automaticamente")
+@click.option("--reabrir-dias", default=None, help="Prazo em dias para reabrir automaticamente")
+@click.option("--reabrir-dias-uteis", is_flag=True, help="Usa dias uteis para reabertura programada")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_conclude_preview_cmd(
+    numero_ou_id_processo: str,
+    reabrir_em: str | None,
+    reabrir_dias: str | None,
+    reabrir_dias_uteis: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_conclude_preview(
+            client,
+            numero_ou_id_processo,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-conclude-confirm")
+@click.argument("numero_ou_id_processo")
+@click.option("--reabrir-em", default=None, help="Data para reabrir automaticamente")
+@click.option("--reabrir-dias", default=None, help="Prazo em dias para reabrir automaticamente")
+@click.option("--reabrir-dias-uteis", is_flag=True, help="Usa dias uteis para reabertura programada")
+@click.option("--confirm", is_flag=True, help="Confirma a conclusao")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_conclude_confirm_cmd(
+    numero_ou_id_processo: str,
+    reabrir_em: str | None,
+    reabrir_dias: str | None,
+    reabrir_dias_uteis: bool,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_conclude_confirm(
+            client,
+            numero_ou_id_processo,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-reopen-preview")
+@click.argument("numero_ou_id_processo")
+@click.option("--unit", default=None, help="Unidade preferida para tentar a reabertura")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_reopen_preview_cmd(numero_ou_id_processo: str, unit: str | None, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_process_reopen_preview(client, numero_ou_id_processo, unit=unit)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-reopen-confirm")
+@click.argument("numero_ou_id_processo")
+@click.option("--unit", default=None, help="Unidade preferida para tentar a reabertura")
+@click.option("--confirm", is_flag=True, help="Confirma a reabertura")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_reopen_confirm_cmd(
+    numero_ou_id_processo: str,
+    unit: str | None,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_reopen_confirm(
+            client,
+            numero_ou_id_processo,
+            unit=unit,
             confirm=confirm,
         )
     _emit_operation_result(result, as_json)
