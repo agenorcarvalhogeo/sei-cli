@@ -5930,6 +5930,70 @@ class SEIClient:
             results.append(result)
         return results
 
+    def get_document_sign_form_info(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
+        """Inspect the sign form without submitting it.
+
+        Returns the pre-populated signer fields the SEI exposes for the
+        current session/user on that specific document.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            return {"ok": False, "error": f"Processo {id_procedimento} não encontrado ou sessão expirada"}
+
+        with self._auto_unit_switch(arvore_html) as switched_to:
+            if switched_to:
+                arvore_html = self._navigate_to_arvore(id_procedimento)
+                if not arvore_html:
+                    return {"ok": False, "error": f"Processo {id_procedimento} não acessível na unidade {switched_to}"}
+
+            doc_pattern = re.compile(
+                rf'controlador\.php\?acao=arvore_visualizar[^"]*id_documento={id_documento}[^"]*'
+            )
+            doc_match = doc_pattern.search(arvore_html)
+            if not doc_match:
+                return {"ok": False, "error": f"Documento {id_documento} não encontrado na árvore"}
+
+            doc_url = urljoin(self._sei_url(""), doc_match.group())
+            rd = self._get(doc_url)
+            sign_match = re.search(r"var\s+linkAssinarDocumento\s*=\s*'([^']+)'", rd.text)
+            if not sign_match:
+                return {"ok": False, "error": "Link de assinatura/autenticação não encontrado para este documento"}
+
+            sign_url = urljoin(self._sei_url(""), sign_match.group(1))
+            rs = self._get(sign_url)
+            ssoup = BeautifulSoup(rs.text, "lxml")
+            form = ssoup.find("form", {"id": "frmAssinaturas"})
+            if not form:
+                return {
+                    "ok": False,
+                    "error": "Formulário de assinatura não encontrado",
+                    "url": str(rs.url),
+                }
+
+            def _field(name: str) -> str:
+                field = form.find(attrs={"name": name})
+                if not field:
+                    return ""
+                if getattr(field, "name", "") == "select":
+                    selected = field.find("option", selected=True)
+                    if selected is None:
+                        selected = field.find("option")
+                    return (selected.get("value", "") if selected else "").strip()
+                return (field.get("value", "") or "").strip()
+
+            txt_usuario = _field("txtUsuario")
+            hdn_id_usuario = _field("hdnIdUsuario")
+            sel_cargo = _field("selCargoFuncao")
+
+            return {
+                "ok": True,
+                "sign_url": sign_url,
+                "txtUsuario": txt_usuario,
+                "hdnIdUsuario": hdn_id_usuario,
+                "selCargoFuncao": sel_cargo,
+                "switched_to": switched_to,
+            }
+
     def _sign_or_authenticate(
         self,
         id_documento: str,

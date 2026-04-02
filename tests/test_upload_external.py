@@ -125,6 +125,18 @@ function acaoAssinar(id) {
 </body></html>
 """
 
+PRINCIPAL_WRAPPER_HTML = """
+<html><body>
+<iframe id="ifrArvore" src="controlador.php?acao=procedimento_controlar&infra_sistema=100000100&infra_hash=xyz"></iframe>
+</body></html>
+"""
+
+CONTROL_HTML = """
+<html><body>
+<form id="frmProcedimentoControlar"></form>
+</body></html>
+"""
+
 BLOCK_PREVIEW_HTML = """
 <html><body>
   <div id="divInfraSparklingModal">
@@ -784,3 +796,21 @@ class TestBlockDetailHelpers:
 
         assert result["signed"] == ["48783191"]
         assert result["errors"] == []
+
+
+class TestTryInicializar:
+    def setup_method(self):
+        self.client = _make_client()
+        self.client._sei_url = SEIClient._sei_url.__get__(self.client, SEIClient)
+        self.client.client = MagicMock()
+
+    def test_try_inicializar_follows_principal_iframe_to_control(self):
+        r1 = _mock_response("", url="https://sei.rn.gov.br/sei/inicializar.php", status=302)
+        r1.headers = {"location": "controlador.php?acao=principal&infra_hash=abc"}
+        r2 = _mock_response(PRINCIPAL_WRAPPER_HTML, url="https://sei.rn.gov.br/sei/controlador.php?acao=principal&infra_hash=abc")
+        r3 = _mock_response(CONTROL_HTML, url="https://sei.rn.gov.br/sei/controlador.php?acao=procedimento_controlar&infra_hash=xyz")
+        self.client.client.get.side_effect = [r1, r2, r3]
+
+        html = self.client._try_inicializar()
+
+        assert html == CONTROL_HTML

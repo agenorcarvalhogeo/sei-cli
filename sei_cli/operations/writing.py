@@ -6,9 +6,11 @@ import re
 from typing import Any
 
 from sei_cli.config import (
+    ConfigError,
     append_created_document_log,
     append_created_process_log,
     load_created_documents,
+    load_credentials,
 )
 
 from .contracts import NextAction
@@ -19,11 +21,13 @@ from .reading import (
     _list_process_markers,
     _normalize_marker_item,
     _process_unit_preflight,
+    _process_preview,
     _resolve_document_id_with_process,
     _resolve_document_ids,
     _resolve_marker_reference,
     _resolve_process_id,
     _result,
+    document_read,
     environment_triage_preview,
     process_marker_read,
     process_marker_preview,
@@ -64,6 +68,221 @@ def _block_document_matches(
 
 def _normalize_process_type_key(value: str) -> str:
     return value.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _normalize_person_text(value: str) -> str:
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized.casefold())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _strip_institutional_prefixes(value: str) -> str:
+    text = re.sub(r"\s+", " ", value or "").strip()
+    if not text:
+        return ""
+    prefixes = [
+        "SEAD",
+        "SEI",
+        "GOVERNO DO ESTADO",
+        "GOVERNO DO ESTADO DO RIO GRANDE DO NORTE",
+        "CORPO DE BOMBEIROS MILITAR",
+        "CBMRN",
+    ]
+    changed = True
+    while changed and text:
+        changed = False
+        for prefix in prefixes:
+            pattern = re.compile(rf"^\s*{re.escape(prefix)}\s+", re.IGNORECASE)
+            updated = pattern.sub("", text).strip()
+            if updated != text:
+                text = updated
+                changed = True
+    return text
+
+
+def _current_signer_profile(client: Any) -> dict[str, str]:
+    status = client.status()
+    try:
+        credentials = load_credentials()
+    except Exception:
+        credentials = None
+    return {
+        "usuario": status.usuario or "",
+        "usuario_normalized": _normalize_person_text(status.usuario or ""),
+        "cargo": getattr(credentials, "cargo", "") or "",
+        "cargo_normalized": _normalize_person_text(getattr(credentials, "cargo", "") or ""),
+    }
+
+
+def _extract_expected_signer(text: str) -> dict[str, Any] | None:
+    non_empty_lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    patterns = [
+        re.compile(
+            r"(?P<name>[A-ZÁ-Ú][A-Za-zÁ-Úá-ú'`-]+(?:\s+[A-ZÁ-Ú][A-Za-zÁ-Úá-ú'`-]+){0,5})\s*[-–—,]\s*"
+            r"(?P<rank>SD(?:\s+BM)?|CB(?:\s+BM)?|[123][°º]?\s*SGT(?:\s+(?:QP)?BM|\s+BM)?|ST\s+BM|"
+            r"[12][°º]?\s*TEN(?:\s+QOEM)?(?:\s+BM)?|CAP(?:\s+BM)?|MAJ(?:\s+BM)?|TC(?:\s+BM)?|CEL(?:\s+QOEM)?(?:\s+BM)?)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?P<rank>SD(?:\s+BM)?|CB(?:\s+BM)?|[123][°º]?\s*SGT(?:\s+(?:QP)?BM|\s+BM)?|ST\s+BM|"
+            r"[12][°º]?\s*TEN(?:\s+QOEM)?(?:\s+BM)?|CAP(?:\s+BM)?|MAJ(?:\s+BM)?|TC(?:\s+BM)?|CEL(?:\s+QOEM)?(?:\s+BM)?)\s+"
+            r"(?P<name>[A-ZÁ-Ú][A-Za-zÁ-Úá-ú'`-]+(?:\s+[A-ZÁ-Ú][A-Za-zÁ-Úá-ú'`-]+){0,5})",
+            re.IGNORECASE,
+        ),
+    ]
+    candidate_windows: list[list[str]] = []
+    ref_idx: int | None = None
+    for i in range(len(non_empty_lines) - 1, -1, -1):
+        if non_empty_lines[i].startswith("Referência"):
+            ref_idx = i
+            break
+    if ref_idx is not None and ref_idx > 0:
+        start = max(0, ref_idx - 12)
+        candidate_windows.append(non_empty_lines[start:ref_idx])
+    candidate_windows.extend([non_empty_lines[-5:], non_empty_lines[-12:]])
+    seen_windows: set[str] = set()
+    best_match: dict[str, Any] | None = None
+    for window_lines in candidate_windows:
+        tail_text = re.sub(r"\s+", " ", " ".join(window_lines)).strip()
+        if not tail_text or tail_text in seen_windows:
+            continue
+        seen_windows.add(tail_text)
+        for pattern in patterns:
+            match = pattern.search(tail_text)
+            if match:
+                clean_name = _strip_institutional_prefixes(match.group("name").strip())
+                candidate = {
+                    "line": tail_text,
+                    "name": clean_name,
+                    "cargo": match.group("rank").strip(),
+                    "normalized_name": _normalize_person_text(clean_name),
+                    "normalized_cargo": _normalize_person_text(match.group("rank")),
+                }
+                if best_match is None:
+                    best_match = candidate
+                else:
+                    candidate_tokens = len(candidate["name"].split())
+                    best_tokens = len(best_match["name"].split())
+                    if candidate_tokens > best_tokens:
+                        best_match = candidate
+                break
+    return best_match
+
+
+def _matches_current_signer(expected_signer: dict[str, Any] | None, current_signer: dict[str, str]) -> bool:
+    if not expected_signer:
+        return False
+    expected_name = expected_signer.get("normalized_name", "")
+    user_name = current_signer.get("usuario_normalized", "")
+    expected_tokens = {token for token in expected_name.split() if len(token) > 2}
+    user_tokens = {token for token in user_name.split() if len(token) > 2}
+    if expected_tokens and user_tokens:
+        overlap = expected_tokens & user_tokens
+        if len(overlap) >= 2:
+            return True
+        if overlap and expected_name.split()[-1] == user_name.split()[-1]:
+            return True
+
+    expected_cargo = expected_signer.get("normalized_cargo", "")
+    user_cargo = current_signer.get("cargo_normalized", "")
+    if expected_cargo and user_cargo and expected_cargo in user_cargo:
+        return True
+    return False
+
+
+def _looks_like_role_not_person(expected_signer: dict[str, Any] | None) -> bool:
+    if not expected_signer:
+        return False
+    normalized_name = expected_signer.get("normalized_name", "")
+    if not normalized_name:
+        return False
+    tokens = normalized_name.split()
+    role_keywords = {
+        "chefe",
+        "diretor",
+        "diretora",
+        "secretario",
+        "secretaria",
+        "coordenador",
+        "coordenadora",
+        "comandante",
+        "subcomandante",
+        "gerente",
+        "assessor",
+        "assessora",
+        "presidente",
+    }
+    function_connectors = {"da", "de", "do", "das", "dos"}
+    if tokens and tokens[0] in role_keywords:
+        return True
+    if len(tokens) <= 3 and any(token in function_connectors for token in tokens):
+        return True
+    return False
+
+
+def _evaluate_signer_compatibility(
+    *,
+    form_signer: dict[str, Any] | None,
+    expected_signer: dict[str, Any] | None,
+    current_signer: dict[str, str],
+) -> dict[str, Any]:
+    form_user = _normalize_person_text((form_signer or {}).get("txtUsuario", ""))
+    current_user = current_signer.get("usuario_normalized", "")
+    form_cargo = _normalize_person_text((form_signer or {}).get("selCargoFuncao", ""))
+    current_cargo = current_signer.get("cargo_normalized", "")
+
+    form_matches = False
+    if form_user and current_user:
+        form_matches = form_user == current_user or (
+            len(set(form_user.split()) & set(current_user.split())) >= 2
+        )
+    elif form_cargo and current_cargo:
+        form_matches = form_cargo == current_cargo or form_cargo in current_cargo or current_cargo in form_cargo
+
+    tail_matches = _matches_current_signer(expected_signer, current_signer)
+    tail_state = "ambiguous"
+    if expected_signer:
+        if tail_matches:
+            tail_state = "match"
+        elif _looks_like_role_not_person(expected_signer):
+            tail_state = "ambiguous"
+        else:
+            tail_state = "mismatch"
+
+    if form_matches and tail_state == "match":
+        return {
+            "decision": "sign",
+            "reason": "sign_form_and_tail_match_current_user",
+            "override_allowed": True,
+            "form_matches": True,
+            "tail_state": tail_state,
+        }
+    if form_matches and tail_state == "ambiguous":
+        return {
+            "decision": "skip",
+            "reason": "tail_ambiguous_review_required",
+            "override_allowed": True,
+            "form_matches": True,
+            "tail_state": tail_state,
+        }
+    if form_matches and tail_state == "mismatch":
+        return {
+            "decision": "skip",
+            "reason": "tail_indicates_other_signer",
+            "override_allowed": True,
+            "form_matches": True,
+            "tail_state": tail_state,
+        }
+    return {
+        "decision": "skip",
+        "reason": "sign_form_does_not_match_current_user",
+        "override_allowed": False,
+        "form_matches": False,
+        "tail_state": tail_state,
+    }
 
 
 def _resolve_process_type(client: Any, tipo_processo: str) -> tuple[str, str]:
@@ -1246,6 +1465,262 @@ def document_edit_confirm(
             operation=operation,
             context=locals().get("context"),
             resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_finalize_preview(
+    client: Any,
+    numero_ou_id_processo: str,
+    *,
+    document_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    operation = "process-finalize-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        id_procedimento, numero_processo = _resolve_process_id(client, numero_ou_id_processo)
+        preflight, unit_guard = _process_unit_preflight(client, id_procedimento)
+        current_signer = _current_signer_profile(client)
+        requested_ids = {str(item).strip() for item in (document_ids or []) if str(item).strip()}
+
+        with unit_guard as switched_to:
+            if switched_to:
+                preflight["switched"] = True
+                preflight["switched_to"] = switched_to
+                context = _context(client)
+            docs = client.get_full_document_tree(id_procedimento)
+            process = next(
+                (
+                    item for item in client.list_processes().recebidos + client.list_processes().gerados
+                    if item.id_procedimento == id_procedimento
+                ),
+                None,
+            )
+            selected_docs = []
+            for doc in docs:
+                if requested_ids and doc.id_documento not in requested_ids and (doc.sei_number or "") not in requested_ids:
+                    continue
+                selected_docs.append(doc)
+
+            documents: list[dict[str, Any]] = []
+            authenticate_ids: list[str] = []
+            sign_ids: list[str] = []
+            warnings: list[str] = []
+            for doc in selected_docs:
+                doc_type = (doc.tipo or "").lower()
+                doc_entry = {
+                    "id_documento": doc.id_documento,
+                    "numero_documento": doc.sei_number,
+                    "nome": doc.nome,
+                    "tipo": doc.tipo,
+                    "assinado": bool(doc.assinado),
+                }
+                if doc.assinado:
+                    doc_entry["recommended_action"] = "already_finalized"
+                    documents.append(doc_entry)
+                    continue
+
+                if doc_type in {"pdf", "documento", "externo"}:
+                    doc_entry["recommended_action"] = "authenticate"
+                    doc_entry["reason"] = "documento_externo"
+                    authenticate_ids.append(doc.id_documento)
+                    documents.append(doc_entry)
+                    continue
+
+                read_result = document_read(
+                    client,
+                    doc.id_documento,
+                    id_procedimento=id_procedimento,
+                )
+                if not read_result.get("ok"):
+                    doc_entry["recommended_action"] = "skip"
+                    doc_entry["reason"] = "read_failed"
+                    doc_entry["error"] = read_result.get("error")
+                    documents.append(doc_entry)
+                    continue
+
+                text = read_result["data"]["text"]
+                expected_signer = _extract_expected_signer(text)
+                form_signer = client.get_document_sign_form_info(doc.id_documento, id_procedimento)
+                signer_validation = _evaluate_signer_compatibility(
+                    form_signer=form_signer if form_signer.get("ok") else None,
+                    expected_signer=expected_signer,
+                    current_signer=current_signer,
+                )
+                semantic = read_result["data"].get("semantic_context", {})
+                doc_entry["expected_signer"] = expected_signer
+                doc_entry["form_signer"] = form_signer if form_signer.get("ok") else None
+                doc_entry["signer_validation"] = signer_validation
+                doc_entry["override_allowed"] = bool(signer_validation.get("override_allowed"))
+                doc_entry["summary"] = semantic.get("summary")
+                if not form_signer.get("ok"):
+                    doc_entry["recommended_action"] = "skip"
+                    doc_entry["reason"] = "sign_form_unavailable"
+                    doc_entry["form_error"] = form_signer.get("error")
+                    warnings.append(
+                        f"Documento {doc.sei_number or doc.id_documento} sem formulario de assinatura acessivel; assinatura bloqueada."
+                    )
+                elif signer_validation["decision"] == "sign":
+                    doc_entry["recommended_action"] = "sign"
+                    doc_entry["reason"] = signer_validation["reason"]
+                    sign_ids.append(doc.id_documento)
+                else:
+                    doc_entry["recommended_action"] = "skip"
+                    doc_entry["reason"] = signer_validation["reason"]
+                    if signer_validation["reason"] == "sign_form_does_not_match_current_user":
+                        warnings.append(
+                            f"Documento {doc.sei_number or doc.id_documento} traz formulario de assinatura para outro usuario/cargo; assinatura bloqueada."
+                        )
+                    elif expected_signer and signer_validation["reason"] == "tail_indicates_other_signer":
+                        warnings.append(
+                            f"Documento {doc.sei_number or doc.id_documento} indica outro signatário: {expected_signer.get('name')}."
+                        )
+                    else:
+                        warnings.append(
+                            f"Documento {doc.sei_number or doc.id_documento} sem signatário claro no rodapé; assinatura bloqueada."
+                        )
+                documents.append(doc_entry)
+
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id_processo,
+            "document_ids": [item["id_documento"] for item in documents],
+        }
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": {
+                    **preflight,
+                    "current_unit": context.get("unidade_sigla"),
+                },
+                "processo": _process_preview(process) if process else {"id_procedimento": id_procedimento, "numero": numero_processo},
+                "current_signer": current_signer,
+                "documents_total": len(documents),
+                "documents": documents,
+                "authenticate_document_ids": authenticate_ids,
+                "sign_document_ids": sign_ids,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-finalize-confirm",
+                    label="Autenticar externos e assinar apenas internos compatíveis com o signatário atual",
+                    params={
+                        "numero_ou_id_processo": id_procedimento,
+                        "document_ids": authenticate_ids + sign_ids,
+                    },
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_finalize_confirm(
+    client: Any,
+    numero_ou_id_processo: str,
+    *,
+    document_ids: list[str] | None = None,
+    force_sign_document_ids: list[str] | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-finalize-confirm"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmacao explicita obrigatoria para assinar/autenticar documentos.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = process_finalize_preview(client, numero_ou_id_processo, document_ids=document_ids)
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+
+        id_procedimento = preview["resolved_ids"]["id_procedimento"]
+        force_sign_set = {str(item).strip() for item in (force_sign_document_ids or []) if str(item).strip()}
+        auth_results: list[dict[str, Any]] = []
+        sign_results: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+
+        for item in preview["data"]["documents"]:
+            if item.get("recommended_action") != "skip":
+                continue
+            item_ids = {item["id_documento"], item.get("numero_documento")}
+            if force_sign_set & {str(value) for value in item_ids if value}:
+                validation = item.get("signer_validation") or {}
+                if validation.get("override_allowed") and validation.get("form_matches"):
+                    item["recommended_action"] = "sign"
+                    item["reason"] = "forced_after_signer_review"
+                    continue
+            skipped.append(
+                {
+                    "id_documento": item["id_documento"],
+                    "numero_documento": item.get("numero_documento"),
+                    "nome": item.get("nome"),
+                    "reason": item.get("reason"),
+                }
+            )
+
+        for doc_id in preview["data"].get("authenticate_document_ids", []):
+            result = client.authenticate_document(doc_id, id_procedimento)
+            result["id_documento"] = doc_id
+            auth_results.append(result)
+        sign_doc_ids = [
+            item["id_documento"]
+            for item in preview["data"]["documents"]
+            if item.get("recommended_action") == "sign"
+        ]
+        for doc_id in sign_doc_ids:
+            result = client.sign_document(doc_id, id_procedimento)
+            result["id_documento"] = doc_id
+            sign_results.append(result)
+
+        errors = [item for item in auth_results + sign_results if item.get("error") or item.get("errors")]
+        if errors:
+            first = errors[0]
+            message = first.get("error") or (first.get("errors") or ["Falha ao finalizar documentos."])[0]
+            raise WorkflowViolationError(
+                message,
+                details={
+                    "id_procedimento": id_procedimento,
+                    "auth_results": auth_results,
+                    "sign_results": sign_results,
+                    "skipped": skipped,
+                },
+            )
+
+        resolved_ids = dict(preview["resolved_ids"])
+        return _result(
+            operation=operation,
+            context=preview["context"],
+            resolved_ids=resolved_ids,
+            data={
+                "preflight": preview["data"]["preflight"],
+                "processo": preview["data"]["processo"],
+                "authenticated_total": len(auth_results),
+                "signed_total": len(sign_results),
+                "skipped_total": len(skipped),
+                "force_sign_document_ids": sorted(force_sign_set),
+                "authenticated": auth_results,
+                "signed": sign_results,
+                "skipped": skipped,
+            },
+            warnings=preview.get("warnings", []),
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("preview", {}).get("context") if "preview" in locals() else locals().get("context"),
+            resolved_ids=resolved_ids or locals().get("preview", {}).get("resolved_ids"),
             exc=exc,
         )
 

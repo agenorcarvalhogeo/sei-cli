@@ -27,6 +27,8 @@ from sei_cli.operations import (
     marker_catalog as op_marker_catalog,
     process_create_confirm as op_process_create_confirm,
     process_create_preview as op_process_create_preview,
+    process_finalize_confirm as op_process_finalize_confirm,
+    process_finalize_preview as op_process_finalize_preview,
     process_pdf_confirm as op_process_pdf_confirm,
     process_pdf_preview as op_process_pdf_preview,
     process_marker_history as op_process_marker_history,
@@ -1060,6 +1062,48 @@ def sign_cmd(
             console.print(f"[green]✅ Doc {doc_id}: assinado com sucesso[/green]")
         else:
             console.print(f"[yellow]⚠️  Doc {doc_id}: resultado indefinido — {r}[/yellow]")
+
+
+@cli.command("process-finalize-preview")
+@click.argument("numero_ou_id_processo")
+@click.argument("document_ids", nargs=-1, required=False)
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_finalize_preview_cmd(
+    numero_ou_id_processo: str,
+    document_ids: tuple[str, ...],
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_finalize_preview(
+            client,
+            numero_ou_id_processo,
+            document_ids=list(document_ids),
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-finalize-confirm")
+@click.argument("numero_ou_id_processo")
+@click.argument("document_ids", nargs=-1, required=False)
+@click.option("--confirm", is_flag=True, help="Confirma a autenticação/assinatura")
+@click.option("--force-sign", "force_sign_document_ids", multiple=True, help="Força assinatura de documento interno após review")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_finalize_confirm_cmd(
+    numero_ou_id_processo: str,
+    document_ids: tuple[str, ...],
+    confirm: bool,
+    force_sign_document_ids: tuple[str, ...],
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_finalize_confirm(
+            client,
+            numero_ou_id_processo,
+            document_ids=list(document_ids),
+            force_sign_document_ids=list(force_sign_document_ids),
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
 
 
 @cli.command("download-pdf")

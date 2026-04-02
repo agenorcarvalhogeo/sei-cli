@@ -24,6 +24,8 @@ from sei_cli.operations import (
     environment_triage_preview,
     inbox_snapshot,
     marker_catalog,
+    process_finalize_confirm,
+    process_finalize_preview,
     process_marker_history,
     process_create_confirm,
     process_create_preview,
@@ -75,6 +77,7 @@ class FakeClient:
         self.last_block_add: dict[str, Any] | None = None
         self.last_block_recall: dict[str, Any] | None = None
         self.signed_documents: list[dict[str, Any]] = []
+        self.authenticated_documents: list[dict[str, Any]] = []
         self.generated_pdf_paths: list[str] = []
         self.marker_catalog = [
             {"id": "10", "nome": "LIVROS"},
@@ -381,11 +384,13 @@ class FakeClient:
                 "3º SGT BM João Silva solicita reaprazamento de férias de 10/04/2026 para 20/04/2026.\n"
                 "Encaminhar ao CMDO PABM APODI para despacho e posterior envio ao DPSGP.\n"
                 "Justificativa: necessidade de adequação da escala operacional.\n"
+                "Fulano - 2º Tenente QOEM BM\n"
             )
         if (id_documento, id_procedimento) == ("48568461", "47607237"):
             return (
                 "Parte genérica referente ao reaprazamento de férias do 3º SGT BM João Silva.\n"
                 "Para ciência do CMDO PABM APODI e registro preliminar.\n"
+                "Jorge Wagner - Cabo QPBM\n"
             )
         if (id_documento, id_procedimento) == ("48568462", "47607237"):
             return (
@@ -539,6 +544,38 @@ class FakeClient:
                 if doc.documento_id == id_documento:
                     doc.assinado = True
         return {"doc_ids": [id_documento], "signed": [id_documento], "already_signed": [], "errors": []}
+
+    def authenticate_document(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
+        self.authenticated_documents.append(
+            {"id_documento": id_documento, "id_procedimento": id_procedimento}
+        )
+        return {"doc_ids": [id_documento], "signed": [id_documento], "already_signed": [], "errors": []}
+
+    def get_document_sign_form_info(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
+        if id_procedimento != "47607237":
+            return {"ok": False, "error": "processo nao suportado no fake"}
+        usuario = self.status().usuario
+        mapping = {
+            "48568466": {
+                "ok": True,
+                "txtUsuario": usuario,
+                "hdnIdUsuario": "123",
+                "selCargoFuncao": "2º Tenente QOEM BM",
+                "sign_url": "controlador.php?acao=documento_assinar&id_documento=48568466",
+            },
+            "48568461": {
+                "ok": True,
+                "txtUsuario": usuario,
+                "hdnIdUsuario": "123",
+                "selCargoFuncao": "2º Tenente QOEM BM",
+                "sign_url": "controlador.php?acao=documento_assinar&id_documento=48568461",
+            },
+            "48568463": {
+                "ok": False,
+                "error": "documento externo sem formulario de assinatura",
+            },
+        }
+        return mapping.get(id_documento, {"ok": False, "error": "formulario indisponivel"})
 
     def get_actions(self, id_procedimento: str, id_documento: str | None = None) -> dict[str, str]:
         if id_procedimento != "47607237":
@@ -852,7 +889,7 @@ def test_document_read_contract() -> None:
     assert result["ok"] is True
     assert result["resolved_ids"]["id_documento"] == "48568466"
     assert result["data"]["documento"]["nome"] == "Solicitação de Reaprazamento"
-    assert result["data"]["line_count"] == 3
+    assert result["data"]["line_count"] == 4
     assert result["data"]["ui_context"]["process_open_in_current_unit"] is True
     assert result["data"]["action_context"]["can_edit_document"] is True
     assert result["data"]["semantic_context"]["document_kind_guess"] == "reaprazamento"
@@ -1216,6 +1253,207 @@ def test_environment_triage_apply_contract() -> None:
     assert result["ok"] is True
     assert result["operation"] == "environment-triage-apply"
     assert result["data"]["applied_total"] >= 1
+
+
+def test_process_finalize_preview_separates_auth_and_sign_and_blocks_other_signer() -> None:
+    result = process_finalize_preview(FakeClient(), "47607237", document_ids=["39860248", "39860241", "39860243"])
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-finalize-preview"
+    assert result["data"]["authenticate_document_ids"] == ["48568463"]
+    assert result["data"]["sign_document_ids"] == ["48568466"]
+    blocked = next(item for item in result["data"]["documents"] if item["id_documento"] == "48568461")
+    assert blocked["recommended_action"] == "skip"
+    assert blocked["reason"] == "tail_indicates_other_signer"
+    assert blocked["override_allowed"] is True
+    assert blocked["form_signer"]["txtUsuario"] == "Fulano"
+
+
+def test_process_finalize_confirm_executes_only_safe_actions() -> None:
+    client = FakeClient()
+    result = process_finalize_confirm(
+        client,
+        "47607237",
+        document_ids=["39860248", "39860241", "39860243"],
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-finalize-confirm"
+    assert client.signed_documents == [{"id_documento": "48568466", "id_procedimento": "47607237"}]
+    assert client.authenticated_documents == [{"id_documento": "48568463", "id_procedimento": "47607237"}]
+    assert result["data"]["skipped_total"] == 1
+
+
+def test_process_finalize_confirm_force_sign_allows_ambiguous_tail_when_form_matches() -> None:
+    class AmbiguousTailClient(FakeClient):
+        def read_document(self, id_documento: str, id_procedimento: str) -> str:
+            if (id_documento, id_procedimento) == ("48568461", "47607237"):
+                return (
+                    "Encaminhamento interno.\n"
+                    "Providencias cabiveis.\n"
+                    "2º TEN QOEM Chefe da 1ª Seção.\n"
+                )
+            return super().read_document(id_documento, id_procedimento)
+
+    client = AmbiguousTailClient()
+    preview = process_finalize_preview(client, "47607237", document_ids=["39860241"])
+
+    assert preview["ok"] is True
+    doc = preview["data"]["documents"][0]
+    assert doc["recommended_action"] == "skip"
+    assert doc["reason"] == "tail_ambiguous_review_required"
+    assert doc["override_allowed"] is True
+
+    result = process_finalize_confirm(
+        client,
+        "47607237",
+        document_ids=["39860241"],
+        force_sign_document_ids=["39860241"],
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["signed_total"] == 1
+    assert client.signed_documents == [{"id_documento": "48568461", "id_procedimento": "47607237"}]
+
+
+def test_process_finalize_confirm_force_sign_still_blocks_when_form_does_not_match() -> None:
+    class WrongFormClient(FakeClient):
+        def get_document_sign_form_info(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
+            data = super().get_document_sign_form_info(id_documento, id_procedimento)
+            if id_documento == "48568461":
+                data["txtUsuario"] = "Jorge Wagner"
+                data["selCargoFuncao"] = "Cabo QPBM"
+            return data
+
+        def read_document(self, id_documento: str, id_procedimento: str) -> str:
+            if (id_documento, id_procedimento) == ("48568461", "47607237"):
+                return (
+                    "Encaminhamento interno.\n"
+                    "Providencias cabiveis.\n"
+                    "2º TEN QOEM Chefe da 1ª Seção.\n"
+                )
+            return super().read_document(id_documento, id_procedimento)
+
+    client = WrongFormClient()
+    result = process_finalize_confirm(
+        client,
+        "47607237",
+        document_ids=["39860241"],
+        force_sign_document_ids=["39860241"],
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["signed_total"] == 0
+    assert result["data"]["skipped_total"] == 1
+    assert client.signed_documents == []
+
+
+def test_process_finalize_preview_extracts_fragmented_footer_signer() -> None:
+    class FragmentedFooterClient(FakeClient):
+        def status(self) -> SystemStatus:
+            return SystemStatus(
+                valid=True,
+                unidade_sigla="OP 3",
+                unidade_descricao="Operacional 3",
+                usuario="Leo Zenon Tassi",
+                ultimo_acesso="29/03/2026 10:00",
+            )
+
+        def read_document(self, id_documento: str, id_procedimento: str) -> str:
+            if (id_documento, id_procedimento) == ("48568466", "47607237"):
+                return (
+                    "Despacho de teste.\n"
+                    "Encaminhar para a secretaria.\n"
+                    "Leo\n"
+                    "Zenon\n"
+                    "Tassi\n"
+                    "-\n"
+                    "2º TEN\n"
+                    "QOEM\n"
+                    "Referência:\n"
+                    "Processo nº 08810198.000085/2026-17\n"
+                    "SEI nº 40442193\n"
+                    "Criado por\n"
+                    "01664314431\n"
+                    ", versão 2 por\n"
+                    "01664314431\n"
+                    "em 01/04/2026 15:51:48.\n"
+                )
+            return super().read_document(id_documento, id_procedimento)
+
+    result = process_finalize_preview(FragmentedFooterClient(), "47607237", document_ids=["39860248"])
+
+    assert result["ok"] is True
+    doc = result["data"]["documents"][0]
+    assert doc["recommended_action"] == "sign"
+    assert doc["expected_signer"]["name"] == "Leo Zenon Tassi"
+
+
+def test_process_finalize_preview_extracts_signer_without_referencia_footer() -> None:
+    class NoReferenciaFooterClient(FakeClient):
+        def status(self) -> SystemStatus:
+            return SystemStatus(
+                valid=True,
+                unidade_sigla="OP 3",
+                unidade_descricao="Operacional 3",
+                usuario="Leo Zenon Tassi",
+                ultimo_acesso="29/03/2026 10:00",
+            )
+
+        def read_document(self, id_documento: str, id_procedimento: str) -> str:
+            if (id_documento, id_procedimento) == ("48568466", "47607237"):
+                return (
+                    "Despacho de teste.\n"
+                    "Encaminhar para a secretaria.\n"
+                    "Leo\n"
+                    "Zenon\n"
+                    "Tassi\n"
+                    "-\n"
+                    "2º TEN\n"
+                    "QOEM\n"
+                )
+            return super().read_document(id_documento, id_procedimento)
+
+    result = process_finalize_preview(NoReferenciaFooterClient(), "47607237", document_ids=["39860248"])
+
+    assert result["ok"] is True
+    doc = result["data"]["documents"][0]
+    assert doc["recommended_action"] == "sign"
+    assert doc["expected_signer"]["name"] == "Leo Zenon Tassi"
+
+
+def test_process_finalize_preview_strips_institutional_prefix_from_signer_name() -> None:
+    class InstitutionalPrefixClient(FakeClient):
+        def status(self) -> SystemStatus:
+            return SystemStatus(
+                valid=True,
+                unidade_sigla="OP 3",
+                unidade_descricao="Operacional 3",
+                usuario="Leo Zenon Tassi",
+                ultimo_acesso="29/03/2026 10:00",
+            )
+
+        def read_document(self, id_documento: str, id_procedimento: str) -> str:
+            if (id_documento, id_procedimento) == ("48568466", "47607237"):
+                return (
+                    "Despacho de teste.\n"
+                    "SEAD Leo Zenon Tassi\n"
+                    "-\n"
+                    "2º TEN\n"
+                    "QOEM\n"
+                    "Referência:\n"
+                    "Processo nº 08810198.000085/2026-17\n"
+                )
+            return super().read_document(id_documento, id_procedimento)
+
+    result = process_finalize_preview(InstitutionalPrefixClient(), "47607237", document_ids=["39860248"])
+
+    assert result["ok"] is True
+    doc = result["data"]["documents"][0]
+    assert doc["expected_signer"]["name"] == "Leo Zenon Tassi"
 
 
 def test_process_create_preview_exposes_hypotheses_when_non_public_access_is_requested() -> None:
@@ -2152,6 +2390,7 @@ def test_document_read_cli_json(monkeypatch) -> None:
         "3º SGT BM João Silva solicita reaprazamento de férias de 10/04/2026 para 20/04/2026.\n"
         "Encaminhar ao CMDO PABM APODI para despacho e posterior envio ao DPSGP.\n"
         "Justificativa: necessidade de adequação da escala operacional.\n"
+        "Fulano - 2º Tenente QOEM BM\n"
     )
 
 
@@ -2519,6 +2758,36 @@ def test_environment_triage_apply_cli_json(monkeypatch) -> None:
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["operation"] == "environment-triage-apply"
+
+
+def test_process_finalize_preview_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["process-finalize-preview", "47607237", "39860248", "39860241", "39860243", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-finalize-preview"
+
+
+def test_process_finalize_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["process-finalize-confirm", "47607237", "39860248", "39860241", "39860243", "--confirm", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-finalize-confirm"
 
 
 def test_relatorio_read_cli_json(monkeypatch) -> None:
