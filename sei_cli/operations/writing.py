@@ -2072,8 +2072,9 @@ def process_finalize_preview(
                     "nome": doc.nome,
                     "tipo": doc.tipo,
                     "assinado": bool(doc.assinado),
+                    "autenticado": bool(doc.autenticado),
                 }
-                if doc.assinado:
+                if doc.assinado or doc.autenticado:
                     doc_entry["recommended_action"] = "already_finalized"
                     documents.append(doc_entry)
                     continue

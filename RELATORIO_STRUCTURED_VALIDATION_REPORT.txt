@@ -1,0 +1,205 @@
+═══════════════════════════════════════════════════════════════
+BATCH 8 — STRUCTURED HTML PARSING VALIDATION REPORT
+Date: 2026-03-30 00:20 (America/Fortaleza)
+Process: 08810107.000178/2025-32 (id_procedimento: 41771530)
+═══════════════════════════════════════════════════════════════
+
+SUMMARY: The view_document_html → parse_relatorio path was correctly
+added in the except block (operations/reading.py ~line 1753), but it
+NEVER FIRES because view_document_html() itself fails with
+"Link de visualização não encontrado" for documents in non-expanded
+folders. ALL relatórios still fall back to text_fallback.
+
+═══════════════════════════════════════════════════════════════
+TEST RESULTS
+═══════════════════════════════════════════════════════════════
+
+Test 1: relatorio-read "33920087" --process-id "41771530" --json
+  Document: Relatório do Fiscal 20/05/2025 (PDF, PASTA1)
+  Result: ✅ ok=true
+  parsing_strategy: "text_fallback"  ← NOT structured
+  extraction_method: "read_document_content_retry"
+  Reason: PDFs have no documento_imprimir_web link — EXPECTED behavior.
+  PDFs will always need text_fallback (or OCR). This is acceptable.
+
+Test 2: relatorio-read "34350227" --process-id "41771530" --json
+  Document: Relatório 34350227 (INTERNO, PASTA3)
+  Result: ✅ ok=true
+  parsing_strategy: "text_fallback"  ← SHOULD BE "structured_html_view"
+  extraction_method: "read_document_content_retry"
+  Reason: BUG — view_document_html() fails (see root cause below)
+
+Test 3: process-report "08810107.000178/2025-32" --relatorio-limit 2 --json
+  Result: ✅ ok=true, 2 relatórios found, 0 failures
+  Relatório 1 (PDF 33920087): parsing_strategy="text_fallback" — expected
+  Relatório 2 (interno 34350227): parsing_strategy="text_fallback" — BUG
+  process-report inherits the same issue from _parse_single_relatorio()
+
+═══════════════════════════════════════════════════════════════
+ROOT CAUSE — view_document_html() DOES NOT EXPAND FOLDERS
+═══════════════════════════════════════════════════════════════
+
+Confirmed by direct Python test:
+
+  c.view_document_html('42248674', '41771530')
+  → RuntimeError: Link de visualização não encontrado para documento 42248674
+
+The call chain:
+
+  view_document_html(id_doc, id_proc)
+    → _navigate_to_arvore(id_proc)           # gets tree HTML
+    → _view_document_html_core(id_doc, arvore_html)
+      → regex search for documento_imprimir_web&id_documento=42248674
+      → NOT FOUND (doc is in PASTA3, only last-expanded folder is loaded)
+      → regex search for documento_visualizar&id_documento=42248674
+      → NOT FOUND (same reason)
+      → raises RuntimeError
+
+This is the SAME cross-folder bug that was fixed in document-read /
+process-read via the read_document_content_retry path (which navigates
+directly to the document via goto). But view_document_html never got
+the equivalent fix.
+
+═══════════════════════════════════════════════════════════════
+FIX NEEDED — TWO PARTS
+═══════════════════════════════════════════════════════════════
+
+PART 1: Make view_document_html work for cross-folder documents
+
+The fix: view_document_html() should expand all folders before searching
+for the print/view URL. The tree already has get_full_document_tree() with
+expand_all=True that does this.
+
+Option A (preferred — minimal change):
+  In view_document_html(), after _navigate_to_arvore(), if the document
+  is not found in the initial HTML, expand all folders using the same
+  AJAX pattern that get_full_document_tree uses, then re-search.
+
+Option B (simpler — construct URL directly):
+  The documento_imprimir_web URL format is:
+    controlador.php?acao=documento_imprimir_web&id_documento=XXXXX&infra_hash=YYYYY
+  
+  The infra_hash is per-page (not per-document) and is already available
+  from the arvore HTML even without expanding folders. So we can:
+    1. Extract infra_hash from arvore_html (it's in many links already)
+    2. Construct the URL: f"controlador.php?acao=documento_imprimir_web&id_documento={id_documento}&infra_hash={infra_hash}"
+    3. GET that URL and return the HTML
+  
+  This avoids expanding folders entirely. The infra_hash is already in
+  _view_document_html_core's search context — we just need a fallback
+  that constructs the URL instead of only searching for it.
+
+  Code sketch for Option B (in _view_document_html_core):
+  
+    # After both regex searches fail:
+    # Fallback: construct URL directly using infra_hash from any link in arvore
+    hash_match = re.search(r'infra_hash=([a-f0-9]+)', arvore_html)
+    if hash_match:
+        constructed_url = (
+            f"controlador.php?acao=documento_imprimir_web"
+            f"&id_documento={id_documento}"
+            f"&infra_hash={hash_match.group(1)}"
+        )
+        r = self._get(self._sei_url(constructed_url))
+        if "login.php" not in str(r.url) and len(r.text) > 500:
+            return r.text
+    
+    raise RuntimeError(f"Link de visualização não encontrado para documento {id_documento}")
+
+PART 2: Ensure relatorio_read uses the correct fallback chain
+
+The except block in relatorio_read() (operations/reading.py ~line 1753)
+already has the correct structure:
+
+    try:
+        html = client.view_document_html(id_doc, id_proc)
+        relatorio = parse_relatorio(html)
+        parsing_strategy = "structured_html_view"
+        extraction_method = "view_document_html"
+    except Exception:
+        # text fallback (last resort)
+
+This is CORRECT — once Part 1 is fixed, this will work automatically.
+
+Same pattern should be verified in _parse_single_relatorio() used by
+process-report (check that it also has the view_document_html intermediate).
+
+═══════════════════════════════════════════════════════════════
+WHAT EACH parsing_strategy MEANS (FOR REFERENCE)
+═══════════════════════════════════════════════════════════════
+
+  "structured_editor"     — get_editor_sections → parse_relatorio(html)
+                            Best quality. Works for unsigned internal docs
+                            that the user can edit.
+
+  "structured_html_view"  — view_document_html → parse_relatorio(html)
+                            Same quality as editor. Works for signed docs
+                            and cross-folder docs. NEW — NOT YET WORKING
+                            due to the folder expansion bug above.
+
+  "text_fallback"         — plain text extraction → _fallback_relatorio_from_text()
+                            Degraded quality. All funcao="Militar citado",
+                            no viaturas, no operational sections.
+                            ONLY acceptable for true binary PDFs.
+
+═══════════════════════════════════════════════════════════════
+EXPECTED RESULTS AFTER FIX
+═══════════════════════════════════════════════════════════════
+
+Test 1 (PDF 33920087):
+  → parsing_strategy: "text_fallback" (PDFs have no HTML representation — OK)
+  → Quality: limited but acceptable for PDFs
+
+Test 2 (interno 34350227, PASTA3):
+  → parsing_strategy: "structured_html_view"
+  → extraction_method: "view_document_html"
+  → relatorio.fiscal: should be populated (not empty "")
+  → relatorio.militares[].funcao: should be "Fiscal", "Chefe de Guarnição",
+    "Condutor", "Operador" etc. — NOT "Militar citado"
+  → relatorio.militares[].viatura: should be "ABT-02", "AS-42", "UR-28" etc.
+  → relatorio.militares[].status: should differentiate ordinario/extraordinario/permuta/do
+  → relatorio.viaturas: should have Viatura entries with hodometro
+  → relatorio.ocorrencias: should have Ocorrencia entries with boletim/codigo/natureza
+  → relatorio.parada, rancho, etc.: should be populated from sections A-I
+
+Test 3 (process-report --relatorio-limit 2):
+  → relatório 1 (PDF): text_fallback — acceptable
+  → relatório 2 (interno): structured_html_view — full quality
+
+═══════════════════════════════════════════════════════════════
+EXISTING PARSER INFRASTRUCTURE REMINDER
+═══════════════════════════════════════════════════════════════
+
+relatorio_parser.py (726 lines) already handles ALL structured fields when
+given HTML input. The parse_relatorio() function expects HTML with CSS
+classes like "Texto_Justificado_Recuo_Primeira_Linha" and table structures.
+
+The documento_imprimir_web endpoint returns this EXACT HTML format — it's
+the same rendering used by the browser when you click a document in the
+SEI tree. parse_relatorio() was built to consume this output.
+
+So: fix view_document_html → parse_relatorio works → structured data flows.
+
+═══════════════════════════════════════════════════════════════
+VALIDATION COMMANDS AFTER FIX (batch 9)
+═══════════════════════════════════════════════════════════════
+
+1. sei relatorio-read "34350227" --process-id "41771530" --json
+   → Expect: parsing_strategy="structured_html_view", fiscal populated,
+     militares with funcao/viatura/status, viaturas[], ocorrencias[]
+
+2. sei process-report "08810107.000178/2025-32" --relatorio-limit 2 --json
+   → Expect: relatório 2 (interno) shows structured_html_view
+
+3. sei relatorio-read "33920087" --process-id "41771530" --json
+   → Expect: text_fallback (unchanged — PDFs remain text-only)
+
+═══════════════════════════════════════════════════════════════
+OPEN BUGS (cumulative)
+═══════════════════════════════════════════════════════════════
+
+1. CRITICAL: view_document_html() fails for cross-folder documents —
+   needs folder expansion or URL construction fallback (described above)
+2. Minor: encoding mojibake in especificacao
+3. Minor: resolved_ids.numero_processo/numero_documento echoes input
+4. Minor: partial failures return exit code 0

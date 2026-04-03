@@ -1,0 +1,163 @@
+═══════════════════════════════════════════════════════════════
+BATCH 10 — TreeDocument.src_url FALLBACK VALIDATION
+Date: 2026-03-30 05:38 (America/Fortaleza)
+Process: 08810107.000178/2025-32 (id_procedimento: 41771530)
+═══════════════════════════════════════════════════════════════
+
+TL;DR: O fallback via get_full_document_tree + TreeDocument.src_url
+FUNCIONA — relatórios internos em pastas não expandidas agora entram
+em structured_html_view. MAS introduziu uma REGRESSÃO em PDFs: agora
+PDFs também entram em structured_html_view com campos TODOS VAZIOS,
+quando antes extraíam dados via text_fallback.
+
+═══════════════════════════════════════════════════════════════
+TEST RESULTS
+═══════════════════════════════════════════════════════════════
+
+Test 1: sei relatorio-read "34350227" --process-id "41771530" --json
+  Document: Relatório 34350227 (INTERNO, PASTA3)
+  Result: ✅ ok=true
+  parsing_strategy: "structured_html_view"  ← CORRETO! Era text_fallback
+  extraction_method: "view_document_html"   ← CORRETO!
+  fiscal: "Adonirã ("     ← parser achou (tem parêntese sobrando)
+  posto_fiscal: "1º SGT BM"  ← correto
+  data_inicio: ""  ← vazio (esperado — é relatório de inquérito, não livro)
+  data_fim: ""     ← vazio (esperado)
+  militares: []    ← vazio (esperado — doc não tem escala)
+  signature_status: pending_signature ← correto
+  VEREDICTO: ✅ PASS — caminho structured_html_view ativado com sucesso
+
+Test 2: sei relatorio-read "33920087" --process-id "41771530" --json
+  Document: Relatório do Fiscal 20/05/2025 (PDF, PASTA1)
+  Result: ✅ ok=true
+  parsing_strategy: "structured_html_view"  ← ❌ REGRESSÃO! Deveria ser text_fallback
+  extraction_method: "view_document_html"   ← ❌ REGRESSÃO!
+  fiscal: ""         ← ❌ VAZIO (antes era "Adonirã" via text_fallback)
+  posto_fiscal: ""   ← ❌ VAZIO (antes era "1º SGT BM")
+  data_inicio: ""    ← ❌ VAZIO (antes era "20/05/2025")
+  data_fim: ""       ← ❌ VAZIO (antes era "21/05/2025")
+  militares: []      ← ❌ VAZIO (antes tinha 35 entries via text_fallback)
+  unidade: ""        ← ❌ VAZIO (antes era "SECRETARIA DE ESTADO DA SEGURAN")
+  signature_status: pending_signature ← correto
+  VEREDICTO: ❌ REGRESSÃO — PDF agora retorna structured_html_view com
+    tudo vazio. Antes text_fallback extraía fiscal, datas, 35 militares.
+
+Test 3: sei process-report "08810107.000178/2025-32" --relatorio-limit 2 --json
+  Result: ✅ ok=true, 2 relatórios, 0 failures
+  Relatório 1 (PDF 33920087):
+    parsing_strategy: "structured_html_view" ← ❌ REGRESSÃO (deveria ser text_fallback)
+    fiscal: ""  ← ❌ VAZIO
+    militares: [] ← ❌ VAZIO
+  Relatório 2 (interno 34350227):
+    parsing_strategy: "structured_html_view" ← ✅ CORRETO
+    fiscal: "Adonirã (" ← ✅ (com lixo cosmético)
+  process-read sampled docs: 6/6 ok, extraction_method=read_document_content_retry
+  relatorio_failures: []
+  VEREDICTO: PARCIAL — interno OK, PDF regrediu
+
+═══════════════════════════════════════════════════════════════
+ROOT CAUSE DA REGRESSÃO NO PDF
+═══════════════════════════════════════════════════════════════
+
+O que acontece com o PDF (33920087, id_documento=41782477):
+
+1. view_document_html() é chamado
+2. _view_document_html_core busca link no arvore HTML → não encontra
+3. Fallback: get_full_document_tree(expand_all=True) → encontra TreeDocument
+4. Fetch TreeDocument.src_url (documento_visualizar) → retorna HTML
+5. Mas para PDFs, o documento_visualizar retorna uma página wrapper
+   com um <iframe> ou <embed> para o viewer de PDF — NÃO tem conteúdo
+   textual do documento
+6. parse_relatorio() recebe esse HTML wrapper → não encontra nada
+7. Retorna relatorio com TUDO VAZIO
+8. O código NÃO faz fallback para text_fallback porque
+   view_document_html "succeeded" (retornou HTML, não exceção)
+
+Antes do fix: view_document_html falhava com exceção →
+código caía em text_fallback → extraía texto do PDF → resultados parciais.
+
+Agora: view_document_html "sucede" com HTML do viewer →
+parse_relatorio retorna empty → NÃO cai em text_fallback.
+
+═══════════════════════════════════════════════════════════════
+FIX NECESSÁRIO — DUAS OPÇÕES
+═══════════════════════════════════════════════════════════════
+
+OPÇÃO A (preferida — cirúrgica):
+Em view_document_html(), após buscar TreeDocument.src_url:
+  - Se tree_doc.tipo == "pdf", NÃO tentar — lançar exceção direto
+  - Isso faz o except block cair em text_fallback naturalmente
+
+  Code sketch:
+    # In view_document_html fallback section:
+    tree = self.get_full_document_tree(id_procedimento, expand_all=True)
+    target = [d for d in tree if d.id_documento == str(id_documento)]
+    if not target or not target[0].src_url:
+        raise
+    if target[0].tipo == "pdf":
+        raise RuntimeError("PDF documents have no HTML representation")
+    r = self._get(target[0].src_url)
+    ...
+
+OPÇÃO B (defensiva — quality gate):
+Após parse_relatorio, verificar se o resultado é "vazio demais":
+  - Se fiscal="" AND len(militares)==0 AND data_inicio="" AND data_fim=""
+  - E o tipo do documento é PDF
+  - Então descartar e tentar text_fallback
+
+OPÇÃO A é mais limpa. PDFs NUNCA têm HTML renderizado com conteúdo
+textual — o documento_visualizar para PDFs mostra o viewer do browser.
+
+═══════════════════════════════════════════════════════════════
+NOTA: PARSER QUALITY COM DOCUMENTO REAL
+═══════════════════════════════════════════════════════════════
+
+O documento 34350227 (interno) é um RELATÓRIO DE INQUÉRITO TÉCNICO,
+não um Livro do Fiscal. Portanto:
+  - fiscal="Adonirã (" — correto (é o fiscal mencionado no texto)
+  - militares=[] — correto (inquérito não tem escala)
+  - viaturas=[] — correto (inquérito não tem escala por viatura)
+  - Seções A-I vazias — correto (não é livro do fiscal)
+
+Para testar a qualidade REAL do parse_relatorio com escala/viaturas/
+ocorrências, precisamos de um Livro do Fiscal tipo INTERNO. Nenhum
+processo disponível na caixa atual do PABM Apodi tem um.
+
+O parêntese sobrando em fiscal="Adonirã (" é um cosmético do parser —
+o HTML original tem "1º SGT BM Adonirã (Fiscal de Operações)" e o
+regex captura o nome mas inclui o parêntese de abertura.
+
+═══════════════════════════════════════════════════════════════
+RESUMO DE STATUS
+═══════════════════════════════════════════════════════════════
+
+  ✅ FIXED: structured_html_view funciona para internos cross-folder
+  ❌ REGRESSÃO: PDFs agora retornam structured_html_view com tudo vazio
+     (antes text_fallback extraía dados parciais)
+  ⚠️ COSMÉTICO: fiscal="Adonirã (" — parêntese sobrando no regex
+
+═══════════════════════════════════════════════════════════════
+OPEN BUGS (atualizado)
+═══════════════════════════════════════════════════════════════
+
+1. CRITICAL: view_document_html() tenta parsear HTML de PDFs e retorna
+   campos vazios — precisa skip para tipo=pdf (ver fix acima)
+2. COSMÉTICO: regex de fiscal captura parêntese de abertura
+3. Minor: encoding mojibake em especificacao
+4. Minor: resolved_ids.numero_processo/numero_documento echoes input
+5. Minor: partial failures return exit code 0
+
+═══════════════════════════════════════════════════════════════
+VALIDATION COMMANDS AFTER FIX (batch 11)
+═══════════════════════════════════════════════════════════════
+
+1. sei relatorio-read "33920087" --process-id "41771530" --json
+   → Expect: parsing_strategy="text_fallback" (PDF deve pular HTML)
+   → Expect: fiscal não-vazio, militares com entries (como batch 7)
+
+2. sei relatorio-read "34350227" --process-id "41771530" --json
+   → Expect: parsing_strategy="structured_html_view" (inalterado)
+   → Expect: fiscal="Adonirã" (sem parêntese — se cosmético fixado)
+
+3. sei process-report "08810107.000178/2025-32" --relatorio-limit 2 --json
+   → Expect: PDF=text_fallback, interno=structured_html_view

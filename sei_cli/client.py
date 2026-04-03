@@ -6235,7 +6235,11 @@ class SEIClient:
         Works for both internal (sign) and external (authenticate) documents —
         SEI uses the same form action ``documento_assinar`` for both.
         """
-        return self._sign_or_authenticate(id_documento, id_procedimento)
+        return self._sign_or_authenticate(
+            id_documento,
+            id_procedimento,
+            expected_kind="assinatura",
+        )
 
     def authenticate_document(self, id_documento: str, id_procedimento: str) -> dict:
         """Authenticate an external (uploaded) document in a process.
@@ -6247,7 +6251,11 @@ class SEIClient:
 
         Returns dict with 'doc_ids', 'signed', 'already_signed', 'errors'.
         """
-        return self._sign_or_authenticate(id_documento, id_procedimento)
+        return self._sign_or_authenticate(
+            id_documento,
+            id_procedimento,
+            expected_kind="autenticacao",
+        )
 
     def authenticate_documents(
         self, id_documentos: list[str], id_procedimento: str
@@ -6260,7 +6268,10 @@ class SEIClient:
         results = []
         for i, doc_id in enumerate(id_documentos):
             result = self._sign_or_authenticate(
-                doc_id, id_procedimento, _reuse_process=(i > 0)
+                doc_id,
+                id_procedimento,
+                _reuse_process=(i > 0),
+                expected_kind="autenticacao",
             )
             result["id_documento"] = doc_id
             results.append(result)
@@ -6330,12 +6341,74 @@ class SEIClient:
                 "switched_to": switched_to,
             }
 
+    def _verify_document_finalization_by_tree(
+        self,
+        id_documento: str,
+        id_procedimento: str,
+        *,
+        expected_kind: str,
+    ) -> dict[str, Any]:
+        """Re-read the full tree and confirm signature/authentication by NosAcoes[].
+
+        expected_kind:
+            "assinatura" for internal sign
+            "autenticacao" for external authenticate
+        """
+        try:
+            docs = self.get_full_document_tree(id_procedimento, expand_all=True)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "verified": False,
+                "method": "tree_nos_acoes",
+                "error": str(exc),
+            }
+
+        target = next((doc for doc in docs if doc.id_documento == id_documento), None)
+        if target is None:
+            return {
+                "ok": False,
+                "verified": False,
+                "method": "tree_nos_acoes",
+                "error": f"Documento {id_documento} não encontrado na árvore após releitura.",
+            }
+
+        signatures = [
+            {
+                "signer": sig.signer,
+                "role": sig.role,
+                "unit": sig.unit,
+                "kind": sig.kind,
+                "icon": sig.icon,
+            }
+            for sig in target.assinaturas
+        ]
+        if expected_kind == "autenticacao":
+            verified = bool(target.autenticado)
+        else:
+            verified = bool(target.assinado)
+
+        return {
+            "ok": True,
+            "verified": verified,
+            "method": "tree_nos_acoes",
+            "document": {
+                "id_documento": target.id_documento,
+                "sei_number": target.sei_number,
+                "nome": target.nome,
+                "assinado": bool(target.assinado),
+                "autenticado": bool(target.autenticado),
+                "assinaturas": signatures,
+            },
+        }
+
     def _sign_or_authenticate(
         self,
         id_documento: str,
         id_procedimento: str,
         *,
         _reuse_process: bool = False,
+        expected_kind: str = "assinatura",
     ) -> dict:
         """Internal: navigate to a document in the process tree and sign/authenticate it.
 
@@ -6361,10 +6434,23 @@ class SEIClient:
                 rf'controlador\.php\?acao=arvore_visualizar[^"]*id_documento={id_documento}[^"]*'
             )
             doc_match = doc_pattern.search(arvore_html)
+            _expanded_arvore_url: str | None = None
             if not doc_match:
+                # Document may be inside a lazy-loaded folder — expand all and retry
+                try:
+                    full_docs = self.get_full_document_tree(id_procedimento, expand_all=True)
+                    target_doc = next((d for d in full_docs if d.id_documento == id_documento), None)
+                    if target_doc and target_doc.arvore_url:
+                        _expanded_arvore_url = target_doc.arvore_url
+                except Exception:
+                    pass
+            if not doc_match and not _expanded_arvore_url:
                 return {"error": f"Documento {id_documento} não encontrado na árvore"}
 
-            doc_url = urljoin(self._sei_url(""), doc_match.group())
+            if doc_match:
+                doc_url = urljoin(self._sei_url(""), doc_match.group())
+            else:
+                doc_url = _expanded_arvore_url  # type: ignore[assignment]
             rd = self._get(doc_url)
 
             # Extract linkAssinarDocumento
@@ -6376,6 +6462,18 @@ class SEIClient:
             self._control_html = None
 
             result = self._execute_sign(sign_url, id_documento)
+
+            tree_verification = self._verify_document_finalization_by_tree(
+                id_documento,
+                id_procedimento,
+                expected_kind=expected_kind,
+            )
+            result["post_verification"] = {"tree": tree_verification}
+            if tree_verification.get("verified"):
+                result["signed"] = [id_documento]
+                result["errors"] = []
+                return result
+
             if (
                 not result.get("signed")
                 and not result.get("already_signed")
@@ -6383,9 +6481,19 @@ class SEIClient:
             ):
                 with contextlib.suppress(Exception):
                     view_html = self.view_document_html(id_documento, id_procedimento)
-                    if re.search(r"assinado\s+eletronicamente\s+por", view_html, re.IGNORECASE):
+                    pattern = (
+                        r"autenticad[oa]\s+(?:eletronicamente\s+)?por"
+                        if expected_kind == "autenticacao"
+                        else r"assinado\s+eletronicamente\s+por"
+                    )
+                    if re.search(pattern, view_html, re.IGNORECASE):
                         result["signed"] = [id_documento]
                         result["errors"] = []
+                        result["post_verification"]["fallback"] = {
+                            "verified": True,
+                            "method": "view_document_html",
+                            "expected_kind": expected_kind,
+                        }
             return result
 
     def _sign_from_blocos(self, block_numero: str, *, doc_indices: list[int] | None = None) -> dict:

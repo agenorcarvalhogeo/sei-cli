@@ -1,0 +1,195 @@
+═══════════════════════════════════════════════════════════════
+BATCH 9 — VIEW_DOCUMENT_HTML + INFRA_HASH FIX VALIDATION
+Date: 2026-03-30 02:25 (America/Fortaleza)
+Process: 08810107.000178/2025-32 (id_procedimento: 41771530)
+═══════════════════════════════════════════════════════════════
+
+TL;DR: O fallback com infra_hash NÃO FUNCIONA — SEI valida o hash
+por ação, não por sessão. Construir URL com hash emprestado retorna
+"Hash inválido". Mas descobri o caminho correto: TreeDocument.src_url
+(documento_visualizar) funciona e retorna HTML parseável.
+
+═══════════════════════════════════════════════════════════════
+TEST RESULTS
+═══════════════════════════════════════════════════════════════
+
+Test 1: sei relatorio-read "34350227" --process-id "41771530" --json
+  Document: Relatório 34350227 (INTERNO, PASTA3)
+  Result: ok=true
+  parsing_strategy: "text_fallback"  ← NÃO mudou
+  extraction_method: "read_document_content_retry"
+  Motivo: view_document_html() falha → infra_hash fallback falha → exceção → text_fallback
+
+Test 2: sei relatorio-read "33920087" --process-id "41771530" --json
+  Document: Relatório do Fiscal 20/05/2025 (PDF, PASTA1)
+  Result: ok=true
+  parsing_strategy: "text_fallback"  ← esperado pra PDF
+  extraction_method: "read_document_content_retry"
+
+Test 3: sei process-report "08810107.000178/2025-32" --relatorio-limit 2 --json
+  Result: ok=true, 2 relatórios, 0 failures
+  Relatório 1 (PDF 33920087): text_fallback — esperado
+  Relatório 2 (interno 34350227): text_fallback — BUG
+
+═══════════════════════════════════════════════════════════════
+ROOT CAUSE — INFRA_HASH É PER-AÇÃO, NÃO PER-SESSÃO
+═══════════════════════════════════════════════════════════════
+
+O código em _view_document_html_core (linhas 3730-3742) faz:
+  1. Extrai um infra_hash qualquer da árvore HTML
+  2. Constrói URL: documento_imprimir_web&id_documento=X&infra_hash=Y
+
+Mas o SEI responde com redirect ao login:
+  "Hash inválido. [/sei/controlador.php?acao=documento_imprimir_web
+   &id_documento=42248674&infra_hash=1f16088b...]"
+
+O infra_hash é VINCULADO À AÇÃO que o gerou. Um hash gerado para
+procedimento_visualizar não funciona para documento_imprimir_web.
+Não é possível construir URLs com hashes emprestados.
+
+═══════════════════════════════════════════════════════════════
+CAMINHO CORRETO DESCOBERTO: TreeDocument.src_url
+═══════════════════════════════════════════════════════════════
+
+Teste manual via Python:
+
+  tree = client.get_full_document_tree('41771530', expand_all=True)
+  target = [d for d in tree if d.id_documento == '42248674'][0]
+  # target.src_url = "controlador.php?acao=documento_visualizar&..."
+  r = client._get(target.src_url)
+  # → 171,204 chars de HTML com CSS classes!
+  # → Contém: Texto_Justificado, Texto_Justificado_Recuo_Primeira_Linha,
+  #   Tabela_Texto_Centralizado, Texto_Centralizado_Maiusculas_Negrito
+  # → parse_relatorio(r.text) → SUCESSO parcial (achou fiscal)
+
+O get_full_document_tree(expand_all=True) expande TODAS as pastas via
+AJAX e popula src_url em cada TreeDocument. Esse src_url usa a ação
+documento_visualizar, que tem um infra_hash válido gerado pelo SEI
+durante a expansão AJAX. Funciona sem login redirect.
+
+NOTA IMPORTANTE: O documento 34350227 NÃO é um Livro do Fiscal.
+É um "RELATÓRIO DO ENCARREGADO DO INQUÉRITO TÉCNICO" (investigação
+de avaria na viatura ABS-07). Não tem escala, parada, rancho, etc.
+Os 5 militares são testemunhas de oitivas, não escalantes.
+Portanto, parse_relatorio encontrar fiscal="Adonirã" e 0 militares/
+0 viaturas/0 ocorrências é CORRETO para este tipo de documento.
+
+═══════════════════════════════════════════════════════════════
+FIX NEEDED — NOVA ABORDAGEM
+═══════════════════════════════════════════════════════════════
+
+O fallback com infra_hash deve ser SUBSTITUÍDO por:
+
+Em view_document_html(), quando _view_document_html_core falha:
+  1. Chamar get_full_document_tree(id_proc, expand_all=True)
+  2. Encontrar o TreeDocument com id_documento matching
+  3. Fetch o src_url (documento_visualizar com hash válido)
+  4. Retornar o HTML
+
+Code sketch:
+
+  def view_document_html(self, id_documento, id_procedimento):
+      arvore_html = self._navigate_to_arvore(id_procedimento)
+      if not arvore_html:
+          raise RuntimeError(...)
+      
+      with self._auto_unit_switch(arvore_html) as switched_to:
+          if switched_to:
+              arvore_html = self._navigate_to_arvore(id_procedimento)
+          
+          try:
+              return self._view_document_html_core(id_documento, arvore_html)
+          except RuntimeError:
+              # Fallback: expand all folders, use TreeDocument.src_url
+              tree = self.get_full_document_tree(id_procedimento, expand_all=True)
+              target = [d for d in tree if d.id_documento == str(id_documento)]
+              if not target or not target[0].src_url:
+                  raise
+              r = self._get(target[0].src_url)
+              if "login.php" in str(r.url) or len(r.text) < 500:
+                  raise RuntimeError("Failed to fetch document via src_url")
+              return r.text
+
+E em _view_document_html_core, REMOVER o bloco infra_hash fallback
+(linhas 3730-3742) que não funciona.
+
+═══════════════════════════════════════════════════════════════
+PARSER COMPATIBILITY NOTA
+═══════════════════════════════════════════════════════════════
+
+parse_relatorio() foi testado com o HTML de documento_visualizar e
+funciona — encontrou fiscal="Adonirã (", posto_fiscal="1º SGT BM".
+
+O HTML retornado por documento_visualizar contém as MESMAS classes
+CSS que documento_imprimir_web:
+  - Texto_Justificado_Recuo_Primeira_Linha ✓
+  - Texto_Centralizado ✓
+  - Tabela_Texto_Centralizado ✓
+
+A diferença é que documento_visualizar inclui wrapper HTML (head,
+scripts, etc.) além do conteúdo do documento. Mas parse_relatorio
+já lida com isso porque usa BeautifulSoup que ignora o wrapper.
+
+Para testar a qualidade REAL do parsing estruturado, precisamos de
+um livro do fiscal INTERNO (não PDF) — o único livro do fiscal neste
+processo (33920087) é PDF, e o 34350227 é um relatório de inquérito.
+
+═══════════════════════════════════════════════════════════════
+SOBRE O DOCUMENTO 34350227
+═══════════════════════════════════════════════════════════════
+
+Tipo: RELATÓRIO DO ENCARREGADO DO INQUÉRITO TÉCNICO
+Assunto: Apuração de avaria na viatura ABS-07 (MB Sprinter 517, placa RQL7B47)
+Encarregado: 2º Ten QOCBM Leo Zenon Tassi
+Portaria: nº 339 de 26/05/2025 (33962111)
+Comandante originador: 1º Ten Arthur Lima Quintino (Cmt 1º SGB/3º GBM)
+
+Oitivas realizadas:
+  - ASP BM Arimatéia (Oficial de Operações)
+  - 1º SGT BM Adonirã (Fiscal de Operações)
+  - 2º SGT BM Santiago (Comandante da guarnição)
+  - 3º SGT BM Ariano (Motorista)
+  - SD BM Castro Neto e Sd BM Tavares (Operadores de Salvamento)
+
+Conclusão: Inexistência de responsabilidade disciplinar.
+Proposta: Arquivamento do Inquérito Técnico.
+
+Assinado eletronicamente por LEO ZENON TASSI em 23/06/2025 09:30.
+
+Este documento NÃO tem seções de escala, parada, rancho, viaturas,
+ocorrências, armamento, passagem de serviço etc. Os campos vazios no
+parse são CORRETOS para este tipo documental.
+
+═══════════════════════════════════════════════════════════════
+OPEN BUGS (atualizado)
+═══════════════════════════════════════════════════════════════
+
+1. CRITICAL: view_document_html() infra_hash fallback não funciona —
+   hash é per-ação no SEI. Fix: usar TreeDocument.src_url via
+   get_full_document_tree(expand_all=True) como fallback
+
+2. REMOVE: bloco infra_hash em _view_document_html_core (L3730-3742)
+   é dead code — nunca produz resultado válido
+
+3. Minor: encoding mojibake em especificacao
+4. Minor: resolved_ids.numero_processo/numero_documento echoes input
+5. Minor: partial failures return exit code 0
+
+═══════════════════════════════════════════════════════════════
+VALIDATION COMMANDS AFTER FIX (batch 10)
+═══════════════════════════════════════════════════════════════
+
+1. sei relatorio-read "34350227" --process-id "41771530" --json
+   → Expect: parsing_strategy="structured_html_view"
+   → Expect: fiscal="Adonirã", 0 militares (correto — é inquérito)
+
+2. sei process-report "08810107.000178/2025-32" --relatorio-limit 2 --json
+   → Expect: relatório 2 (interno) com structured_html_view
+
+3. sei relatorio-read "33920087" --process-id "41771530" --json
+   → Expect: text_fallback (PDF — inalterado)
+
+BONUS — se tiver acesso a um processo com livro do fiscal INTERNO:
+4. sei relatorio-read "<SEI_NUMBER_DO_LIVRO>" --process-id "<ID>" --json
+   → Verificar qualidade real: militares com funcao/viatura/status,
+     viaturas com hodometro, ocorrências com BO, seções A-I

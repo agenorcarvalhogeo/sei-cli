@@ -469,7 +469,8 @@ var linkAssinarDocumento = 'controlador.php?acao=documento_assinar&id_documento=
 
         result = self.client._sign_or_authenticate("88888", "55555")
 
-        mock_arvore.assert_called_once_with("55555")
+        assert mock_arvore.call_args_list[0].args == ("55555",)
+        assert mock_arvore.call_count >= 1
         assert result.get("signed") == ["88888"]
 
     @patch.object(SEIClient, '_navigate_to_arvore')
@@ -762,6 +763,8 @@ class TestBlockDetailHelpers:
         assert called_doc == "48783191"
 
     def test_sign_or_authenticate_recovers_when_form_returns_but_document_is_signed(self):
+        from sei_cli.models import TreeDocument
+
         self.client._navigate_to_arvore = MagicMock(
             return_value='controlador.php?acao=arvore_visualizar&id_documento=48783191&id_procedimento=55555'
         )
@@ -788,6 +791,16 @@ class TestBlockDetailHelpers:
                 "returned_to_sign_form": True,
             }
         )
+        self.client.get_full_document_tree = MagicMock(
+            return_value=[
+                TreeDocument(
+                    id_documento="48783191",
+                    nome="Despacho",
+                    tipo="interno",
+                    assinado=False,
+                )
+            ]
+        )
         self.client.view_document_html = MagicMock(
             return_value="<html><body>Documento assinado eletronicamente por Fulano</body></html>"
         )
@@ -796,6 +809,122 @@ class TestBlockDetailHelpers:
 
         assert result["signed"] == ["48783191"]
         assert result["errors"] == []
+        assert result["post_verification"]["tree"]["verified"] is False
+        assert result["post_verification"]["fallback"]["verified"] is True
+
+    def test_sign_or_authenticate_prefers_tree_post_verification_for_signature(self):
+        from sei_cli.models import SignatureInfo, TreeDocument
+
+        self.client._navigate_to_arvore = MagicMock(
+            return_value='controlador.php?acao=arvore_visualizar&id_documento=48783191&id_procedimento=55555'
+        )
+
+        class _UnitGuard:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        self.client._auto_unit_switch = MagicMock(return_value=_UnitGuard())
+        self.client._get = MagicMock(
+            return_value=_mock_response(
+                "<html><script>var linkAssinarDocumento = 'controlador.php?acao=documento_assinar&id_documento=48783191&infra_hash=abc';</script></html>"
+            )
+        )
+        self.client._execute_sign = MagicMock(
+            return_value={
+                "doc_ids": "48783191",
+                "signed": [],
+                "already_signed": [],
+                "errors": ["SEI retornou ao formulário de assinatura sem confirmar a operação."],
+                "returned_to_sign_form": True,
+            }
+        )
+        self.client.get_full_document_tree = MagicMock(
+            return_value=[
+                TreeDocument(
+                    id_documento="48783191",
+                    nome="Despacho",
+                    tipo="interno",
+                    assinado=True,
+                    assinaturas=[
+                        SignatureInfo(
+                            signer="LEO ZENON TASSI",
+                            role="2º Tenente QOEM BM",
+                            unit="CBM",
+                            kind="assinatura",
+                            icon="svg/assinatura.svg?18",
+                        )
+                    ],
+                )
+            ]
+        )
+        self.client.view_document_html = MagicMock()
+
+        result = self.client.sign_document("48783191", "55555")
+
+        assert result["signed"] == ["48783191"]
+        assert result["errors"] == []
+        assert result["post_verification"]["tree"]["verified"] is True
+        self.client.view_document_html.assert_not_called()
+
+    def test_authenticate_document_prefers_tree_post_verification_for_authentication(self):
+        from sei_cli.models import SignatureInfo, TreeDocument
+
+        self.client._navigate_to_arvore = MagicMock(
+            return_value='controlador.php?acao=arvore_visualizar&id_documento=48783546&id_procedimento=55555'
+        )
+
+        class _UnitGuard:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        self.client._auto_unit_switch = MagicMock(return_value=_UnitGuard())
+        self.client._get = MagicMock(
+            return_value=_mock_response(
+                "<html><script>var linkAssinarDocumento = 'controlador.php?acao=documento_assinar&id_documento=48783546&infra_hash=abc';</script></html>"
+            )
+        )
+        self.client._execute_sign = MagicMock(
+            return_value={
+                "doc_ids": "48783546",
+                "signed": [],
+                "already_signed": [],
+                "errors": ["SEI retornou ao formulário de assinatura sem confirmar a operação."],
+                "returned_to_sign_form": True,
+            }
+        )
+        self.client.get_full_document_tree = MagicMock(
+            return_value=[
+                TreeDocument(
+                    id_documento="48783546",
+                    nome="Documento Externo",
+                    tipo="pdf",
+                    autenticado=True,
+                    assinaturas=[
+                        SignatureInfo(
+                            signer="LEO ZENON TASSI",
+                            role="2º Tenente QOEM BM",
+                            unit="CBM",
+                            kind="autenticacao",
+                            icon="svg/autenticacao2.svg?18",
+                        )
+                    ],
+                )
+            ]
+        )
+        self.client.view_document_html = MagicMock()
+
+        result = self.client.authenticate_document("48783546", "55555")
+
+        assert result["signed"] == ["48783546"]
+        assert result["errors"] == []
+        assert result["post_verification"]["tree"]["verified"] is True
+        self.client.view_document_html.assert_not_called()
 
 
 class TestTryInicializar:

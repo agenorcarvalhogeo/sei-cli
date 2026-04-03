@@ -1014,3 +1014,49 @@ Neste momento, a decisao oficial do projeto e:
 - **Sim** usar workflows/YAML para guiar o fluxo de negocio.
 - **Sim** usar essa camada como futura base de um MCP local, se o uso real
   provar que a interface estabilizou.
+
+## Backlog Imediato
+
+### Pos-verificacao de assinatura/autenticacao por `NosAcoes[]`
+
+Objetivo:
+- usar a nova deteccao estrutural por `NosAcoes[]` como pos-check principal em assinatura direta de documento
+- reduzir falso positivo e falso negativo apos `sign_document()` e `authenticate_document()`
+
+Escopo recomendado:
+1. `sign_document()`
+- manter o preflight atual de formulario
+- apos o submit, reler a arvore completa com `get_full_document_tree(..., expand_all=True)`
+- localizar o `id_documento`
+- confirmar `SignatureInfo(kind="assinatura")`
+
+2. `authenticate_document()`
+- apos o submit, reler a arvore completa
+- localizar o `id_documento`
+- confirmar `SignatureInfo(kind="autenticacao")`
+
+3. `process-finalize-confirm`
+- substituir a pos-verificacao atual por `NosAcoes[]` como sinal principal
+- manter a leitura textual/renderizada atual como fallback diagnostico
+
+4. `signature-block-sign-confirm`
+- nao e prioridade alterar agora
+- o fluxo atual ja ficou confiavel pela releitura do bloco
+
+Decisao tecnica:
+- preferir `NosAcoes[]` como source of truth para pos-verificacao em assinatura/autenticacao direta
+- manter o metodo atual como fallback complementar durante a transicao
+- se houver divergencia entre arvore e leitura do documento, emitir warning diagnostico
+
+Checklist real para o Lago depois da implementacao:
+1. validar assinatura direta local de documento interno de teste
+2. validar autenticacao direta de PDF externo de teste
+3. validar `process-finalize-confirm` em processo misto:
+   - externos -> `autenticacao`
+   - internos -> `assinatura`
+4. confirmar que o documento certo aparece com:
+   - `assinado=true` para interno
+   - `autenticado=true` para PDF
+5. decidir, com base no real:
+   - se o metodo antigo pode virar apenas fallback
+   - ou se vale manter os dois checks em paralelo

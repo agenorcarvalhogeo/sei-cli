@@ -1,0 +1,174 @@
+================================================================================
+RELATÓRIO DE VALIDAÇÃO — process-read (Canônica)
+================================================================================
+
+Ambiente:
+  sei-cli v0.2.0 (editable, ~/Projects/sei-cli/)
+  Unidade ativa: CBM - COBM - CMDO PABM APODI
+  Data: 2026-03-29
+
+================================================================================
+TESTES EXECUTADOS
+================================================================================
+
+#  | Processo               | Tipo        | Docs | Pastas | Modo                  | Filtro Data
+---|------------------------|-------------|------|--------|-----------------------|------------
+1  | 000081/2026-17         | Diárias     | 4    | 1      | summary               | —
+2  | 000081/2026-17         | Diárias     | 4    | 1      | all + date-filter     | 20-25/03/2026
+3  | 000178/2025-32         | IT/PAD      | 33   | 4      | summary (6 sampled)   | —
+4  | 000181/2023-12         | Sindicância | 20   | 2      | summary (6 sampled)   | —
+
+================================================================================
+RESULTADOS POR TESTE
+================================================================================
+
+TESTE 1 — Processo pequeno, summary mode
+  ✅ ok=true, 4 docs mapeados corretamente
+  ✅ 2/2 internos lidos com sucesso
+  ❌ 2/2 PDFs falharam: "Link de visualização não encontrado"
+  ✅ process_kind_guess=diarias, action_required=true
+  ✅ ui_context, action_context completos e corretos
+
+TESTE 2 — Mesmo processo, date-filter
+  ✅ ok=true, date_filter_applied=true
+  ✅ documents_matching_filter_total=0 (correto — nenhum doc tem data no título)
+  ✅ Warning adequado: "Nenhum documento com data no titulo corresponde ao recorte informado."
+
+TESTE 3 — Processo médio, 33 docs, 4 pastas (PASTA1-4)
+  ✅ ok=true, sampling summary-first-last-sample (6 de 33)
+  ✅ 3/3 docs de PASTA4 lidos com sucesso
+  ❌ 3/3 docs de PASTA3 falharam: "Link de visualização não encontrado" (são INTERNOS, não PDFs!)
+  ✅ relatorio_candidates identificou 2 relatórios
+  ✅ next_actions sugere relatorio-read e process-read --mode all
+
+TESTE 4 — Processo grande, 20 docs, 2 pastas (PASTA1-2)
+  ✅ ok=true, sampling summary-first-last-sample (6 de 20)
+  ✅ 2/2 docs de PASTA2 lidos com sucesso (internos)
+  ❌ 1/1 PDF de PASTA2 falhou (esperado — é PDF)
+  ❌ 3/3 docs de PASTA1 falharam: "Link de visualização não encontrado" (INTERNOS!)
+
+================================================================================
+🔴 BUG CRÍTICO: "Link de visualização não encontrado"
+================================================================================
+
+AFETA: docs internos de pastas que não são a última expandida + todos os PDFs
+
+CAUSA RAIZ (confirmada por testes manuais com a API Python):
+
+  O process-read usa view_document(id_doc, id_proc) que busca um link de
+  visualização HTML na página. Esse link só existe:
+    - Para docs INTERNOS que estão na pasta ATUALMENTE ATIVA na sessão SEI
+    - NUNCA para docs tipo 'pdf' (PDFs externos não têm visualização HTML)
+
+  Quando o código navega entre pastas, o estado da sessão muda e os links
+  de visualização das pastas anteriores somem.
+
+EVIDÊNCIA DIRETA:
+
+  Teste 3: PASTA4 ✅ (3/3), PASTA3 ❌ (3/3)
+  Teste 4: PASTA2 ✅ (2/2), PASTA1 ❌ (3/3)
+
+  → Sempre falha nas pastas visitadas ANTES da última.
+
+PROVA MANUAL (Python, mesma sessão):
+
+  # Árvore mapeada com sucesso — todos os 4 docs aparecem com id correto
+  tree = client.get_full_document_tree('48218772', expand_all=True)
+  # → [TreeDocument(48218774, interno), TreeDocument(48218816, pdf),
+  #    TreeDocument(48603211, interno), TreeDocument(48680709, pdf)]
+
+  # Leitura de INTERNO via read_document(id_doc, id_proc):
+  read_document('48218774', '48218772')  → ✅ 1797 chars (Parte Genérica)
+  read_document('48603211', '48218772')  → ✅ 942 chars (Despacho Decisório)
+
+  # Leitura de PDF via read_document — FALHA:
+  read_document('48218816', '48218772')  → ❌ "Link de visualização não encontrado"
+  read_document('48680709', '48218772')  → ❌ "Link de visualização não encontrado"
+
+  # Mas download_document(TreeDocument) funciona para PDFs:
+  download_document(pdf_tree_doc)         → ✅ bytes, len=105349
+
+  O TreeDocument tem atributo src_url que download_document usa internamente
+  para buscar o arquivo direto — bypassa completamente a navegação HTML.
+
+================================================================================
+🟡 BUGS MENORES
+================================================================================
+
+1. ENCODING (cosmético)
+   especificacao com mojibake (UTF-8 lido como Latin-1).
+   Ex: "ZENNON" em vez de "ZENON"
+
+2. RESOLVED_IDS ECHO (cosmético)
+   numero_processo e numero_documento ecoam o input em vez de
+   resolver pro número human-readable.
+
+3. EXIT CODE (UX)
+   Processo com falhas parciais de leitura retorna exit code 0.
+   Correto semanticamente (o envelope é ok=true), mas pode confundir pipes.
+
+================================================================================
+🟢 O QUE FUNCIONA BEM
+================================================================================
+
+- Mapeamento de árvore: documents_total, folders, document_type_counts — perfeitos
+- Sampling: summary-first-last-sample seleciona corretamente
+- Date filter: funciona, avisa adequadamente quando 0 matches
+- Semantic context: process_kind_guess, involved_military, involved_units — bons
+- JSON contract: schema_version, ok, operation, context, resolved_ids, data,
+  next_actions, warnings, error — consistente em todos os testes
+- action_context: detecta corretamente can_interact, process_open_in_current_unit
+
+================================================================================
+💡 FIX PROPOSTO: Arquitetura Map-then-Read
+================================================================================
+
+FASE 1 — Map (uma vez, no início)
+
+  tree = client.get_full_document_tree(id_proc, expand_all=True)
+  # → lista plana de TreeDocument com id_documento, src_url, tipo
+  # Todos os lazy folders expandidos de uma vez — estado consistente
+
+FASE 2 — Read (por documento, usando IDs fixos)
+
+  for doc in selected_documents:
+      if doc.tipo == 'interno':
+          # read_document faz goto interno pelo id
+          text = client.read_document(doc.id_documento, id_proc)
+      elif doc.tipo == 'pdf':
+          # Baixar bytes via src_url do TreeDocument
+          pdf_bytes = client.download_document(doc)  # usa doc.src_url
+          text = extract_text_from_pdf(pdf_bytes)     # pdftotext/PyMuPDF
+
+POR QUE RESOLVE:
+
+  1. get_full_document_tree(expand_all=True) expande tudo de uma vez
+     → estado de sessão consistente
+  2. Cada TreeDocument tem src_url IMUTÁVEL populado no momento da expansão
+  3. PDFs usam download_document() que já funciona (testado: 105KB OK)
+  4. Internos usam read_document(id_doc, id_proc) — navega por ID fixo
+
+PARA EXTRAÇÃO DE TEXTO DE PDF:
+
+  Opções (em ordem de preferência):
+  - PyMuPDF (fitz) — leve, sem dependências externas, pip install pymupdf
+  - pdftotext (poppler) — CLI, já instalado via brew no macOS
+  - pdfplumber — mais preciso pra tabelas
+
+GOTCHA:
+
+  Se read_document() também depender do estado de navegação da sessão
+  (e não fizer goto interno), o fix precisa garantir que cada leitura
+  faz um goto explícito antes. Testar isoladamente com docs de pastas
+  diferentes em sequência.
+
+================================================================================
+PRÓXIMOS PASSOS
+================================================================================
+
+1. Implementar map-then-read no process-read operation
+2. Adicionar fallback: tipo=='pdf' → download_document(TreeDocument) + text extraction
+3. Adicionar pymupdf ou pdfplumber como dependência opcional
+4. Re-rodar os 4 testes como regression test
+5. Corrigir encoding de especificacao (Latin-1 → UTF-8)
+6. Corrigir resolved_ids pra resolver número human-readable
