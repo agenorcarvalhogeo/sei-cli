@@ -165,6 +165,15 @@ class TreeFolder:
 
 
 @dataclass(slots=True)
+class SignatureInfo:
+    signer: str
+    role: str
+    unit: str
+    kind: str
+    icon: str
+
+
+@dataclass(slots=True)
 class TreeDocument:
     """A document node from the SEI tree (with download/view info)."""
     id_documento: str
@@ -175,7 +184,9 @@ class TreeDocument:
     src_url: str | None = None         # documento_visualizar or documento_download_anexo
     html_content: str | None = None    # inline HTML (for docs with viewer info)
     sei_number: str | None = None      # SEI document number from title
-    assinado: bool = False             # True if doc icon indicates signed status
+    assinado: bool = False
+    autenticado: bool = False
+    assinaturas: list[SignatureInfo] = field(default_factory=list)
 
 
 @dataclass(slots=True)

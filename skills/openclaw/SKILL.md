@@ -270,6 +270,19 @@ Documento em rascunho pode exigir unidade dona do processo. Documento assinado �
 
 Quando o fluxo estiver correto, o SEI não deve forçar relogin. Se aparecer relogin, tratar como bug de navegação/rota, não como comportamento normal.
 
+### Gotcha 12 — Lazy-loaded folders hide data
+
+SEI pagina documentos do processo em pastas (`PASTA1`, `PASTA2`, ...). Pastas com `carregado=false` **não** vêm carregadas na resposta inicial da árvore. Isso afeta documentos, `NosAcoes` de assinatura e metadados.
+
+Antes de concluir que um documento não existe, que um processo tem poucos documentos ou que uma assinatura está ausente:
+
+1. verifique se há pastas lazy-loaded
+2. expanda todas antes de tirar conclusão
+3. prefira sempre `get_full_document_tree(id, expand_all=True)` em vez de parsing bruto da árvore
+4. se por algum motivo usar HTML cru da árvore, expanda todas as pastas primeiro
+
+Exemplo real validado: um processo mostrava só 2 documentos e 2 assinaturas no root. Depois da expansão da `PASTA1`, apareciam 12 documentos e 10 assinaturas. Concluir “não há assinatura” olhando só o root é erro crítico.
+
 ## Padrão de decisão do agente
 
 Para qualquer tarefa SEI:
@@ -286,4 +299,3 @@ Para qualquer tarefa SEI:
 - `docs/operations.md` — backlog e decisões operacionais
 - `docs/plan.md` — visão mais ampla do projeto
 - `skills/oda/SKILL.md` — formatação documental
-

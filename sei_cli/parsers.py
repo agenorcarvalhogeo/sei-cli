@@ -18,7 +18,7 @@ from lxml import html
 from sei_cli.models import (
     Block, BlockDocument, Document, LoginForm, Process,
     Marcador, MarcadorForm, ProcessDetails, ProcessList, SystemStatus,
-    TramitarDestino, TramitarForm, TreeDocument, TreeFolder, Unit,
+    SignatureInfo, TramitarDestino, TramitarForm, TreeDocument, TreeFolder, Unit,
 )
 
 
@@ -36,6 +36,94 @@ def _extract_id(link: str, param: str = "id_procedimento") -> str | None:
     parsed = urlparse(link)
     values = parse_qs(parsed.query).get(param)
     return values[0] if values else None
+
+
+def _split_js_args(raw: str) -> list[str]:
+    args: list[str] = []
+    buf: list[str] = []
+    in_string = False
+    quote = ""
+    escape = False
+
+    for ch in raw:
+        if in_string:
+            buf.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                in_string = False
+        else:
+            if ch in ("'", '"'):
+                in_string = True
+                quote = ch
+                buf.append(ch)
+            elif ch == ",":
+                args.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+
+    if buf:
+        args.append("".join(buf).strip())
+    return args
+
+
+def _decode_js_string(token: str) -> str:
+    token = token.strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        token = token[1:-1]
+    token = token.replace(r"\'", "'").replace(r"\"", '"').replace(r"\\", "\\")
+    token = token.replace(r"\n", "\n").replace(r"\r", "\r").replace(r"\t", "\t")
+    return unescape(token)
+
+
+def parse_tree_signatures(content: str) -> dict[str, list[SignatureInfo]]:
+    signatures: dict[str, list[SignatureInfo]] = {}
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if "NosAcoes[" not in line or "new infraArvoreAcao(" not in line:
+            continue
+        match = re.match(r"NosAcoes\[\d+\]\s*=\s*new\s+infraArvoreAcao\((.*)\);\s*$", line)
+        if not match:
+            continue
+        args = _split_js_args(match.group(1))
+        if len(args) < 7:
+            continue
+        action_type = _decode_js_string(args[0])
+        if action_type != "ASSINATURA":
+            continue
+
+        id_documento = _decode_js_string(args[2]).strip()
+        if not id_documento:
+            continue
+
+        tooltip = _decode_js_string(args[5]).strip()
+        icon = _decode_js_string(args[6]).strip()
+        kind = "autenticacao" if "autenticacao" in icon.lower() else "assinatura"
+
+        tooltip = re.sub(r"^(Assinado por:|Autenticado por:)\n?", "", tooltip, flags=re.I).strip()
+        signer_blocks = [block.strip() for block in tooltip.split("\n\n") if block.strip()]
+        parsed_signers: list[SignatureInfo] = []
+        for block in signer_blocks:
+            lines = [line.strip() for line in block.splitlines() if line.strip()]
+            if len(lines) < 3:
+                continue
+            parsed_signers.append(
+                SignatureInfo(
+                    signer=lines[0],
+                    role=lines[1],
+                    unit=lines[2],
+                    kind=kind,
+                    icon=icon,
+                )
+            )
+        if parsed_signers:
+            signatures[id_documento] = parsed_signers
+
+    return signatures
 
 
 # --- Login ---
@@ -260,6 +348,7 @@ def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument
         content = content[2:].lstrip('\n')
 
     docs: list[TreeDocument] = []
+    signature_map = parse_tree_signatures(content)
     lines = content.split('\n')
 
     # Parse all Nos[N] definitions and their .src/.html assignments
@@ -345,17 +434,9 @@ def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument
                 if m:
                     sei_number = m.group(1)
 
-        # Detect signed status from icon URL or HTML content
-        # SEI uses icon filenames like "documento_assinado", "protocolo_documento_assinado",
-        # or "assinado" in the src/html to indicate signed documents
-        src_url_raw = node.get('src_url', '')
-        html_raw = node.get('html_content', '')
-        icon_raw = node.get('icon', '')  # from infraArvoreNo params
-        assinado = any(
-            'assinado' in s.lower()
-            for s in (src_url_raw, html_raw, icon_raw)
-            if s
-        )
+        assinaturas = signature_map.get(node.get('id', ''), [])
+        assinado = any(sig.kind == 'assinatura' for sig in assinaturas)
+        autenticado = any(sig.kind == 'autenticacao' for sig in assinaturas)
 
         docs.append(TreeDocument(
             id_documento=node.get('id', ''),
@@ -367,6 +448,8 @@ def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument
             html_content=node.get('html_content'),
             sei_number=sei_number,
             assinado=assinado,
+            autenticado=autenticado,
+            assinaturas=assinaturas,
         ))
 
     return docs

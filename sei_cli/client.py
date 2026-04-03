@@ -50,6 +50,7 @@ from sei_cli.parsers import (
     parse_system_status,
     parse_tramitar_form,
     parse_tree_folders,
+    parse_tree_signatures,
     parse_unit_switch_form,
     parse_unit_switch_link,
     parse_units_switch_page,
@@ -1243,11 +1244,28 @@ class SEIClient:
             return []
 
         all_docs: list[TreeDocument] = []
+        all_signatures: dict[str, list[Any]] = {}
+
+        def _merge_signatures(signature_map: dict[str, list[Any]]) -> None:
+            for doc_id, infos in signature_map.items():
+                if doc_id not in all_signatures:
+                    all_signatures[doc_id] = list(infos)
+                else:
+                    existing = {
+                        (sig.signer, sig.role, sig.unit, sig.kind, sig.icon)
+                        for sig in all_signatures[doc_id]
+                    }
+                    for sig in infos:
+                        key = (sig.signer, sig.role, sig.unit, sig.kind, sig.icon)
+                        if key not in existing:
+                            all_signatures[doc_id].append(sig)
+                            existing.add(key)
 
         # Parse folders from the tree JS
         folders = parse_tree_folders(arvore_html)
 
-        # Parse already-loaded documents (from folders with carregado=true)
+        # Parse already-loaded documents and signatures from root
+        _merge_signatures(parse_tree_signatures(arvore_html))
         loaded_docs = parse_expanded_folder(arvore_html, self._sei_url(""))
         all_docs.extend(loaded_docs)
 
@@ -1265,6 +1283,7 @@ class SEIClient:
                 })
 
                 if r.text.startswith('OK'):
+                    _merge_signatures(parse_tree_signatures(r.text))
                     folder_docs = parse_expanded_folder(
                         r.text, self._sei_url("")
                     )
@@ -1273,6 +1292,13 @@ class SEIClient:
                         if not doc.parent_folder:
                             doc.parent_folder = folder.folder_id
                     all_docs.extend(folder_docs)
+
+        for doc in all_docs:
+            signatures = all_signatures.get(doc.id_documento, [])
+            if signatures:
+                doc.assinaturas = signatures
+                doc.assinado = any(sig.kind == "assinatura" for sig in signatures)
+                doc.autenticado = any(sig.kind == "autenticacao" for sig in signatures)
 
         return all_docs
 
