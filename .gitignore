@@ -19,3 +19,10 @@ session.json
 # IDE
 .vscode/
 .idea/
+
+# Generated files
+*.txt
+!requirements*.txt
+CODEX_*.md
+BUG_REPORT_*.md
+uv.lock
