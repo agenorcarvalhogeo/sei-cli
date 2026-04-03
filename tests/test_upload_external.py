@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 from bs4 import BeautifulSoup
 
-from sei_cli.client import SEIClient
+from sei_cli.client import SEIClient, _sanitize_for_iso_8859_1
 
 
 # --- HTML Fixtures ---
@@ -1030,3 +1030,47 @@ class TestTryInicializar:
         html = self.client._try_inicializar()
 
         assert html == CONTROL_HTML
+
+
+class TestPostEncodingSanitization:
+    def setup_method(self):
+        self.client = _make_client()
+        self.client.client = MagicMock()
+        self.client.base_url = SEIClient.BASE
+
+    @patch("sei_cli.client.auth._follow")
+    def test_post_sanitizes_non_latin1_punctuation(self, mock_follow):
+        response = _mock_response("<html></html>", url="https://sei.rn.gov.br/sei/controlador.php?acao=x")
+        self.client.client.post.return_value = response
+        mock_follow.return_value = response
+
+        self.client._post(
+            "https://sei.rn.gov.br/sei/controlador.php?acao=x",
+            {"txtTexto": "Calendário — curso “SAT”"},
+        )
+
+        content = self.client.client.post.call_args.kwargs["content"].decode("iso-8859-1")
+        assert "%E2%80%94" not in content
+        assert "Calend%E1rio+-+curso+%22SAT%22" in content
+
+    @patch("sei_cli.client.auth._follow")
+    def test_post_pairs_sanitizes_non_latin1_punctuation(self, mock_follow):
+        response = _mock_response("<html></html>", url="https://sei.rn.gov.br/sei/controlador.php?acao=x")
+        self.client.client.post.return_value = response
+        mock_follow.return_value = response
+
+        self.client._post_pairs(
+            "https://sei.rn.gov.br/sei/controlador.php?acao=x",
+            [("selTexto", "Ofício Externo — responder até amanhã")],
+        )
+
+        content = self.client.client.post.call_args.kwargs["content"].decode("iso-8859-1")
+        assert "%E2%80%94" not in content
+        assert "Of%EDcio+Externo+-+responder+at%E9+amanh%E3" in content
+
+
+def test_sanitize_for_iso_8859_1():
+    assert _sanitize_for_iso_8859_1("Denúncia \u2014 Centro") == "Denúncia - Centro"
+    assert _sanitize_for_iso_8859_1("\u201cteste\u201d") == "\x22teste\x22"
+    assert _sanitize_for_iso_8859_1("normal text áàã") == "normal text áàã"
+    assert _sanitize_for_iso_8859_1("\u2026fim") == "...fim"

@@ -19,6 +19,7 @@ import contextlib
 import json
 import re
 import time
+import unicodedata
 from typing import Any, Iterator
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -26,6 +27,34 @@ import httpx
 from bs4 import BeautifulSoup
 
 from sei_cli import auth
+
+
+def _sanitize_for_iso_8859_1(text: str) -> str:
+    """Sanitize text to ISO-8859-1 by replacing unsupported Unicode chars.
+    
+    SEI form submissions use ISO-8859-1 encoding. Characters like em-dash (—, U+2014)
+    or fancy quotes (" ", '') don't exist in this charset and cause UnicodeEncodeError.
+    This function replaces them with ASCII equivalents.
+    
+    Args:
+        text: Text that may contain non-ISO-8859-1 characters.
+        
+    Returns:
+        Text with unsafe characters replaced by ISO-8859-1 equivalents.
+    """
+    replacements = {
+        '—': '-',      # em-dash → hyphen
+        '–': '-',      # en-dash → hyphen
+        '\u201c': '"',  # left double quote → ASCII quote
+        '\u201d': '"',  # right double quote → ASCII quote
+        '\u2018': "'",  # left single quote → ASCII apostrophe
+        '\u2019': "'",  # right single quote → ASCII apostrophe
+        '…': '...',    # ellipsis → three dots
+    }
+    result = text
+    for unicode_char, ascii_equiv in replacements.items():
+        result = result.replace(unicode_char, ascii_equiv)
+    return result
 from sei_cli.config import load_credentials, orgao_to_value, SESSION_PATH
 from sei_cli.models import (
     Block, BlockDocument, Document, DocumentCreated, DocumentType,
@@ -99,6 +128,29 @@ class SEIClient:
         self._harvest_hashes(r.text)
         return r
 
+    @staticmethod
+    def _sanitize_form_value_for_encoding(value: Any, encoding: str) -> str:
+        text = "" if value is None else str(value)
+        replacements = {
+            "\u2014": "-",
+            "\u2013": "-",
+            "\u2018": "'",
+            "\u2019": "'",
+            "\u201c": '"',
+            "\u201d": '"',
+            "\u00a0": " ",
+            "\u2026": "...",
+        }
+        for src, dst in replacements.items():
+            text = text.replace(src, dst)
+        try:
+            text.encode(encoding)
+            return text
+        except UnicodeEncodeError:
+            normalized = unicodedata.normalize("NFKD", text)
+            ascii_like = normalized.encode(encoding, errors="replace").decode(encoding)
+            return ascii_like
+
     def _post(self, url: str, data: dict, *, encoding: str = "iso-8859-1") -> httpx.Response:
         """POST form data, defaulting to ISO-8859-1 (SEI's native encoding).
 
@@ -106,7 +158,11 @@ class SEIClient:
         in the same encoding. Using UTF-8 would corrupt accented characters.
         """
         from urllib.parse import urlencode as _urlencode
-        body = _urlencode(list(data.items()), encoding=encoding)
+        sanitized_items = [
+            (key, self._sanitize_form_value_for_encoding(value, encoding))
+            for key, value in data.items()
+        ]
+        body = _urlencode(sanitized_items, encoding=encoding)
         r = self.client.post(
             url,
             content=body.encode(encoding),
@@ -131,7 +187,11 @@ class SEIClient:
         — needed for ``<select multiple>`` fields.
         """
         from urllib.parse import urlencode as _urlencode
-        body = _urlencode(pairs, encoding=encoding)
+        sanitized_pairs = [
+            (key, self._sanitize_form_value_for_encoding(value, encoding))
+            for key, value in pairs
+        ]
+        body = _urlencode(sanitized_pairs, encoding=encoding)
         r = self.client.post(
             url,
             content=body.encode(encoding),
