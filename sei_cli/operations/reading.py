@@ -99,14 +99,21 @@ def _block_preview(block: Block) -> dict[str, Any]:
 
 
 def _tree_document(doc: TreeDocument) -> dict[str, Any]:
-    return {
+    d: dict[str, Any] = {
         "id_documento": doc.id_documento,
         "nome": doc.nome,
         "tipo": doc.tipo,
         "parent_folder": doc.parent_folder,
         "sei_number": doc.sei_number,
         "assinado": doc.assinado,
+        "autenticado": doc.autenticado,
     }
+    if doc.assinaturas:
+        d["assinaturas"] = [
+            {"signer": s.signer, "role": s.role, "unit": s.unit, "kind": s.kind}
+            for s in doc.assinaturas
+        ]
+    return d
 
 
 def _block_document(doc: BlockDocument) -> dict[str, Any]:
