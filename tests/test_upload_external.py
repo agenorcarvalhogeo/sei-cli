@@ -618,6 +618,47 @@ class TestExecuteSignForm:
     @patch("sei_cli.client.auth._follow")
     @patch("sei_cli.client.load_credentials")
     @patch("sei_cli.client.orgao_to_value")
+    def test_detects_missing_tipo_conferencia_as_explicit_error(
+        self,
+        mock_orgao_to_value,
+        mock_load_credentials,
+        mock_follow,
+    ):
+        from sei_cli.models import Credentials
+
+        mock_load_credentials.return_value = Credentials(
+            usuario="u",
+            senha="s",
+            orgao="CBM",
+            login_url="https://sei.rn.gov.br",
+            cargo="2º Tenente QOEM BM",
+        )
+        mock_orgao_to_value.return_value = "28"
+
+        form = BeautifulSoup(
+            '<form id="frmAssinaturas" action="controlador.php?acao=documento_assinar">'
+            '<input name="hdnIdDocumentos" value="40439957" />'
+            "</form>",
+            "lxml",
+        ).find("form")
+
+        response = _mock_response(
+            "<html><body>Documento 40439957 não possui Tipo de Conferência informada."
+            '<form id="frmAssinaturas"></form></body></html>',
+            url="https://sei.rn.gov.br/sei/controlador.php?acao=documento_assinar&id_documento=40439957",
+        )
+        self.client.client.post.return_value = response
+        mock_follow.return_value = response
+
+        result = self.client._execute_sign_form(form, "<html></html>")
+
+        assert result["signed"] == []
+        assert result["already_signed"] == []
+        assert "Tipo de Conferência informada" in result["errors"][0]
+
+    @patch("sei_cli.client.auth._follow")
+    @patch("sei_cli.client.load_credentials")
+    @patch("sei_cli.client.orgao_to_value")
     def test_uses_selected_cargo_from_form_when_credentials_cargo_is_empty(
         self,
         mock_orgao_to_value,
@@ -868,6 +909,52 @@ class TestBlockDetailHelpers:
         assert result["errors"] == []
         assert result["post_verification"]["tree"]["verified"] is True
         self.client.view_document_html.assert_not_called()
+
+    def test_sign_or_authenticate_expands_lazy_loaded_folder_when_doc_not_in_root(self):
+        from sei_cli.models import TreeDocument
+
+        self.client._navigate_to_arvore = MagicMock(
+            return_value='controlador.php?acao=arvore_visualizar&id_procedimento=55555'
+        )
+
+        class _UnitGuard:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        self.client._auto_unit_switch = MagicMock(return_value=_UnitGuard())
+        self.client.get_full_document_tree = MagicMock(
+            return_value=[
+                TreeDocument(
+                    id_documento="48783191",
+                    nome="Despacho",
+                    tipo="interno",
+                    arvore_url="https://sei.rn.gov.br/sei/controlador.php?acao=arvore_visualizar&id_documento=48783191&id_procedimento=55555&infra_hash=expanded",
+                    assinado=False,
+                )
+            ]
+        )
+        self.client._get = MagicMock(
+            return_value=_mock_response(
+                "<html><script>var linkAssinarDocumento = 'controlador.php?acao=documento_assinar&id_documento=48783191&infra_hash=abc';</script></html>"
+            )
+        )
+        self.client._execute_sign = MagicMock(
+            return_value={
+                "doc_ids": "48783191",
+                "signed": ["48783191"],
+                "already_signed": [],
+                "errors": [],
+            }
+        )
+
+        result = self.client.sign_document("48783191", "55555")
+
+        assert result["signed"] == ["48783191"]
+        called_url = self.client._get.call_args.args[0]
+        assert called_url == "https://sei.rn.gov.br/sei/controlador.php?acao=arvore_visualizar&id_documento=48783191&id_procedimento=55555&infra_hash=expanded"
 
     def test_authenticate_document_prefers_tree_post_verification_for_authentication(self):
         from sei_cli.models import SignatureInfo, TreeDocument

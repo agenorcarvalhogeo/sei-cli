@@ -6689,9 +6689,19 @@ class SEIClient:
             else:
                 found_messages.add("Documento já foi assinado.")
 
+        conference_match = re.search(
+            r"Documento\s+\d+\s+não\s+possui\s+Tipo\s+de\s+Confer[êe]ncia\s+informada\.?",
+            plain_text,
+            re.IGNORECASE,
+        )
+        if conference_match:
+            found_messages.add(conference_match.group().strip())
+
         for text in found_messages:
             if "já foi assinado" in text:
                 result["already_signed"].append(text)
+            elif "tipo de confer" in text.lower():
+                result["errors"].append(text)
             elif "assinado com sucesso" in text.lower():
                 result["signed"].append(doc_ids)
             elif "erro" in text.lower() or "incorret" in text.lower():
