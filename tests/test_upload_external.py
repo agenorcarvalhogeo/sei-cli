@@ -1046,11 +1046,13 @@ class TestPostEncodingSanitization:
 
         self.client._post(
             "https://sei.rn.gov.br/sei/controlador.php?acao=x",
-            {"txtTexto": "Calendário — curso “SAT”"},
+            {"txtTexto": "Calendário \u2014 curso \u201cSAT\u201d"},
         )
 
         content = self.client.client.post.call_args.kwargs["content"].decode("iso-8859-1")
         assert "%E2%80%94" not in content
+        assert "%E2%80%9C" not in content
+        assert "%E2%80%9D" not in content
         assert "Calend%E1rio+-+curso+%22SAT%22" in content
 
     @patch("sei_cli.client.auth._follow")
