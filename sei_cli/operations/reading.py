@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from collections import Counter
+import concurrent.futures
 import contextlib
 from datetime import date, datetime
 import io
 import importlib
+import json
+import os
+from pathlib import Path
 import re
+import subprocess
+import sys
+import tempfile
 from typing import Any
 import unicodedata
 
@@ -1705,6 +1712,8 @@ def _environment_triage_reason(process: Process) -> list[str]:
         reasons.append("unmarked")
     elif process.recente:
         reasons.append("marked_review")
+    elif process.marcador:
+        reasons.append("marked_review")
     return reasons
 
 
@@ -1892,6 +1901,30 @@ def _triage_priority(process: Process) -> tuple[int, int]:
     if not process.marcador:
         score += 2
     return score, 1 if process.caixa == "recebidos" else 0
+
+
+def _filter_environment_triage_processes(
+    processes: list[Process],
+    *,
+    only_new: bool = False,
+    only_changed: bool = False,
+    only_unmarked: bool = False,
+    include_marked_review: bool = False,
+) -> list[Process]:
+    filtered: list[Process] = []
+    for process in processes:
+        if not _environment_candidate(process, include_marked_review=include_marked_review):
+            continue
+        reasons = _environment_triage_reason(process)
+        if only_new and "new" not in reasons:
+            continue
+        if only_changed and "changed" not in reasons:
+            continue
+        if only_unmarked and "unmarked" not in reasons:
+            continue
+        filtered.append(process)
+    filtered.sort(key=_triage_priority, reverse=True)
+    return filtered
 
 
 def _list_process_markers(client: Any, id_procedimento: str) -> list[dict[str, Any]]:
@@ -2118,6 +2151,7 @@ def environment_triage_preview(
     only_changed: bool = False,
     only_unmarked: bool = False,
     include_marked_review: bool = False,
+    offset: int = 0,
     limit: int = 5,
     mode: str = "contextual",
     sample_size: int = 3,
@@ -2128,28 +2162,20 @@ def environment_triage_preview(
         warnings: list[str] = []
         processes = client.list_processes()
         all_processes = list(processes.recebidos) + list(processes.gerados)
-        filtered: list[Process] = []
-        for process in all_processes:
-            if not _environment_candidate(process, include_marked_review=include_marked_review):
-                continue
-            reasons = _environment_triage_reason(process)
-            if only_new and "new" not in reasons:
-                continue
-            if only_changed and "changed" not in reasons:
-                continue
-            if only_unmarked and "unmarked" not in reasons:
-                continue
-            filtered.append(process)
-
-        filtered.sort(key=_triage_priority, reverse=True)
+        filtered = _filter_environment_triage_processes(
+            all_processes,
+            only_new=only_new,
+            only_changed=only_changed,
+            only_unmarked=only_unmarked,
+            include_marked_review=include_marked_review,
+        )
+        selected_processes = filtered[offset : offset + limit]
         candidates: list[dict[str, Any]] = []
         markers = [_normalize_marker_item(item) for item in client.list_marcadores()]
 
         if mode == "deep":
             # Deep mode: reads docs per process (~100s each). Use for small batches.
-            for process in filtered:
-                if len(candidates) >= limit:
-                    break
+            for process in selected_processes:
                 preview = process_marker_preview(
                     client,
                     process.id_procedimento or process.numero,
@@ -2179,10 +2205,10 @@ def environment_triage_preview(
                         "selected_marker": selected_marker,
                         "suggested_marker_text": preview["data"].get("suggested_marker_text"),
                         "summary": preview["data"].get("summary"),
-                    }
-                )
+                        }
+                    )
         elif mode == "contextual":
-            for process in filtered[:limit]:
+            for process in selected_processes:
                 try:
                     candidates.append(_contextual_triage_candidate(client, process, markers))
                 except Exception as exc:
@@ -2203,7 +2229,7 @@ def environment_triage_preview(
                     )
         else:
             # Fast mode: uses only process metadata. No doc reads.
-            for process in filtered[:limit]:
+            for process in selected_processes:
                 selected_marker = _fast_suggest_marker(markers, process)
                 suggested_text = _fast_suggested_text(process)
                 has_marker = bool(process.marcador)
@@ -2235,6 +2261,7 @@ def environment_triage_preview(
                     "only_changed": only_changed,
                     "only_unmarked": only_unmarked,
                     "include_marked_review": include_marked_review,
+                    "offset": offset,
                     "limit": limit,
                     "mode": mode,
                 },
@@ -2253,11 +2280,180 @@ def environment_triage_preview(
                         "only_changed": only_changed,
                         "only_unmarked": only_unmarked,
                         "include_marked_review": include_marked_review,
+                        "offset": offset,
                         "limit": limit,
                         "mode": mode,
                     },
                 )
             ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(operation=operation, exc=exc)
+
+
+def environment_triage_parallel(
+    *,
+    only_new: bool = False,
+    only_changed: bool = False,
+    only_unmarked: bool = False,
+    include_marked_review: bool = False,
+    offset: int = 0,
+    limit: int = 15,
+    mode: str = "contextual",
+    sample_size: int = 3,
+    workers: int = 4,
+    chunk_size: int = 15,
+) -> dict[str, Any]:
+    operation = "environment-triage-parallel"
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        warnings: list[str] = []
+        chunks: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        total_candidates = 0
+        worker_count = max(1, workers)
+        per_chunk = max(1, chunk_size)
+        wave_base = max(0, offset)
+        any_success = False
+
+        def _run_chunk(slot: int, chunk_offset: int, session_path: str) -> dict[str, Any]:
+            cmd = [
+                sys.executable,
+                "-m",
+                "sei_cli.cli",
+                "environment-triage-preview",
+                "--mode",
+                mode,
+                "--offset",
+                str(chunk_offset),
+                "--limit",
+                str(per_chunk),
+                "--sample-size",
+                str(sample_size),
+                "--json",
+            ]
+            if only_new:
+                cmd.append("--only-new")
+            if only_changed:
+                cmd.append("--only-changed")
+            if only_unmarked:
+                cmd.append("--only-unmarked")
+            if include_marked_review:
+                cmd.append("--include-marked-review")
+            env = os.environ.copy()
+            env["SEI_SESSION_PATH"] = session_path
+            completed = subprocess.run(
+                cmd,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            payload: dict[str, Any] | None = None
+            if completed.stdout.strip():
+                with contextlib.suppress(json.JSONDecodeError):
+                    payload = json.loads(completed.stdout)
+            return {
+                "slot": slot,
+                "offset": chunk_offset,
+                "returncode": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "payload": payload,
+            }
+
+        with tempfile.TemporaryDirectory(prefix="sei-triage-parallel-") as tmpdir:
+            session_paths = [
+                str(Path(tmpdir) / f"session-worker-{idx}.json")
+                for idx in range(worker_count)
+            ]
+            while True:
+                wave_jobs = []
+                for slot in range(worker_count):
+                    chunk_offset = wave_base + (slot * per_chunk)
+                    if total_candidates and chunk_offset >= total_candidates:
+                        continue
+                    wave_jobs.append((slot, chunk_offset, session_paths[slot]))
+                if not wave_jobs:
+                    break
+                with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    futures = [
+                        executor.submit(_run_chunk, slot, chunk_offset, session_path)
+                        for slot, chunk_offset, session_path in wave_jobs
+                    ]
+                    wave_results = [future.result() for future in futures]
+                wave_results.sort(key=lambda item: int(item["offset"]))
+
+                wave_selected = 0
+                for item in wave_results:
+                    payload = item.get("payload")
+                    if item["returncode"] != 0 or not isinstance(payload, dict) or not payload.get("ok"):
+                        message = (
+                            payload.get("error", {}).get("message")
+                            if isinstance(payload, dict)
+                            else None
+                        ) or item.get("stderr") or "worker_failed"
+                        warnings.append(f"worker_offset_{item['offset']}: {message}")
+                        chunks.append(
+                            {
+                                "offset": item["offset"],
+                                "limit": per_chunk,
+                                "ok": False,
+                            }
+                        )
+                        continue
+
+                    any_success = True
+                    data = payload.get("data") or {}
+                    selected = data.get("candidates") or []
+                    selected_total = int(data.get("candidates_selected_total") or len(selected))
+                    wave_selected += selected_total
+                    total_candidates = max(total_candidates, int(data.get("candidates_total") or 0))
+                    candidates.extend(selected)
+                    chunks.append(
+                        {
+                            "offset": item["offset"],
+                            "limit": per_chunk,
+                            "ok": True,
+                            "selected_total": selected_total,
+                            "warnings": payload.get("warnings", []),
+                        }
+                    )
+                    for warning in payload.get("warnings", []) or []:
+                        warnings.append(f"offset_{item['offset']}: {warning}")
+
+                if wave_selected == 0:
+                    break
+                wave_base += worker_count * per_chunk
+                if total_candidates and wave_base >= total_candidates:
+                    break
+
+        if not any_success:
+            raise RuntimeError("Nenhum worker de triagem retornou resultado válido.")
+
+        return _result(
+            operation=operation,
+            context={"parallel": True, "workers": worker_count, "mode": mode},
+            data={
+                "filters": {
+                    "only_new": only_new,
+                    "only_changed": only_changed,
+                    "only_unmarked": only_unmarked,
+                    "include_marked_review": include_marked_review,
+                    "offset": offset,
+                    "limit": limit,
+                    "mode": mode,
+                    "sample_size": sample_size,
+                },
+                "workers": worker_count,
+                "chunk_size": per_chunk,
+                "candidates_total": total_candidates,
+                "candidates_selected_total": len(candidates),
+                "chunks_total": len(chunks),
+                "chunks": chunks,
+                "candidates": candidates[:limit] if limit > 0 else candidates,
+            },
             warnings=warnings,
         )
     except Exception as exc:

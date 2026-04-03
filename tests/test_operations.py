@@ -21,6 +21,7 @@ from sei_cli.operations import (
     document_quality_check,
     document_read,
     environment_triage_apply,
+    environment_triage_parallel,
     environment_triage_preview,
     inbox_snapshot,
     marker_catalog,
@@ -1424,6 +1425,113 @@ def test_environment_triage_preview_contextual_reads_at_most_one_doc_per_candida
     assert result["data"]["filters"]["mode"] == "contextual"
     assert client.read_calls <= result["data"]["candidates_selected_total"]
     assert all("summary" in item for item in result["data"]["candidates"])
+
+
+def test_environment_triage_preview_offset_pages_candidates() -> None:
+    client = FakeClient()
+
+    first_page = environment_triage_preview(client, limit=2, offset=0, mode="fast")
+    second_page = environment_triage_preview(client, limit=2, offset=2, mode="fast")
+
+    assert first_page["ok"] is True
+    assert second_page["ok"] is True
+    assert first_page["data"]["filters"]["offset"] == 0
+    assert second_page["data"]["filters"]["offset"] == 2
+    first_ids = [item["processo"]["id_procedimento"] for item in first_page["data"]["candidates"]]
+    second_ids = [item["processo"]["id_procedimento"] for item in second_page["data"]["candidates"]]
+    assert first_ids
+    assert second_ids
+    assert first_ids != second_ids
+
+
+def test_environment_triage_parallel_aggregates_worker_chunks(monkeypatch) -> None:
+    class _Completed:
+        def __init__(self, payload: dict[str, Any], returncode: int = 0) -> None:
+            self.returncode = returncode
+            self.stdout = json.dumps(payload, ensure_ascii=False)
+            self.stderr = ""
+
+    calls: list[dict[str, Any]] = []
+
+    def _fake_run(cmd, cwd=None, capture_output=None, text=None, env=None):
+        offset = int(cmd[cmd.index("--offset") + 1])
+        calls.append({"cmd": list(cmd), "env": dict(env or {})})
+        if offset == 0:
+            payload = {
+                "ok": True,
+                "operation": "environment-triage-preview",
+                "data": {
+                    "candidates_total": 3,
+                    "candidates_selected_total": 2,
+                    "candidates": [
+                        {"processo": {"id_procedimento": "1"}},
+                        {"processo": {"id_procedimento": "2"}},
+                    ],
+                },
+                "warnings": [],
+            }
+        elif offset == 2:
+            payload = {
+                "ok": True,
+                "operation": "environment-triage-preview",
+                "data": {
+                    "candidates_total": 3,
+                    "candidates_selected_total": 1,
+                    "candidates": [
+                        {"processo": {"id_procedimento": "3"}},
+                    ],
+                },
+                "warnings": [],
+            }
+        else:
+            payload = {
+                "ok": True,
+                "operation": "environment-triage-preview",
+                "data": {
+                    "candidates_total": 3,
+                    "candidates_selected_total": 0,
+                    "candidates": [],
+                },
+                "warnings": [],
+            }
+        return _Completed(payload)
+
+    monkeypatch.setattr("sei_cli.operations.reading.subprocess.run", _fake_run)
+
+    result = environment_triage_parallel(
+        only_unmarked=True,
+        workers=2,
+        chunk_size=2,
+        limit=10,
+        mode="contextual",
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "environment-triage-parallel"
+    assert result["data"]["candidates_total"] == 3
+    assert result["data"]["candidates_selected_total"] == 3
+    assert [item["processo"]["id_procedimento"] for item in result["data"]["candidates"]] == ["1", "2", "3"]
+    assert any(call["env"].get("SEI_SESSION_PATH") for call in calls)
+    assert any("--offset" in call["cmd"] for call in calls)
+    offsets = [int(call["cmd"][call["cmd"].index("--offset") + 1]) for call in calls]
+    assert offsets == [0, 2]
+
+
+def test_environment_triage_reason_marks_marked_review_for_marked_process() -> None:
+    process = Process(
+        numero="1",
+        tipo="Ofício",
+        especificacao="Teste",
+        id_procedimento="1",
+        link="",
+        novo=False,
+        recente=False,
+        marcador="Ofícios",
+    )
+
+    result = environment_triage_preview(FakeClient(), include_marked_review=True, limit=50, mode="fast")
+    assert result["ok"] is True
+    assert any("marked_review" in item["triage_reason"] for item in result["data"]["candidates"] if item["processo"]["marcador"])
 
 
 def test_environment_triage_apply_contract() -> None:
@@ -3042,6 +3150,34 @@ def test_environment_triage_preview_cli_json(monkeypatch) -> None:
     assert payload["ok"] is True
     assert payload["operation"] == "environment-triage-preview"
     assert payload["data"]["filters"]["mode"] == "fast"
+
+
+def test_environment_triage_parallel_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sei_cli.cli.op_environment_triage_parallel",
+        lambda **kwargs: {
+            "ok": True,
+            "operation": "environment-triage-parallel",
+            "context": {"parallel": True},
+            "resolved_ids": {},
+            "data": {"workers": kwargs["workers"], "chunk_size": kwargs["chunk_size"], "candidates": []},
+            "warnings": [],
+            "next_actions": [],
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["environment-triage-parallel", "--workers", "4", "--chunk-size", "15", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "environment-triage-parallel"
+    assert payload["data"]["workers"] == 4
+    assert payload["data"]["chunk_size"] == 15
 
 
 def test_environment_triage_apply_cli_json(monkeypatch) -> None:

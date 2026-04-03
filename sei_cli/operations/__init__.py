@@ -2,6 +2,7 @@ from .contracts import NextAction, OperationError, OperationResult
 from .reading import (
     block_review,
     document_read,
+    environment_triage_parallel,
     environment_triage_preview,
     inbox_snapshot,
     marker_catalog,
@@ -77,6 +78,7 @@ __all__ = [
     "document_quality_check",
     "document_read",
     "environment_triage_apply",
+    "environment_triage_parallel",
     "environment_triage_preview",
     "inbox_snapshot",
     "marker_catalog",

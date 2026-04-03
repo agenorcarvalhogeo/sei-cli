@@ -6,10 +6,10 @@ from pathlib import Path
 
 from sei_cli.models import Credentials
 
-CREDENTIALS_PATH = Path("~/.config/sei/credentials.json").expanduser()
-SESSION_PATH = Path("~/.config/sei-cli/session.json").expanduser()
-CREATED_PROCESSES_PATH = Path("~/.config/sei-cli/created_processes.json").expanduser()
-CREATED_DOCUMENTS_PATH = Path("~/.config/sei-cli/created_documents.json").expanduser()
+CREDENTIALS_PATH = Path(os.getenv("SEI_CREDENTIALS_PATH", "~/.config/sei/credentials.json")).expanduser()
+SESSION_PATH = Path(os.getenv("SEI_SESSION_PATH", "~/.config/sei-cli/session.json")).expanduser()
+CREATED_PROCESSES_PATH = Path(os.getenv("SEI_CREATED_PROCESSES_PATH", "~/.config/sei-cli/created_processes.json")).expanduser()
+CREATED_DOCUMENTS_PATH = Path(os.getenv("SEI_CREATED_DOCUMENTS_PATH", "~/.config/sei-cli/created_documents.json")).expanduser()
 
 ORGAO_MAP: dict[str, str] = {
     "CBM": "28",
