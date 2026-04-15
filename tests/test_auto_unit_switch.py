@@ -277,6 +277,8 @@ class TestSwitchUnit:
         client._control_html = None
         client._menu_links = {}
         client._persist_session = MagicMock()
+        client._ensure_session = MagicMock(return_value="<html><title>Controle de Processos</title></html>")
+        client._is_valid_control_html = MagicMock(side_effect=[False, True])
 
         switch_response = MagicMock()
         switch_response.url = "https://sei.rn.gov.br/sei/controlador.php?acao=infra_trocar_unidade&infra_unidade_atual=110006929"
@@ -293,7 +295,7 @@ class TestSwitchUnit:
         mock_switch_form.return_value = ("controlador.php", {})
         mock_parse_status.side_effect = [
             SystemStatus(valid=True, unidade_sigla="CBM - COBM - CMDO PABM APODI"),
-            SystemStatus(valid=False, unidade_sigla="CBM - COBM - CMDO PABM APODI"),
+            SystemStatus(valid=True, unidade_sigla="CBM - COBM - CMDO PABM APODI"),
         ]
         mock_menu_links.return_value = {}
 

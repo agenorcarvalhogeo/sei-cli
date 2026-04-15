@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 from sei_cli.config import (
@@ -293,15 +294,30 @@ def _resolve_process_type(client: Any, tipo_processo: str) -> tuple[str, str]:
     aliases = getattr(client, "PROC_TYPES", {})
     key = _normalize_process_type_key(tipo_processo)
     resolved = aliases.get(key)
-    if not resolved:
+    if resolved:
+        return resolved, key
+
+    if hasattr(client, "list_process_types"):
+        available = client.list_process_types()
+        by_name = next((item for item in available if _normalize_process_type_key(item.nome) == key), None)
+        if by_name:
+            return by_name.id_serie, key
         raise WorkflowViolationError(
             f"Tipo de processo '{tipo_processo}' nao reconhecido.",
             details={
                 "tipo_processo_informado": tipo_processo,
                 "known_aliases": sorted(aliases.keys()),
+                "available_types": [item.nome for item in available],
             },
         )
-    return resolved, key
+
+    raise WorkflowViolationError(
+        f"Tipo de processo '{tipo_processo}' nao reconhecido.",
+        details={
+            "tipo_processo_informado": tipo_processo,
+            "known_aliases": sorted(aliases.keys()),
+        },
+    )
 
 
 def _resolve_access_level(nivel_acesso: str) -> tuple[str, str, list[str]]:
@@ -3413,9 +3429,10 @@ def signature_block_sign_preview(
             return block_result
 
         pending_documents = block_result["data"].get("pending_documents", [])
+        signable_documents = block_result["data"].get("signable_documents", pending_documents)
         requested_ids = {item.strip() for item in (document_ids or []) if item and item.strip()}
         selected_documents = [
-            item for item in pending_documents
+            item for item in signable_documents
             if not requested_ids or item.get("documento_id") in requested_ids or item.get("numero_sei") in requested_ids
         ]
         if requested_ids and not selected_documents:
@@ -3428,7 +3445,7 @@ def signature_block_sign_preview(
         block_state = str(block_result["data"]["bloco"].get("estado") or "").casefold()
         if block_state == "recebido":
             warnings.append("Bloco em estado 'Recebido' normalmente não aceita assinatura pela unidade atual.")
-        if not pending_documents:
+        if not signable_documents:
             warnings.append("Bloco sem documentos pendentes de assinatura.")
 
         normalized_documents: list[dict[str, Any]] = []
@@ -3469,6 +3486,7 @@ def signature_block_sign_preview(
             data={
                 "bloco": block_result["data"]["bloco"],
                 "pending_documents_total": len(pending_documents),
+                "signable_documents_total": len(signable_documents),
                 "selected_documents_total": len(selected_documents),
                 "selected_documents": normalized_documents,
                 "signable_document_ids": signable_document_ids,
@@ -3582,38 +3600,52 @@ def signature_block_sign_confirm(
                 },
             )
 
-        verification = __import__("sei_cli.operations.reading", fromlist=["signature_block_review"]).signature_block_review(
-            client,
-            block_numero,
-        )
-        if not verification.get("ok"):
-            verification["operation"] = operation
-            return verification
+        verification = None
+        still_signable_after_verification: list[str] = []
+        for attempt in range(3):
+            verification = __import__("sei_cli.operations.reading", fromlist=["signature_block_review"]).signature_block_review(
+                client,
+                block_numero,
+            )
+            if not verification.get("ok"):
+                verification["operation"] = operation
+                return verification
 
-        pending_items = verification["data"].get("pending_documents", [])
+            signable_items = verification["data"].get("signable_documents", [])
+            still_signable_after_verification = [
+                (item.get("resolved_id_documento") or item.get("documento_id"))
+                for item in selected_documents
+                if any(
+                    _block_document_matches(
+                        signable_item,
+                        id_documento=item.get("resolved_id_documento") or item.get("documento_id"),
+                        numero_documento=item.get("resolved_numero_documento") or item.get("numero_sei") or item.get("numero_documento"),
+                    )
+                    for signable_item in signable_items
+                )
+            ]
+            if not still_signable_after_verification:
+                break
+            if attempt < 2:
+                time.sleep(0.6 * (attempt + 1))
+
+        if verification is None:
+            raise WorkflowViolationError(
+                "Falha ao reler o bloco após assinatura.",
+                details={"block_numero": block_numero},
+            )
+
         requested_ids = [
             item.get("resolved_id_documento") or item.get("documento_id")
             for item in selected_documents
             if item.get("resolved_id_documento") or item.get("documento_id")
         ]
-        not_signed_after_verification = [
-            (item.get("resolved_id_documento") or item.get("documento_id"))
-            for item in selected_documents
-            if any(
-                _block_document_matches(
-                    pending_item,
-                    id_documento=item.get("resolved_id_documento") or item.get("documento_id"),
-                    numero_documento=item.get("resolved_numero_documento") or item.get("numero_sei") or item.get("numero_documento"),
-                )
-                for pending_item in pending_items
-            )
-        ]
-        if not_signed_after_verification:
+        if still_signable_after_verification:
             raise WorkflowViolationError(
-                "Assinatura submetida, mas alguns documentos continuam pendentes após releitura do bloco.",
+                "Assinatura submetida, mas alguns documentos continuam assináveis após releitura do bloco.",
                 details={
                     "block_numero": block_numero,
-                    "remaining_pending_document_ids": not_signed_after_verification,
+                    "remaining_signable_document_ids": still_signable_after_verification,
                 },
             )
 
@@ -3626,6 +3658,7 @@ def signature_block_sign_confirm(
                 "sign_results": results,
                 "verification": {
                     "remaining_pending_total": verification["data"].get("pending_total"),
+                    "remaining_signable_total": len(verification["data"].get("signable_documents", [])),
                     "signed_total": verification["data"].get("signed_total"),
                 },
             },

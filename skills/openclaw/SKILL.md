@@ -146,6 +146,8 @@ São fluxos diferentes.
 
 - **Assinatura local:** assinar na unidade geradora com `process-finalize-*` ou `sign_document`, depois de recolher o bloco se ele estiver disponibilizado.
 - **Assinatura por bloco:** usar `signature-block-sign-*` apenas na unidade destinatária do bloco disponibilizado.
+- Se o documento está no bloco e o bloco ainda expõe ação de assinar para a unidade atual, continue no fluxo `signature-block-sign-*` mesmo que já exista assinatura anterior de outro militar.
+- Não desviar para assinatura local só porque o documento já tem alguma assinatura anterior. O sinal correto é o bloco ainda estar com `can_sign=true` / `signable_document_ids` preenchido.
 
 Cenário de referência validado: `CMDO PABM APODI -> PAD-PDF`.
 

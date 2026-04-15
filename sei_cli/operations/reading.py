@@ -45,6 +45,24 @@ def _context(client: Any) -> dict[str, Any]:
     }
 
 
+def _context_best_effort(
+    client: Any,
+    fallback: dict[str, Any] | None = None,
+    *,
+    assumed_unit: str | None = None,
+) -> dict[str, Any]:
+    try:
+        return _context(client)
+    except Exception:
+        context = dict(fallback or {})
+        if assumed_unit:
+            context["unidade_sigla"] = assumed_unit
+            context["unidade_descricao"] = assumed_unit
+        if "valid" not in context:
+            context["valid"] = False
+        return context
+
+
 def _result(
     *,
     operation: str,
@@ -135,6 +153,7 @@ def _block_document(doc: BlockDocument) -> dict[str, Any]:
         "assinante": doc.assinante,
         "assinantes": doc.assinantes,
         "assinado": doc.assinado,
+        "can_sign": doc.can_sign,
     }
 
 
@@ -219,7 +238,10 @@ def _refresh_tree_document(
 
 
 def _find_process_metadata(client: Any, id_procedimento: str, numero_processo: str | None) -> Process | None:
-    processes = client.list_processes()
+    try:
+        processes = client.list_processes()
+    except Exception:
+        return None
     for process in processes.recebidos + processes.gerados:
         if process.id_procedimento == id_procedimento:
             return process
@@ -315,6 +337,31 @@ def _has_action(actions: dict[str, str], *, key: str | None = None, token: str |
     if token and any(token in url for url in actions.values()):
         return True
     return False
+
+
+def _normalize_person_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized.casefold())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _block_document_needs_current_user_signature(doc: dict[str, Any], current_user: str) -> bool:
+    if not doc.get("can_sign"):
+        return False
+    current_user_normalized = _normalize_person_text(current_user)
+    if not current_user_normalized:
+        return bool(doc.get("can_sign"))
+    current_tokens = {token for token in current_user_normalized.split() if len(token) > 2}
+    for signer in doc.get("assinantes", []) or []:
+        signer_normalized = _normalize_person_text(str(signer))
+        signer_tokens = {token for token in signer_normalized.split() if len(token) > 2}
+        overlap = signer_tokens & current_tokens
+        if len(overlap) >= 2:
+            return False
+        if overlap and signer_normalized.split()[-1:] == current_user_normalized.split()[-1:]:
+            return False
+    return True
 
 
 def _action_context(process_actions: dict[str, str], document_actions: dict[str, str]) -> dict[str, Any]:
@@ -757,10 +804,27 @@ def _read_tree_document_text(
 ) -> tuple[str, str]:
     read_document_content = getattr(client, "read_document_content", None)
 
+    def _is_session_expiry(exc: Exception) -> bool:
+        message = str(exc).casefold()
+        return (
+            "session expired" in message
+            or "sessão expirada" in message
+            or "pagina de login" in message
+            or "página de login" in message
+            or "pwdsenha" in message
+            or "login.php" in message
+        )
+
     if doc and doc.src_url and callable(read_document_content):
         try:
             return read_document_content(doc), "read_document_content"
         except Exception as exc:
+            if _is_session_expiry(exc) and hasattr(client, "_ensure_session"):
+                client._ensure_session()
+                try:
+                    return read_document_content(doc), "read_document_content_session_retry"
+                except Exception:
+                    pass
             refreshed_doc, refreshed_process_id = _refresh_tree_document(
                 client,
                 doc,
@@ -781,7 +845,13 @@ def _read_tree_document_text(
     if doc and doc.tipo.lower() == "interno":
         try:
             return client.read_document(id_documento, id_procedimento), "read_document"
-        except Exception:
+        except Exception as exc:
+            if _is_session_expiry(exc) and hasattr(client, "_ensure_session"):
+                client._ensure_session()
+                try:
+                    return client.read_document(id_documento, id_procedimento), "read_document_session_retry"
+                except Exception:
+                    pass
             refreshed_doc, refreshed_process_id = _refresh_tree_document(
                 client,
                 doc,
@@ -805,7 +875,18 @@ def _read_tree_document_text(
             )
         try:
             payload = downloader(doc)
-        except Exception:
+        except Exception as exc:
+            if _is_session_expiry(exc) and hasattr(client, "_ensure_session"):
+                client._ensure_session()
+                try:
+                    payload = downloader(doc)
+                except Exception:
+                    pass
+                else:
+                    if isinstance(payload, bytes):
+                        return _extract_pdf_text_from_bytes(payload), "download_document_pdf_session_retry"
+                    if isinstance(payload, str):
+                        return payload, "download_document_text_session_retry"
             refreshed_doc, refreshed_process_id = _refresh_tree_document(
                 client,
                 doc,
@@ -1051,8 +1132,15 @@ def _aggregate_process_context(
     *,
     selection: dict[str, Any],
     total_docs: int,
+    docs: list[TreeDocument] | None = None,
 ) -> dict[str, Any]:
     successful = [item for item in analyzed_documents if item.get("ok", True)]
+    if not successful:
+        return _partial_process_context_from_tree(
+            docs or [],
+            selection=selection,
+            total_docs=total_docs,
+        )
     semantic_contexts = [item["semantic_context"] for item in successful]
 
     involved_people = _unique_people(
@@ -1118,6 +1206,8 @@ def _aggregate_process_context(
         ),
         "domain_context": process_domain_context,
         "key_documents": key_documents,
+        "partial_context": False,
+        "summary_source": "document_reads",
     }
 
 
@@ -1225,7 +1315,7 @@ def process_read(
             if switched_to:
                 preflight["switched"] = True
                 preflight["switched_to"] = switched_to
-                context = _context(client)
+                context = _context_best_effort(client, context, assumed_unit=switched_to)
 
             process = _find_process_metadata(client, id_procedimento, numero_processo)
             docs = client.get_full_document_tree(id_procedimento)
@@ -1312,6 +1402,7 @@ def process_read(
                 analyzed_documents,
                 selection=selection,
                 total_docs=len(docs),
+                docs=docs,
             )
 
         next_actions: list[NextAction] = []
@@ -1531,6 +1622,8 @@ def process_summary(
         "processo": data.get("processo", {}),
         "summary": process_context.get("summary"),
         "process_kind_guess": process_context.get("process_kind_guess"),
+        "summary_source": process_context.get("summary_source"),
+        "partial_context": process_context.get("partial_context", False),
         "preflight": data.get("preflight", {}),
         "selection": data.get("selection", {}),
         "read_summary": read_summary,
@@ -1821,11 +1914,98 @@ def _select_context_document(docs: list[TreeDocument]) -> TreeDocument | None:
     return docs[index] if selected else None
 
 
+def _context_document_candidates(docs: list[TreeDocument]) -> list[TreeDocument]:
+    if not docs:
+        return []
+
+    def _score(item: tuple[int, TreeDocument]) -> tuple[int, int]:
+        index, doc = item
+        name = _normalize_marker_name(doc.nome or "")
+        keyword_score = 0
+        for token, score in (
+            ("despacho", 60),
+            ("oficio", 55),
+            ("parecer", 50),
+            ("manifest", 45),
+            ("requer", 40),
+            ("solicit", 35),
+            ("relatorio", 30),
+            ("inform", 25),
+            ("parte generica", 20),
+        ):
+            if token in name:
+                keyword_score = max(keyword_score, score)
+        signed_score = 5 if doc.assinado else 0
+        recency_score = index
+        return keyword_score + signed_score + recency_score, recency_score
+
+    ranked = sorted(enumerate(docs), key=_score, reverse=True)
+    return [doc for _index, doc in ranked]
+
+
+def _partial_process_context_from_tree(
+    docs: list[TreeDocument],
+    *,
+    selection: dict[str, Any],
+    total_docs: int,
+) -> dict[str, Any]:
+    folders = sorted({doc.parent_folder for doc in docs if doc.parent_folder})
+    signed_total = sum(1 for doc in docs if doc.assinado or doc.autenticado)
+    key_docs = _context_document_candidates(docs)[:5]
+    key_documents = [
+        {
+            "documento": _tree_document(doc),
+            "summary": f"Documento visível na árvore: {doc.nome}",
+            "document_kind_guess": "generic",
+            "action_required": False,
+            "action_kind": None,
+        }
+        for doc in key_docs
+    ]
+    involved_units = _unique_strings(
+        [
+            signature.unit
+            for doc in docs
+            for signature in doc.assinaturas
+            if signature.unit
+        ]
+    )
+    document_names = [doc.nome for doc in key_docs if doc.nome]
+    summary_parts = [
+        _selection_scope_label(selection, total_docs),
+        f"Contexto parcial pela árvore: {len(docs)} documento(s) visível(is), {signed_total} com assinatura/autenticação.",
+    ]
+    if document_names:
+        summary_parts.append(f"Documentos-chave visíveis: {', '.join(document_names[:3])}.")
+    if folders:
+        summary_parts.append(f"Pastas visíveis: {', '.join(folders[:3])}.")
+    return {
+        "summary": " ".join(summary_parts),
+        "process_kind_guess": "generic",
+        "document_kind_counts": {},
+        "involved_people": [],
+        "involved_military": [],
+        "involved_units": involved_units,
+        "mentioned_dates": [],
+        "deadlines": [],
+        "requires_response": None,
+        "action_required": None,
+        "dominant_action_kind": None,
+        "information_only": None,
+        "has_relatorio_operacional": any("relatorio" in _normalize_marker_name(doc.nome or "") for doc in docs),
+        "domain_context": {"kind": "generic", "fields": {}},
+        "key_documents": key_documents,
+        "partial_context": True,
+        "summary_source": "tree_partial",
+    }
+
+
 def _contextual_triage_candidate(client: Any, process: Process, markers: list[dict[str, Any]]) -> dict[str, Any]:
     process_preview = _process_preview(process)
     process_id = process.id_procedimento or process.numero
     docs = client.get_full_document_tree(process_id)
-    context_doc = _select_context_document(docs)
+    context_candidates = _context_document_candidates(docs)
+    context_doc = context_candidates[0] if context_candidates else None
     if not context_doc:
         selected_marker = _fast_suggest_marker(markers, process)
         suggested_text = _fast_suggested_text(process)
@@ -1839,13 +2019,56 @@ def _contextual_triage_candidate(client: Any, process: Process, markers: list[di
             "summary": suggested_text,
             "context_document": None,
         }
+    read_warning: str | None = None
+    text: str | None = None
+    extraction_method: str | None = None
+    for candidate in context_candidates[:3]:
+        try:
+            text, extraction_method = _read_tree_document_text(
+                client,
+                candidate,
+                id_documento=candidate.id_documento,
+                id_procedimento=process_id,
+            )
+            context_doc = candidate
+            break
+        except Exception as exc:
+            read_warning = str(exc)
+    if text is None or extraction_method is None:
+        partial_context = _partial_process_context_from_tree(
+            docs,
+            selection={
+                "documents_selected_total": len(context_candidates[:3]),
+                "strategy": "contextual-tree-partial",
+                "date_filter_applied": False,
+            },
+            total_docs=len(docs),
+        )
+        selected_marker = _fast_suggest_marker(markers, process)
+        summary = partial_context["summary"]
+        suggested_text = _sanitize_marker_text(f"{_process_subject(process)} - contexto parcial pela árvore")
+        marker_action = "create" if not process.marcador else ("update" if process.recente or process.novo else "keep")
+        result = {
+            "processo": process_preview,
+            "triage_reason": _environment_triage_reason(process),
+            "marker_action": marker_action,
+            "current_marker": process.marcador,
+            "selected_marker": selected_marker,
+            "suggested_marker_text": suggested_text,
+            "summary": summary,
+            "context_document": {
+                "id_documento": context_doc.id_documento,
+                "numero_documento": context_doc.sei_number,
+                "nome": context_doc.nome,
+                "tipo": context_doc.tipo,
+                "assinado": context_doc.assinado,
+                "extraction_method": "tree_partial",
+            } if context_doc else None,
+        }
+        if read_warning:
+            result["warning"] = f"contextual_partial: {read_warning}"
+        return result
 
-    text, extraction_method = _read_tree_document_text(
-        client,
-        context_doc,
-        id_documento=context_doc.id_documento,
-        id_procedimento=process_id,
-    )
     semantic_context, _domain_context = _semantic_context(
         {
             "nome": context_doc.nome,
@@ -1873,7 +2096,7 @@ def _contextual_triage_candidate(client: Any, process: Process, markers: list[di
     status = _status_from_semantic(semantic_context, text, context_doc)
     suggested_text = _sanitize_marker_text(f"{subject} - {status}")
     marker_action = "create" if not process.marcador else ("update" if process.recente or process.novo else "keep")
-    return {
+    result = {
         "processo": process_preview,
         "triage_reason": _environment_triage_reason(process),
         "marker_action": marker_action,
@@ -1890,6 +2113,9 @@ def _contextual_triage_candidate(client: Any, process: Process, markers: list[di
             "extraction_method": extraction_method,
         },
     }
+    if read_warning:
+        result["warning"] = f"contextual_retry: {read_warning}"
+    return result
 
 
 def _triage_priority(process: Process) -> tuple[int, int]:
@@ -2588,7 +2814,7 @@ def document_read(client: Any, numero_ou_id: str, *, id_procedimento: str | None
             if switched_to:
                 preflight["switched"] = True
                 preflight["switched_to"] = switched_to
-                context = _context(client)
+                context = _context_best_effort(client, context, assumed_unit=switched_to)
                 docs = client.get_full_document_tree(id_procedimento_resolved)
             process = _find_process_metadata(client, id_procedimento_resolved, None)
             doc_payload = _document_read_core(
@@ -2655,7 +2881,7 @@ def relatorio_read(client: Any, numero_ou_id: str, *, id_procedimento: str | Non
             if switched_to:
                 preflight["switched"] = True
                 preflight["switched_to"] = switched_to
-                context = _context(client)
+                context = _context_best_effort(client, context, assumed_unit=switched_to)
                 docs = client.get_full_document_tree(id_procedimento_resolved)
             doc_meta = next((doc for doc in docs if doc.id_documento == id_documento), None)
 
@@ -2855,16 +3081,21 @@ def signature_block_review(client: Any, block_numero: str) -> dict[str, Any]:
         return base
 
     documents = base["data"].get("documents", [])
+    current_user = base.get("context", {}).get("usuario", "")
     pending_documents = [doc for doc in documents if not doc.get("assinado")]
+    signable_documents = [
+        doc for doc in documents
+        if _block_document_needs_current_user_signature(doc, current_user)
+    ]
     signed_documents = [doc for doc in documents if doc.get("assinado")]
     processos = base["data"].get("processos", [])
     warnings = list(base.get("warnings", []))
-    if not pending_documents:
+    if not signable_documents:
         warnings.append("Bloco sem documentos pendentes de assinatura.")
 
     next_actions: list[NextAction] = []
-    if pending_documents:
-        first_pending = pending_documents[0]
+    if signable_documents:
+        first_pending = signable_documents[0]
         next_actions.append(
             NextAction(
                 action="document-read",
@@ -2891,9 +3122,10 @@ def signature_block_review(client: Any, block_numero: str) -> dict[str, Any]:
         data={
             **base["data"],
             "pending_documents": pending_documents,
+            "signable_documents": signable_documents,
             "signed_documents": signed_documents,
-            "ready_to_sign": bool(pending_documents),
-            "signable_document_ids": [doc.get("documento_id") for doc in pending_documents if doc.get("documento_id")],
+            "ready_to_sign": bool(signable_documents),
+            "signable_document_ids": [doc.get("documento_id") for doc in signable_documents if doc.get("documento_id")],
         },
         next_actions=next_actions,
         warnings=warnings,

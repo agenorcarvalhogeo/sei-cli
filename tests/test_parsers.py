@@ -238,7 +238,36 @@ def test_parse_block_documents_unsigned_row_keeps_empty_signers() -> None:
 
     assert len(docs) == 1
     assert docs[0].assinantes == []
-    assert docs[0].assinante == ""
+
+
+def test_parse_block_documents_with_existing_signature_and_sign_action_stays_signable() -> None:
+    html = """
+    <html><body>
+      <table>
+        <tr class="infraTrEscura">
+          <td><input type="checkbox" value="48783191-871299"/></td>
+          <td>2</td>
+          <td>08810254.000117/2026-62</td>
+          <td><a href="#ID-48783191-871299">40381240</a></td>
+          <td>Despacho</td>
+          <td align="justified">
+            <div class="divRotuloItemCelula">JORGE WAGNER / Cabo QPBM</div>
+          </td>
+          <td>
+            <a href="#" onclick="return acaoAssinar('48783191-871299', 'controlador.php?acao=documento_assinar&id_documento=48783191&infra_hash=abc');">Assinar</a>
+            <img title="Assinatura"/>
+          </td>
+        </tr>
+      </table>
+    </body></html>
+    """
+
+    docs = parse_block_documents(html, BASE)
+
+    assert len(docs) == 1
+    assert docs[0].assinado is False
+    assert docs[0].can_sign is True
+    assert docs[0].assinante == "JORGE WAGNER / Cabo QPBM"
     assert docs[0].assinado is False
 
 

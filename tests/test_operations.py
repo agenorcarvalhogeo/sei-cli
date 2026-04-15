@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 import tempfile
@@ -125,14 +126,15 @@ class FakeClient:
         self.block_documents_map: dict[str, list[BlockDocument]] = {
             "774681": [
                 BlockDocument(
-                    seq="1",
+                seq="1",
                 processo="08810058.000128/2026-69",
                 documento_id="48568466",
                 tipo_documento="Relatório do Fiscal",
-                assinante="Fulano",
+                assinante="Beltrano",
                 numero_sei="39860248",
                 numero_documento="39860248",
                 assinado=False,
+                can_sign=True,
             ),
                 BlockDocument(
                     seq="2",
@@ -143,6 +145,7 @@ class FakeClient:
                     numero_sei="39860248",
                     numero_documento="39860248",
                     assinado=True,
+                    can_sign=False,
                 ),
             ]
         }
@@ -566,6 +569,7 @@ class FakeClient:
             for doc in docs:
                 if doc.documento_id == id_documento:
                     doc.assinado = True
+                    doc.can_sign = False
         return {"doc_ids": [id_documento], "signed": [id_documento], "already_signed": [], "errors": []}
 
     def authenticate_document(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
@@ -835,6 +839,12 @@ class FakeClient:
             "warnings": [],
         }
 
+    def list_process_types(self) -> list[DocumentType]:
+        return [
+            DocumentType(id_serie="100000182", nome="Férias"),
+            DocumentType(id_serie="100000999", nome="Processo Expandido Pouco Usado"),
+        ]
+
     def list_document_types(self, id_procedimento: str) -> list[DocumentType]:
         if id_procedimento != "47607237":
             return []
@@ -843,6 +853,7 @@ class FakeClient:
             DocumentType(id_serie="292", nome="Parte Genérica"),
             DocumentType(id_serie="178", nome="Solicitação"),
             DocumentType(id_serie="92", nome="Informação"),
+            DocumentType(id_serie="999", nome="Tipo Expandido Pouco Usado"),
         ]
 
     def get_document_creation_metadata(
@@ -1179,6 +1190,136 @@ def test_process_summary_contract() -> None:
     assert result["data"]["read_summary"]["documents_failed_total"] == 0
     assert result["data"]["key_documents"]
     assert result["data"]["action_items"]
+
+
+class PartialContextClient(FakeClient):
+    def read_document(self, id_documento: str, id_procedimento: str) -> str:
+        if id_documento == "48568466":
+            raise RuntimeError("Processo aberto somente na unidade CHEFIA SAT")
+        return super().read_document(id_documento, id_procedimento)
+
+
+class TreeOnlyContextClient(FakeClient):
+    def read_document(self, id_documento: str, id_procedimento: str) -> str:
+        raise RuntimeError("Processo aberto somente na unidade CHEFIA SAT")
+
+    def read_document_content(self, doc: TreeDocument) -> str:
+        raise RuntimeError("about:blank")
+
+    def download_document(self, doc: TreeDocument, output_path: str | None = None) -> bytes | str:
+        raise RuntimeError("download bloqueado pela unidade atual")
+
+
+class SessionRetryReadClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._session_retry_triggered = False
+        self.ensure_session_calls = 0
+
+    def _ensure_session(self) -> None:
+        self.ensure_session_calls += 1
+        self._session_retry_triggered = True
+
+    def read_document(self, id_documento: str, id_procedimento: str) -> str:
+        if id_documento == "48568466" and not self._session_retry_triggered:
+            raise RuntimeError("Sessão expirada — página de login retornada em vez do controle de processos")
+        return super().read_document(id_documento, id_procedimento)
+
+
+class MetadataListFailureClient(FakeClient):
+    def list_processes(self, unit: str | None = None) -> ProcessList:
+        raise RuntimeError("Sessão expirada — página de login retornada em vez do controle de processos")
+
+
+class SwitchedUnitStatusFailureClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._switched_active = False
+
+    def _navigate_to_arvore(self, id_procedimento: str) -> str:
+        return '<html><div>Processo aberto somente na unidade CMDO PABM APODI</div></html>'
+
+    def _detect_unit_restriction(self, arvore_html: str) -> str | None:
+        return "CMDO PABM APODI"
+
+    @contextlib.contextmanager
+    def _auto_unit_switch(self, arvore_html: str, *, target_unit: str | None = None):
+        self._switched_active = True
+        try:
+            yield target_unit or "CMDO PABM APODI"
+        finally:
+            self._switched_active = False
+
+    def status(self) -> SystemStatus:
+        if self._switched_active:
+            raise RuntimeError("Sessão expirada — página de login retornada em vez do controle de processos")
+        return super().status()
+
+    def list_processes(self, unit: str | None = None) -> ProcessList:
+        if self._switched_active:
+            raise RuntimeError("Sessão expirada — página de login retornada em vez do controle de processos")
+        return super().list_processes(unit)
+
+
+def test_environment_triage_contextual_retries_other_visible_document_before_fallback() -> None:
+    client = PartialContextClient()
+
+    result = environment_triage_preview(client, limit=3, mode="contextual")
+
+    assert result["ok"] is True
+    candidate = next(item for item in result["data"]["candidates"] if item["processo"]["id_procedimento"] == "47607237")
+    assert candidate["context_document"] is not None
+    assert candidate["context_document"]["id_documento"] != "48568466"
+    assert candidate["summary"]
+
+
+def test_process_summary_uses_tree_partial_context_when_no_document_is_readable() -> None:
+    result = process_summary(TreeOnlyContextClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["read_summary"]["documents_failed_total"] == result["data"]["read_summary"]["documents_selected_total"]
+    assert result["data"]["summary"]
+    assert result["data"]["summary_source"] == "tree_partial"
+    assert result["data"]["key_documents"]
+
+
+def test_process_read_retries_after_session_expiry_during_document_read() -> None:
+    client = SessionRetryReadClient()
+
+    result = process_read(client, "47607237")
+
+    assert result["ok"] is True
+    assert client.ensure_session_calls == 1
+    assert any(
+        item.get("extraction_method") in {"read_document_session_retry", "read_document"}
+        for item in result["data"]["documents_read"]
+        if item.get("ok")
+    )
+
+
+def test_process_read_survives_when_process_metadata_list_fails() -> None:
+    result = process_read(MetadataListFailureClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["processo"]["id_procedimento"] == "47607237"
+    assert result["data"]["documents_total"] == 8
+
+
+def test_process_read_survives_when_status_breaks_after_unit_switch() -> None:
+    result = process_read(SwitchedUnitStatusFailureClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["preflight"]["switched"] is True
+    assert result["context"]["unidade_sigla"] == "CMDO PABM APODI"
+    assert result["data"]["processo"]["id_procedimento"] == "47607237"
+
+
+def test_process_summary_survives_when_status_breaks_after_unit_switch() -> None:
+    result = process_summary(SwitchedUnitStatusFailureClient(), "47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["preflight"]["switched"] is True
+    assert result["data"]["processo"]["id_procedimento"] == "47607237"
 
 
 def test_marker_catalog_contract() -> None:
@@ -1541,6 +1682,20 @@ def test_environment_triage_apply_contract() -> None:
     assert result["ok"] is True
     assert result["operation"] == "environment-triage-apply"
     assert result["data"]["applied_total"] >= 1
+
+
+def test_process_create_preview_resolves_dynamic_process_type() -> None:
+    result = process_create_preview(FakeClient(), "Processo Expandido Pouco Usado", especificacao="")
+
+    assert result["ok"] is True
+    assert result["resolved_ids"]["tipo_processo_id"] == "100000999"
+
+
+def test_document_create_preview_resolves_dynamic_document_type() -> None:
+    result = document_create_preview(FakeClient(), "47607237", "Tipo Expandido Pouco Usado")
+
+    assert result["ok"] is True
+    assert result["resolved_ids"]["tipo_documento_id"] == "999"
 
 
 def test_process_finalize_preview_separates_auth_and_sign_and_blocks_other_signer() -> None:
@@ -2313,7 +2468,74 @@ def test_signature_block_review_contract() -> None:
     assert result["operation"] == "signature-block-review"
     assert result["data"]["ready_to_sign"] is True
     assert result["data"]["signable_document_ids"] == ["48568466"]
-    assert result["data"]["pending_documents"][0]["assinantes"] == ["Fulano"]
+    assert result["data"]["pending_documents"][0]["assinantes"] == ["Beltrano"]
+    assert result["data"]["signable_documents"][0]["can_sign"] is True
+
+
+class UnsignablePendingBlockClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_documents_map["774681"] = [
+            BlockDocument(
+                seq="1",
+                processo="08810058.000128/2026-69",
+                documento_id="48568466",
+                tipo_documento="Relatório do Fiscal",
+                assinante="Fulano",
+                numero_sei="39860248",
+                numero_documento="39860248",
+                assinado=False,
+                can_sign=False,
+            )
+        ]
+
+
+class AlreadySignedByCurrentUserBlockClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_documents_map["774681"] = [
+            BlockDocument(
+                seq="1",
+                processo="08810058.000128/2026-69",
+                documento_id="48568466",
+                tipo_documento="Relatório do Fiscal",
+                assinante="LEO ZENON TASSI / 2º Tenente QOEM BM",
+                assinantes=["LEO ZENON TASSI / 2º Tenente QOEM BM"],
+                numero_sei="39860248",
+                numero_documento="39860248",
+                assinado=False,
+                can_sign=True,
+            )
+        ]
+
+    def status(self) -> SystemStatus:
+        unit_sigla = self.switched_to or "OP 3"
+        return SystemStatus(
+            valid=True,
+            unidade_sigla=unit_sigla,
+            unidade_descricao=unit_sigla,
+            usuario="LEO ZENON TASSI",
+            ultimo_acesso="29/03/2026 10:00",
+        )
+
+
+def test_signature_block_review_distinguishes_pending_from_signable() -> None:
+    result = signature_block_review(UnsignablePendingBlockClient(), "774681")
+
+    assert result["ok"] is True
+    assert result["data"]["pending_documents"]
+    assert result["data"]["signable_documents"] == []
+
+
+def test_signature_block_review_excludes_documents_already_signed_by_current_user() -> None:
+    result = signature_block_review(AlreadySignedByCurrentUserBlockClient(), "774681")
+
+    assert result["ok"] is True
+    assert result["data"]["pending_documents"]
+    assert result["data"]["signable_documents"] == []
+    assert result["data"]["ready_to_sign"] is False
+    assert result["data"]["ready_to_sign"] is False
+    assert result["data"]["signable_document_ids"] == []
 
 
 def test_signature_block_add_document_preview_contract() -> None:
@@ -2352,12 +2574,13 @@ class DisponibilizedBlockClient(FakeClient):
                     seq="1",
                     processo="08810254.000117/2026-62",
                     documento_id="48783191",
-                    tipo_documento="Despacho",
-                    assinante="LEO ZENON TASSI / 2º Tenente QOEM BM",
-                    numero_sei="40381240",
-                    numero_documento="40381240",
-                    assinado=False,
-                )
+                tipo_documento="Despacho",
+                assinante="LEO ZENON TASSI / 2º Tenente QOEM BM",
+                numero_sei="40381240",
+                numero_documento="40381240",
+                assinado=False,
+                can_sign=True,
+            )
             ]
         }
 
@@ -2615,6 +2838,7 @@ def test_signature_block_sign_preview_contract() -> None:
     assert result["ok"] is True
     assert result["operation"] == "signature-block-sign-preview"
     assert result["data"]["pending_documents_total"] == 1
+    assert result["data"]["signable_documents_total"] == 1
     assert result["data"]["selected_documents_total"] == 1
     assert result["data"]["signable_document_ids"] == ["48568466"]
 
@@ -2627,6 +2851,7 @@ def test_signature_block_sign_confirm_contract() -> None:
     assert result["operation"] == "signature-block-sign-confirm"
     assert result["resolved_ids"]["document_ids"] == ["48568466"]
     assert client.signed_documents == [{"id_documento": "48568466", "id_procedimento": "47607237"}]
+    assert result["data"]["verification"]["remaining_signable_total"] == 0
     assert result["data"]["verification"]["remaining_pending_total"] == 0
 
 
@@ -2664,10 +2889,11 @@ class SeiNumberBlockSignClient(FakeClient):
                 processo="08810058.000128/2026-69",
                 documento_id="39860251",
                 tipo_documento="Relatório do Fiscal",
-                assinante="Fulano",
+                assinante="Beltrano",
                 numero_sei="39860251",
                 numero_documento="39860251",
                 assinado=False,
+                can_sign=True,
             )
         ]
 
@@ -2684,6 +2910,21 @@ class SeiNumberBlockSignClient(FakeClient):
             for doc in docs:
                 if doc.documento_id in {id_documento, "39860251"}:
                     doc.assinado = True
+                    doc.can_sign = False
+        return {"doc_ids": [id_documento], "signed": [id_documento], "already_signed": [], "errors": []}
+
+
+class PendingButNotSignableBlockSignClient(FakeClient):
+    def sign_document(self, id_documento: str, id_procedimento: str) -> dict[str, Any]:
+        self.signed_documents.append(
+            {"id_documento": id_documento, "id_procedimento": id_procedimento}
+        )
+        for docs in self.block_documents_map.values():
+            for doc in docs:
+                if doc.documento_id == id_documento:
+                    doc.assinante = "LEO ZENON TASSI / 2º Tenente QOEM BM"
+                    doc.can_sign = False
+                    doc.assinado = False
         return {"doc_ids": [id_documento], "signed": [id_documento], "already_signed": [], "errors": []}
 
 
@@ -2709,6 +2950,15 @@ def test_signature_block_sign_confirm_resolves_block_document_by_sei_number() ->
     assert result["ok"] is True
     assert result["resolved_ids"]["document_ids"] == ["48568469"]
     assert client.signed_documents == [{"id_documento": "48568469", "id_procedimento": "47607237"}]
+
+
+def test_signature_block_sign_confirm_uses_signable_documents_for_success() -> None:
+    client = PendingButNotSignableBlockSignClient()
+    result = signature_block_sign_confirm(client, "774681", confirm=True)
+
+    assert result["ok"] is True
+    assert result["data"]["verification"]["remaining_pending_total"] >= 1
+    assert result["data"]["verification"]["remaining_signable_total"] == 0
 
 
 def test_relatorio_read_contract() -> None:

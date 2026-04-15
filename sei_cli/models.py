@@ -84,6 +84,7 @@ class BlockDocument:
     numero_documento: str | None = None
     data_documento: str | None = None
     assinado: bool = False
+    can_sign: bool = False
     link_processo: str | None = None
     link_documento: str | None = None
 

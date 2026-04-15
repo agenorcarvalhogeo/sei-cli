@@ -370,13 +370,22 @@ class SEIClient:
         This reduces ~40 re-logins per session to near zero.
         """
         if self._control_html:
-            return self._control_html
+            if self._is_valid_control_html(self._control_html):
+                return self._control_html
+            self._control_html = None
         return self._ensure_session()
 
     def _fresh_control(self) -> str:
         """Force refresh of control page (smart: GET if session valid, login if not)."""
         self._control_html = None
         return self._ensure_session()
+
+    def _is_valid_control_html(self, html: str) -> bool:
+        if not html or "pwdSenha" in html or "login.php" in html:
+            return False
+        with contextlib.suppress(Exception):
+            return parse_system_status(html).valid
+        return False
 
     @contextlib.contextmanager
     def batch_mode(self) -> "Iterator[SEIClient]":
@@ -589,9 +598,14 @@ class SEIClient:
 
         tipo_url = self._sei_url(href_match.group(1))
         r_tipo = self._get(tipo_url)
-
-        soup_tipo = BeautifulSoup(r_tipo.text, "lxml")
-        form_tipo = soup_tipo.find("form", id="frmProcedimentoEscolherTipo")
+        expanded_html, soup_tipo, form_tipo = self._expand_chooser_form(
+            r_tipo.text,
+            form_id="frmProcedimentoEscolherTipo",
+            filter_field="hdnFiltroTipoProcedimento",
+        )
+        if form_tipo is None:
+            soup_tipo = BeautifulSoup(expanded_html, "lxml")
+            form_tipo = soup_tipo.find("form", id="frmProcedimentoEscolherTipo")
         if not form_tipo:
             raise RuntimeError("Formulário de escolha de tipo não encontrado")
 
@@ -632,6 +646,96 @@ class SEIClient:
                 data_cad[n] = ta.get_text()
 
         return soup_cad, data_cad, action_cad
+
+    def _parse_chooser_types(self, html: str) -> list[DocumentType]:
+        """Parse chooser pages that use `escolher(ID)` links.
+
+        This captures visible and collapsed entries present in the HTML.
+        """
+        soup = BeautifulSoup(html, "lxml")
+        types: list[DocumentType] = []
+        seen: set[str] = set()
+        for a in soup.find_all("a"):
+            onclick = a.get("onclick", "")
+            m = re.search(r"escolher\((-?\d+)\)", onclick)
+            if not m:
+                continue
+            type_id = m.group(1)
+            if type_id in seen:
+                continue
+            name = a.get_text(" ", strip=True)
+            if not name:
+                continue
+            seen.add(type_id)
+            types.append(DocumentType(id_serie=type_id, nome=name))
+
+        if types:
+            return types
+
+        for match in re.finditer(
+            r"""<a[^>]+onclick=["']escolher\((-?\d+)\)["'][^>]*>(.*?)</a>""",
+            html,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            type_id = match.group(1)
+            if type_id in seen:
+                continue
+            name = re.sub(r"<[^>]+>", " ", match.group(2))
+            name = " ".join(name.split()).strip()
+            if not name:
+                continue
+            seen.add(type_id)
+            types.append(DocumentType(id_serie=type_id, nome=name))
+        return types
+
+    def _expand_chooser_form(
+        self,
+        html: str,
+        *,
+        form_id: str,
+        filter_field: str,
+        expanded_value: str = "T",
+    ) -> tuple[str, BeautifulSoup, Any | None]:
+        """Expand chooser pages that use form submit behind the green '+'."""
+        soup = BeautifulSoup(html, "lxml")
+        form = soup.find("form", id=form_id)
+        if not form:
+            return html, soup, None
+        current_input = form.find(attrs={"name": filter_field})
+        current_value = ""
+        if current_input is not None:
+            current_value = str(current_input.get("value", ""))
+        if current_value == expanded_value:
+            return html, soup, form
+        action = form.get("action")
+        if not action:
+            return html, soup, form
+        action_url = urljoin(self._sei_url(""), action)
+        data = self._collect_form_defaults(form)
+        data[filter_field] = expanded_value
+        response = self._post(action_url, data)
+        expanded_html = response.text
+        expanded_soup = BeautifulSoup(expanded_html, "lxml")
+        expanded_form = expanded_soup.find("form", id=form_id)
+        return expanded_html, expanded_soup, expanded_form
+
+    def list_process_types(self) -> list[DocumentType]:
+        """List available process types from the chooser page."""
+        html = self._ensure_control()
+        href_match = re.search(
+            r'href="(controlador\.php\?acao=procedimento_escolher_tipo[^"]+)"',
+            html,
+        )
+        if not href_match:
+            return []
+        tipo_url = self._sei_url(href_match.group(1))
+        r_tipo = self._get(tipo_url)
+        expanded_html, _expanded_soup, _expanded_form = self._expand_chooser_form(
+            r_tipo.text,
+            form_id="frmProcedimentoEscolherTipo",
+            filter_field="hdnFiltroTipoProcedimento",
+        )
+        return self._parse_chooser_types(expanded_html)
 
     def _collect_form_defaults(self, form: Any) -> dict[str, str]:
         data: dict[str, str] = {}
@@ -910,7 +1014,8 @@ class SEIClient:
         id_procedimento: str,
         tipo: str,
     ) -> tuple[BeautifulSoup, dict[str, str], str, str]:
-        id_serie = self.DOC_TYPES.get(tipo.lower().replace(" ", "_"), tipo)
+        normalized = tipo.lower().replace(" ", "_")
+        id_serie = self.DOC_TYPES.get(normalized, tipo)
         arvore_html = self._navigate_to_arvore(id_procedimento)
         if not arvore_html:
             raise RuntimeError("Não foi possível acessar a árvore do processo")
@@ -924,10 +1029,31 @@ class SEIClient:
 
         incl_url = urljoin(self._sei_url(""), href_match.group(1))
         rtype = self._get(incl_url)
-        tsoup = BeautifulSoup(rtype.text, "lxml")
-        form = tsoup.find("form", id="frmDocumentoEscolherTipo")
+        expanded_html, tsoup, form = self._expand_chooser_form(
+            rtype.text,
+            form_id="frmDocumentoEscolherTipo",
+            filter_field="hdnFiltroSerie",
+        )
+        if form is None:
+            tsoup = BeautifulSoup(expanded_html, "lxml")
+            form = tsoup.find("form", id="frmDocumentoEscolherTipo")
         if not form:
             raise RuntimeError("Formulário de escolha de tipo não encontrado")
+
+        available_types = self._parse_chooser_types(expanded_html)
+        by_id = next((item for item in available_types if item.id_serie == id_serie), None)
+        if by_id is None and not str(id_serie).isdigit():
+            normalized_name = tipo.strip().lower()
+            by_name = next(
+                (
+                    item
+                    for item in available_types
+                    if item.nome.strip().lower() == normalized_name
+                ),
+                None,
+            )
+            if by_name:
+                id_serie = by_name.id_serie
 
         form_action = urljoin(self._sei_url(""), form["action"])
         fdata: dict[str, str] = {}
@@ -2175,6 +2301,7 @@ class SEIClient:
         soup = BeautifulSoup(detail_html, "lxml")
         rows = soup.find_all("tr", class_=re.compile(r"infraTr(Clara|Escura)"))
         entries: list[dict[str, Any]] = []
+        generic_sign_url: str | None = None
 
         # Extract per-document sign URLs from JS arrays (arrSequencial / arrLinkAssinatura).
         # SEI stores these in <script> blocks, indexed by 0-based position.
@@ -2191,6 +2318,15 @@ class SEIClient:
                 _seq_to_sign_url[seq_val] = urljoin(
                     self._sei_url(""), _js_sign[pos]
                 )
+        generic_sign_match = re.search(
+            r"""['"]([^'"]*controlador\.php\?[^'"]*acao=documento_assinar[^'"]*)['"]""",
+            detail_html,
+        )
+        if generic_sign_match:
+            generic_sign_url = urljoin(
+                self._sei_url(""),
+                generic_sign_match.group(1).replace("&amp;", "&"),
+            )
 
         def _extract_action_url(tag: Any) -> str | None:
             onclick = tag.get("onclick", "")
@@ -2244,8 +2380,12 @@ class SEIClient:
             # Fallback: use sign URL from JS arrays if not found in row HTML
             if not sign_url and seq and seq in _seq_to_sign_url:
                 sign_url = _seq_to_sign_url[seq]
+            if not sign_url and generic_sign_url and checkbox.get("value"):
+                sign_url = generic_sign_url
             imgs = row.find_all("img", title=True)
-            assinado = any("Assinatura" in (img.get("title") or "") for img in imgs)
+            has_signature_marker = any("Assinatura" in (img.get("title") or "") for img in imgs)
+            can_sign = bool(sign_url)
+            assinado = has_signature_marker and not can_sign
             entries.append(
                 {
                     "seq": seq,
@@ -2257,6 +2397,7 @@ class SEIClient:
                     "assinante": assinante,
                     "assinantes": assinantes,
                     "assinado": assinado,
+                    "can_sign": can_sign,
                     "checkbox_name": checkbox.get("name"),
                     "checkbox_value": checkbox.get("value"),
                     "preview_url": preview_url,
@@ -2264,6 +2405,37 @@ class SEIClient:
                 }
             )
         return entries
+
+    def _execute_block_sign(
+        self,
+        sign_url: str,
+        doc_id: str,
+        *,
+        detail_html: str,
+        checkbox_value: str | None,
+    ) -> dict:
+        if "id_documento=" in sign_url:
+            return self._execute_sign(sign_url, doc_id)
+
+        soup = BeautifulSoup(detail_html, "lxml")
+        form = soup.find("form", {"id": "frmRelBlocoProtocoloLista"})
+        if not form:
+            return {"error": "Formulário de documentos do bloco não encontrado"}
+
+        data: dict[str, str] = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name", "")
+            if name:
+                data[name] = inp.get("value", "")
+        item_value = checkbox_value or doc_id
+        data["hdnInfraItemId"] = item_value
+        data["hdnInfraItensSelecionados"] = item_value
+        response = self._post(sign_url, data)
+        ssoup = BeautifulSoup(response.text, "lxml")
+        sign_form = ssoup.find("form", {"id": "frmAssinaturas"})
+        if not sign_form:
+            return {"error": "Formulário de assinatura não encontrado"}
+        return self._execute_sign_form(sign_form, response.text)
 
     def preview_block_document(self, block_numero: str, doc_sei_number: str) -> str:
         """Preview a document from a block detail page without leaving block context."""
@@ -2736,10 +2908,17 @@ class SEIClient:
             f"&infra_sistema=100000100&infra_unidade_atual={target.link}"
         )
         rc = self._get(control_url)
-        self._control_html = rc.text
-        self._menu_links = parse_menu_links(rc.text, self._sei_url(""))
+        if self._is_valid_control_html(rc.text):
+            self._control_html = rc.text
+            self._menu_links = parse_menu_links(rc.text, self._sei_url(""))
+        else:
+            self._control_html = None
+            refreshed = self._ensure_session()
+            if self._is_valid_control_html(refreshed):
+                self._control_html = refreshed
+                self._menu_links = parse_menu_links(refreshed, self._sei_url(""))
         self._persist_session()
-        control_status = parse_system_status(rc.text)
+        control_status = parse_system_status(self._control_html or rc.text)
         if control_status.valid:
             return control_status
         if post_status.valid:
@@ -3158,7 +3337,7 @@ class SEIClient:
         # After unit switch the infra_hash changes, so we use
         # inicializar.php to get a valid redirect with fresh hashes.
         html = self._try_inicializar()
-        if html and "tblProcessosRecebidos" in html:
+        if html and self._is_valid_control_html(html):
             self._control_html = html
             self._menu_links = parse_menu_links(html, self._sei_url(""))
             self._persist_session()
@@ -4447,19 +4626,12 @@ class SEIClient:
 
         incl_url = urljoin(self._sei_url(""), href_match.group(1))
         rtype = self._get(incl_url)
-
-        # Parse onclick="escolher(ID)" + link text
-        types: list[DocumentType] = []
-        tsoup = BeautifulSoup(rtype.text, "lxml")
-        for a in tsoup.find_all("a"):
-            onclick = a.get("onclick", "")
-            m = re.match(r"escolher\((-?\d+)\)", onclick)
-            if m:
-                types.append(DocumentType(
-                    id_serie=m.group(1),
-                    nome=a.text.strip(),
-                ))
-        return types
+        expanded_html, _expanded_soup, _expanded_form = self._expand_chooser_form(
+            rtype.text,
+            form_id="frmDocumentoEscolherTipo",
+            filter_field="hdnFiltroSerie",
+        )
+        return self._parse_chooser_types(expanded_html)
 
     def create_document(
         self,
@@ -6567,7 +6739,7 @@ class SEIClient:
         pending_entries = [
             entry
             for entry in entries
-            if not entry.get("assinado") and entry.get("sign_url")
+            if entry.get("can_sign")
         ]
         if not pending_entries:
             return {"error": f"Bloco {block_numero} não possui documentos pendentes assináveis"}
@@ -6588,7 +6760,12 @@ class SEIClient:
                     f"Documento do bloco sem URL de assinatura: seq={entry.get('seq')}"
                 )
                 continue
-            item_result = self._execute_sign(str(sign_url), str(doc_ref))
+            item_result = self._execute_block_sign(
+                str(sign_url),
+                str(doc_ref),
+                detail_html=rd.text,
+                checkbox_value=entry.get("checkbox_value"),
+            )
             result["doc_ids"].append(str(doc_ref))
             result["signed"].extend([str(item) for item in item_result.get("signed", []) if item])
             result["already_signed"].extend(

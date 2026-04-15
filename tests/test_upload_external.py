@@ -125,6 +125,66 @@ function acaoAssinar(id) {
 </body></html>
 """
 
+BLOCK_SIGN_FORM_HTML = """
+<html><body>
+<form id="frmAssinaturas" action="controlador.php?acao=documento_assinar">
+  <input type="hidden" name="hdnIdDocumentos" value="48218774" />
+  <input type="text" name="txtUsuario" value="LEO ZENON TASSI" />
+  <input type="hidden" name="hdnIdUsuario" value="123" />
+  <select name="selCargoFuncao">
+    <option value="2º Tenente QOEM BM" selected>2º Tenente QOEM BM</option>
+  </select>
+</form>
+</body></html>
+"""
+
+CHOOSER_HTML_WITH_COLLAPSED = """
+<html><body>
+<a onclick="escolher(5)">Despacho</a>
+<div style="display:none">
+  <a onclick="escolher(999)">Tipo Expandido Pouco Usado</a>
+</div>
+</body></html>
+"""
+
+PROCESS_CHOOSER_INITIAL = """
+<html><body>
+<form id="frmProcedimentoEscolherTipo" action="controlador.php?acao=procedimento_escolher_tipo&infra_hash=abc">
+  <input type="hidden" name="hdnFiltroTipoProcedimento" value="U" />
+</form>
+<a onclick="escolher(100000182)">Férias</a>
+</body></html>
+"""
+
+PROCESS_CHOOSER_EXPANDED = """
+<html><body>
+<form id="frmProcedimentoEscolherTipo" action="controlador.php?acao=procedimento_escolher_tipo&infra_hash=abc">
+  <input type="hidden" name="hdnFiltroTipoProcedimento" value="T" />
+</form>
+<a onclick="escolher(100000182)">Férias</a>
+<a onclick="escolher(100000999)">Processo Expandido Pouco Usado</a>
+</body></html>
+"""
+
+DOCUMENT_CHOOSER_INITIAL = """
+<html><body>
+<form id="frmDocumentoEscolherTipo" action="controlador.php?acao=documento_escolher_tipo&infra_hash=abc">
+  <input type="hidden" name="hdnFiltroSerie" value="U" />
+</form>
+<a onclick="escolher(5)">Despacho</a>
+</body></html>
+"""
+
+DOCUMENT_CHOOSER_EXPANDED = """
+<html><body>
+<form id="frmDocumentoEscolherTipo" action="controlador.php?acao=documento_escolher_tipo&infra_hash=abc">
+  <input type="hidden" name="hdnFiltroSerie" value="T" />
+</form>
+<a onclick="escolher(5)">Despacho</a>
+<a onclick="escolher(999)">Tipo Expandido Pouco Usado</a>
+</body></html>
+"""
+
 PRINCIPAL_WRAPPER_HTML = """
 <html><body>
 <iframe id="ifrArvore" src="controlador.php?acao=procedimento_controlar&infra_sistema=100000100&infra_hash=xyz"></iframe>
@@ -761,6 +821,68 @@ class TestBlockDetailHelpers:
         assert entry["numero_documento"] == "40381565"
         assert entry["preview_url"].endswith("id_documento=48783546")
         assert entry["sign_url"].endswith("id_documento=48783546&infra_hash=abc")
+        assert entry["can_sign"] is True
+        assert entry["assinado"] is False
+
+    def test_parse_chooser_types_includes_collapsed_entries(self):
+        types = self.client._parse_chooser_types(CHOOSER_HTML_WITH_COLLAPSED)
+
+        assert [item.id_serie for item in types] == ["5", "999"]
+        assert [item.nome for item in types] == ["Despacho", "Tipo Expandido Pouco Usado"]
+
+    def test_list_process_types_expands_chooser_via_form_submit(self):
+        self.client._ensure_control = MagicMock(
+            return_value='<a href="controlador.php?acao=procedimento_escolher_tipo&infra_hash=root">Iniciar Processo</a>'
+        )
+        self.client._get = MagicMock(return_value=_mock_response(PROCESS_CHOOSER_INITIAL))
+        self.client._post = MagicMock(return_value=_mock_response(PROCESS_CHOOSER_EXPANDED))
+
+        types = self.client.list_process_types()
+
+        assert [item.nome for item in types] == ["Férias", "Processo Expandido Pouco Usado"]
+        assert self.client._post.call_args.args[1]["hdnFiltroTipoProcedimento"] == "T"
+
+    def test_list_document_types_expands_chooser_via_form_submit(self):
+        self.client._navigate_to_arvore = MagicMock(
+            return_value='<a href="controlador.php?acao=documento_escolher_tipo&infra_hash=root"><img src="svg/documento_incluir.svg?18" /></a>'
+        )
+        self.client._get = MagicMock(return_value=_mock_response(DOCUMENT_CHOOSER_INITIAL))
+        self.client._post = MagicMock(return_value=_mock_response(DOCUMENT_CHOOSER_EXPANDED))
+
+        types = self.client.list_document_types("55555")
+
+        assert [item.nome for item in types] == ["Despacho", "Tipo Expandido Pouco Usado"]
+        assert self.client._post.call_args.args[1]["hdnFiltroSerie"] == "T"
+
+    def test_load_document_creation_form_resolves_expanded_type_name_to_id(self):
+        self.client._navigate_to_arvore = MagicMock(
+            return_value='<a href="controlador.php?acao=documento_escolher_tipo&infra_hash=root"><img src="svg/documento_incluir.svg?18" /></a>'
+        )
+        get_responses = [
+            _mock_response(DOCUMENT_CHOOSER_INITIAL),
+        ]
+        self.client._get = MagicMock(side_effect=get_responses)
+        self.client._post = MagicMock(
+            side_effect=[
+                _mock_response(DOCUMENT_CHOOSER_EXPANDED),
+                _mock_response(DOC_CADASTRO_FORM),
+            ]
+        )
+
+        _soup, _data, _action, id_serie = self.client._load_document_creation_form("55555", "Tipo Expandido Pouco Usado")
+
+        assert id_serie == "999"
+        submit_payload = self.client._post.call_args_list[1].args[1]
+        assert submit_payload["hdnIdSerie"] == "999"
+
+    def test_ensure_control_invalidates_login_like_cached_html(self):
+        self.client._control_html = "<html><body><input name='pwdSenha' /></body></html>"
+        self.client._ensure_session = MagicMock(return_value="<html><title>Controle de Processos</title></html>")
+
+        html = self.client._ensure_control()
+
+        assert "Controle de Processos" in html
+        assert self.client._ensure_session.call_count == 1
 
     def test_preview_block_document_matches_by_numero_sei(self):
         self.client._get_block_detail_page = MagicMock(
@@ -802,6 +924,36 @@ class TestBlockDetailHelpers:
         called_doc = self.client._execute_sign.call_args.args[1]
         assert called_url.endswith("acao=documento_assinar&id_documento=48783191&infra_hash=abc")
         assert called_doc == "48783191"
+
+    def test_sign_block_accepts_row_with_existing_signature_marker_when_sign_url_exists(self):
+        self.client._get_block_detail_page = MagicMock(
+            return_value=(
+                _mock_response(
+                    BLOCK_DETAIL_HTML_MULTI,
+                    url="https://sei.rn.gov.br/sei/controlador.php?acao=rel_bloco_protocolo_listar&id_bloco=871299&infra_hash=lista",
+                ),
+                BeautifulSoup(BLOCK_DETAIL_HTML_MULTI, "lxml"),
+            )
+        )
+        self.client._post = MagicMock(return_value=_mock_response(BLOCK_SIGN_FORM_HTML))
+        self.client._execute_sign_form = MagicMock(
+            return_value={
+                "doc_ids": "48218774",
+                "signed": ["48218774"],
+                "already_signed": [],
+                "errors": [],
+            }
+        )
+        self.client.get_block_documents = MagicMock(return_value=[])
+
+        result = self.client.sign_block("871299", doc_indices=[1])
+
+        assert result["signed"] == ["48218774"]
+        called_url = self.client._post.call_args.args[0]
+        called_data = self.client._post.call_args.args[1]
+        assert "acao=documento_assinar" in called_url
+        assert called_data["hdnInfraItemId"] == "48218774-871299"
+        assert called_data["hdnInfraItensSelecionados"] == "48218774-871299"
 
     def test_sign_or_authenticate_recovers_when_form_returns_but_document_is_signed(self):
         from sei_cli.models import TreeDocument

@@ -657,10 +657,20 @@ def parse_block_documents(content: str, base_url: str) -> list[BlockDocument]:
         tipo_doc = _norm(tds[4].text_content()) if len(tds) > 4 else ""
         assinantes = _cell_lines(tds[5]) if len(tds) > 5 else []
         assinante = "; ".join(assinantes)
-        
-        # Check if signed (look for 'Assinatura' img with specific title)
+
+        sign_action_present = False
+        for anchor in row.xpath(".//a[@onclick] | .//a[@href]"):
+            onclick = anchor.attrib.get("onclick", "")
+            href = anchor.attrib.get("href", "")
+            if "acaoAssinar" in onclick or "documento_assinar" in onclick or "documento_assinar" in href:
+                sign_action_present = True
+                break
+
+        # Full signed state for the current unit should only be true when
+        # there is a signature marker and no remaining sign action on the row.
         imgs = row.xpath(".//img[@title]")
-        assinado = any("Assinatura" in (i.attrib.get("title", "")) for i in imgs)
+        has_signature_marker = any("Assinatura" in (i.attrib.get("title", "")) for i in imgs)
+        assinado = has_signature_marker and not sign_action_present
         
         bd_kwargs: dict[str, Any] = dict(
             seq=seq,
@@ -672,6 +682,7 @@ def parse_block_documents(content: str, base_url: str) -> list[BlockDocument]:
             numero_documento=numero_documento,
             data_documento=data_documento,
             assinado=assinado,
+            can_sign=sign_action_present,
         )
         if numero_sei_value:
             bd_kwargs["numero_sei"] = numero_sei_value
