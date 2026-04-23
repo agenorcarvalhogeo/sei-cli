@@ -10,6 +10,40 @@ description: "Operar o SEI via canônicas do sei-cli: leitura de processos/docum
 
 Use **sempre as canônicas do CLI** quando houver uma para a tarefa. Não prefira métodos brutos do `SEIClient` nem comandos legados se a superfície canônica já existir.
 
+## Regra de instalação e versão
+
+Não tentar instalar, atualizar ou trocar a instalação do `sei-cli` automaticamente.
+
+Antes de qualquer ação de setup ou upgrade, identificar a origem do binário em uso:
+
+- `which sei`
+- `sei --version`
+
+Só propor upgrade, reinstalação com `pipx`/`uv` ou troca de PATH quando:
+
+- o usuário pedir explicitamente
+- a tarefa for explicitamente de setup/manutenção
+- ou houver conflito real entre instalações e isso estiver bloqueando o uso
+
+Operar o SEI não exige auto-upgrade da ferramenta.
+
+## Inicialização recomendada após conectar
+
+Na primeira utilização em uma máquina/sessão funcional, é recomendado fazer uma leitura leve dos ambientes acessíveis para melhorar navegação e preflight entre unidades.
+
+Preferir algo não destrutivo, por exemplo:
+
+1. `sei inbox-snapshot --json`
+2. se necessário, uma triagem leve por ambiente com `environment-triage-preview --mode fast --limit ... --json`
+
+Objetivo:
+
+- descobrir unidades/ambientes mais usados
+- facilitar trocas de unidade posteriores
+- reduzir navegação cega entre ambientes
+
+Isso é aquecimento de contexto, não pré-requisito obrigatório para toda tarefa.
+
 ## Superfície canônica atual
 
 ### Leitura
@@ -28,6 +62,7 @@ Use **sempre as canônicas do CLI** quando houver uma para a tarefa. Não prefir
 - `sei process-create-confirm ... --confirm --json`
 - `sei document-create-preview ... --json`
 - `sei document-create-confirm ... --confirm --json`
+- Para reutilizar conteudo existente, use `--documento-modelo <numero_sei>` em `document-create-*`; isso seleciona `Documento Modelo` (`rdoTextoInicial=D`) e preenche `txtProtocoloDocumentoTextoBase`.
 - `sei document-edit-preview ... --json`
 - `sei document-edit-confirm ... --confirm --json`
 - `sei document-quality-check ... --json`
@@ -35,9 +70,9 @@ Use **sempre as canônicas do CLI** quando houver uma para a tarefa. Não prefir
 ### PDF nativo
 
 - `sei process-pdf-preview <processo> --json`
-- `sei process-pdf-confirm <processo> --json`
+- `sei process-pdf-confirm <processo> --confirm --json`
 - `sei document-pdf-preview <documento> --process-id <processo> --json`
-- `sei document-pdf-confirm <documento> --process-id <processo> --json`
+- `sei document-pdf-confirm <documento> --process-id <processo> --confirm --json`
 
 ### Marcadores e triagem
 
@@ -47,11 +82,12 @@ Use **sempre as canônicas do CLI** quando houver uma para a tarefa. Não prefir
 - `sei process-marker-history <processo> --json`
 - `sei process-marker-set-preview <processo> --marker <nome-ou-id> --json`
 - `sei process-marker-set-confirm <processo> --marker <nome-ou-id> --confirm --json`
-- `sei process-marker-update-preview <processo> --text "<texto>" --json`
-- `sei process-marker-update-confirm <processo> --text "<texto>" --confirm --json`
+- `sei process-marker-update-preview <processo> --texto/--text "<texto>" --json`
+- `sei process-marker-update-confirm <processo> --texto/--text "<texto>" --confirm --json`
 - `sei process-marker-remove-preview <processo> --json`
 - `sei process-marker-remove-confirm <processo> --confirm --json`
 - `sei environment-triage-preview [--mode fast|contextual|deep] --json`
+- `sei environment-triage-parallel [--mode fast|contextual|deep] --json`
 - `sei environment-triage-apply ... --confirm --json`
 
 ### Encaminhamento, conclusão e reabertura
@@ -266,6 +302,8 @@ Documento em rascunho pode exigir unidade dona do processo. Documento assinado �
 
 - não aplicar `html.escape()` no corpo
 - preservar HTML cru
+- a canônica `document-edit-*` deve salvar tags reais (`<p>`, `<strong>`, `<table>`) e nunca `&lt;p&gt;` visível
+- preservar seções não alvo, mas normalizar qualquer seção `txaEditor_*` escapada antes do POST
 - se a seção template-lock não aceitar conteúdo, usar a seção editável seguinte
 
 ### Sessão/login

@@ -108,6 +108,77 @@ Le um bloco e devolve:
 - unidade origem/destino
 - proximas acoes de leitura
 
+## Catalogo Canonico Atual
+
+Use esta lista como referencia curta da superficie promovida. Quando houver
+comando nesta lista, skills e workflows devem preferi-lo aos comandos legados.
+
+### Leitura e navegacao
+
+- `inbox-snapshot`
+- `process-open`
+- `process-read`
+- `process-summary`
+- `process-report`
+- `document-read`
+- `relatorio-read`
+
+### Criacao e edicao documental
+
+- `process-create-preview`
+- `process-create-confirm`
+- `document-create-preview`
+- `document-create-confirm`
+- `document-edit-preview`
+- `document-edit-confirm`
+- `document-quality-check`
+
+### Marcadores e triagem
+
+- `marker-catalog`
+- `process-marker-preview`
+- `process-marker-read`
+- `process-marker-history`
+- `process-marker-set-preview`
+- `process-marker-set-confirm`
+- `process-marker-update-preview`
+- `process-marker-update-confirm`
+- `process-marker-remove-preview`
+- `process-marker-remove-confirm`
+- `environment-triage-preview`
+- `environment-triage-parallel`
+- `environment-triage-apply`
+
+### Processo, PDF e finalizacao
+
+- `process-forward-preview`
+- `process-forward-confirm`
+- `process-conclude-preview`
+- `process-conclude-confirm`
+- `process-reopen-preview`
+- `process-reopen-confirm`
+- `process-finalize-preview`
+- `process-finalize-confirm`
+- `process-pdf-preview`
+- `process-pdf-confirm`
+- `document-pdf-preview`
+- `document-pdf-confirm`
+
+### Blocos de assinatura
+
+- `block-review`
+- `signature-block-list`
+- `signature-block-read`
+- `signature-block-review`
+- `signature-block-add-document-preview`
+- `signature-block-add-document-confirm`
+- `signature-block-recall-preview`
+- `signature-block-recall-confirm`
+- `signature-block-refresh-preview`
+- `signature-block-refresh-confirm`
+- `signature-block-sign-preview`
+- `signature-block-sign-confirm`
+
 ## Estado Atual da Camada Documental
 
 Esta frente foi considerada estavel para uso real:
@@ -122,6 +193,7 @@ Capacidades estabilizadas:
 
 - heranca real de acesso do processo na criacao documental
 - resolucao de tipo documental pelo formulario real
+- criacao a partir de Documento Modelo com `--documento-modelo <numero_sei>`
 - identificacao de secoes `editable` vs `readOnly`
 - gravacao na secao editavel correta
 - reler documento apos gravacao
@@ -170,20 +242,20 @@ Essas canônicas devem devolver:
 
 #### Fase 2. Mutacoes seguras de bloco
 
-- `signature-block-create-preview`
-- `signature-block-create-confirm`
 - `signature-block-add-document-preview`
 - `signature-block-add-document-confirm`
-- `signature-block-remove-document-confirm`
-- `signature-block-disponibilizar-confirm`
-- `signature-block-cancel-confirm`
-- backlog: `signature-block-update-destinations-preview`
-- backlog: `signature-block-update-destinations-confirm`
+- `signature-block-recall-preview`
+- `signature-block-recall-confirm`
+- `signature-block-refresh-preview`
+- `signature-block-refresh-confirm`
 
 Todas com `preview` + `confirm` quando houver risco operacional.
 
 Backlog adicional de bloco:
 
+- criar bloco novo por superficie canonica
+- remover documento avulso por superficie canonica fora do `refresh`
+- disponibilizar/cancelar por comandos canonicos avulsos quando isso for mais claro que `refresh`/`recall`
 - permitir adicionar/remover unidades destino de um bloco de assinatura de forma canônica
 - usar isso para cenários de assinatura por unidade destinatária sem recriar bloco
 - manter leitura/revisão de destinos antes de mutar o bloco
@@ -193,10 +265,8 @@ Backlog adicional de bloco:
   - ajustar o conjunto de documentos no bloco
   - disponibilizar novamente para a unidade destinataria
   - usar isso para preparar um bloco reutilizavel com novos documentos pendentes
-- backlog: `signature-block-recall-preview`
-- backlog: `signature-block-recall-confirm`
-- backlog: `signature-block-refresh-preview`
-- backlog: `signature-block-refresh-confirm`
+- `signature-block-update-destinations-preview`
+- `signature-block-update-destinations-confirm`
 
 #### Fase 3. Assinatura canonica
 

@@ -15,11 +15,16 @@ def test_workflow_show_reaprazamento() -> None:
     assert result["operation"] == "workflow-show"
     assert result["data"]["workflow"]["slug"] == "reaprazamento"
     assert result["data"]["workflow"]["steps_total"] == 9
+    assert result["data"]["workflow"]["supported_steps_total"] == 8
     assert result["data"]["steps"][0]["step_id"] == "01-escolher-cenario"
-    assert result["data"]["steps"][2]["future_operation"] == "document-create-preview"
+    assert result["data"]["steps"][1]["canonical_operation"] == "process-create-preview"
+    assert result["data"]["steps"][2]["canonical_operation"] == "document-create-preview"
     assert result["data"]["steps"][3]["canonical_operation"] == "document-read"
+    assert result["data"]["steps"][4]["canonical_operation"] == "process-forward-preview"
     assert result["data"]["steps"][5]["canonical_operation"] == "process-read"
     assert result["data"]["steps"][6]["canonical_operation"] == "document-read"
+    assert result["data"]["steps"][7]["canonical_operation"] == "document-create-preview"
+    assert result["data"]["steps"][8]["canonical_operation"] == "process-forward-preview"
 
 
 def test_workflow_next_returns_first_step() -> None:
@@ -46,6 +51,7 @@ def test_workflow_next_self_request_branch() -> None:
     assert result["ok"] is True
     assert result["data"]["decision_required"] is False
     assert result["data"]["next_step"]["step_id"] == "02-auto-criar-processo"
+    assert result["next_actions"][0]["action"] == "process-create-preview"
     assert "mapeado diretamente para a etapa seguinte" in result["data"]["transition_reason"]
 
 
@@ -62,6 +68,7 @@ def test_workflow_next_follows_step_id_destination() -> None:
 
     assert result["ok"] is True
     assert result["data"]["next_step"]["step_id"] == "03-auto-criar-solicitacao"
+    assert result["next_actions"][0]["action"] == "document-create-preview"
     assert "mapeado diretamente para a etapa seguinte" in result["data"]["transition_reason"]
 
 
@@ -71,6 +78,14 @@ def test_workflow_next_terminal_step() -> None:
     assert result["ok"] is True
     assert result["data"]["next_step"] is None
     assert result["data"]["transition_reason"] == "Etapa terminal do workflow."
+
+
+def test_workflow_next_forward_step_is_canonical() -> None:
+    result = workflow_next("reaprazamento", current_step="04-auto-ler-solicitacao")
+
+    assert result["ok"] is True
+    assert result["data"]["next_step"]["step_id"] == "05-auto-encaminhar-comandante"
+    assert result["next_actions"][0]["action"] == "process-forward-preview"
 
 
 def test_workflow_next_self_request_reads_document_before_forwarding() -> None:

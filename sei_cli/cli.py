@@ -1697,7 +1697,7 @@ def marker_catalog_cmd(as_json: bool) -> None:
 @cli.command("process-marker-preview")
 @click.argument("numero_ou_id")
 @click.option("--marker", default=None, help="ID ou nome do marcador")
-@click.option("--texto", default=None, help="Texto sugerido explícito para o marcador")
+@click.option("--texto", "--text", "texto", default=None, help="Texto sugerido explícito para o marcador")
 @click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
 @click.option("--date-from", default=None)
 @click.option("--date-to", default=None)
@@ -1749,7 +1749,7 @@ def process_marker_history_cmd(numero_ou_id: str, marker: str | None, as_json: b
 @cli.command("process-marker-set-preview")
 @click.argument("numero_ou_id")
 @click.option("--marker", required=True, help="ID ou nome do marcador")
-@click.option("--texto", default=None, help="Texto do marcador")
+@click.option("--texto", "--text", "texto", default=None, help="Texto do marcador")
 @click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
 @click.option("--date-from", default=None)
 @click.option("--date-to", default=None)
@@ -1782,7 +1782,7 @@ def process_marker_set_preview_cmd(
 @cli.command("process-marker-set-confirm")
 @click.argument("numero_ou_id")
 @click.option("--marker", required=True, help="ID ou nome do marcador")
-@click.option("--texto", default=None, help="Texto do marcador")
+@click.option("--texto", "--text", "texto", default=None, help="Texto do marcador")
 @click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
 @click.option("--date-from", default=None)
 @click.option("--date-to", default=None)
@@ -1839,7 +1839,7 @@ def process_marker_remove_confirm_cmd(numero_ou_id: str, marker: str | None, con
 @cli.command("process-marker-update-preview")
 @click.argument("numero_ou_id")
 @click.option("--marker", default=None, help="ID ou nome do marcador a alterar")
-@click.option("--texto", default=None, help="Novo texto do marcador")
+@click.option("--texto", "--text", "texto", default=None, help="Novo texto do marcador")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
 def process_marker_update_preview_cmd(
     numero_ou_id: str,
@@ -1855,7 +1855,7 @@ def process_marker_update_preview_cmd(
 @cli.command("process-marker-update-confirm")
 @click.argument("numero_ou_id")
 @click.option("--marker", default=None, help="ID ou nome do marcador a alterar")
-@click.option("--texto", required=True, help="Novo texto do marcador")
+@click.option("--texto", "--text", "texto", required=True, help="Novo texto do marcador")
 @click.option("--confirm", is_flag=True, help="Confirma a alteração do marcador")
 @click.option("--json", "as_json", is_flag=True, help="Saída JSON")
 def process_marker_update_confirm_cmd(
@@ -1990,6 +1990,7 @@ def process_create_confirm_cmd(
 @click.option("--descricao", default="")
 @click.option("--interessados", default="")
 @click.option("--texto-inicial", default="N")
+@click.option("--documento-modelo", default="", help="Número SEI de documento existente para usar como modelo")
 @click.option("--nivel", "nivel_acesso", default="inherit")
 @click.option("--motivo-acesso", default="")
 @click.option("--hipotese-acesso", default="")
@@ -2001,6 +2002,7 @@ def document_create_preview_cmd(
     descricao: str,
     interessados: str,
     texto_inicial: str,
+    documento_modelo: str,
     nivel_acesso: str,
     motivo_acesso: str,
     hipotese_acesso: str,
@@ -2015,6 +2017,7 @@ def document_create_preview_cmd(
             descricao=descricao,
             interessados=interessados,
             texto_inicial=texto_inicial,
+            documento_modelo=documento_modelo,
             nivel_acesso=nivel_acesso,
             motivo_acesso=motivo_acesso,
             hipotese_acesso=hipotese_acesso,
@@ -2029,6 +2032,7 @@ def document_create_preview_cmd(
 @click.option("--descricao", default="")
 @click.option("--interessados", default="")
 @click.option("--texto-inicial", default="N")
+@click.option("--documento-modelo", default="", help="Número SEI de documento existente para usar como modelo")
 @click.option("--nivel", "nivel_acesso", default="inherit")
 @click.option("--motivo-acesso", default="")
 @click.option("--hipotese-acesso", default="")
@@ -2041,6 +2045,7 @@ def document_create_confirm_cmd(
     descricao: str,
     interessados: str,
     texto_inicial: str,
+    documento_modelo: str,
     nivel_acesso: str,
     motivo_acesso: str,
     hipotese_acesso: str,
@@ -2056,6 +2061,7 @@ def document_create_confirm_cmd(
             descricao=descricao,
             interessados=interessados,
             texto_inicial=texto_inicial,
+            documento_modelo=documento_modelo,
             nivel_acesso=nivel_acesso,
             motivo_acesso=motivo_acesso,
             hipotese_acesso=hipotese_acesso,

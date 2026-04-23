@@ -13,6 +13,7 @@ import pytest
 from bs4 import BeautifulSoup
 
 from sei_cli.client import SEIClient, _sanitize_for_iso_8859_1
+from sei_cli.models import EditorSection
 
 
 # --- HTML Fixtures ---
@@ -243,6 +244,96 @@ def _mock_response(
     return r
 
 
+def test_save_document_posts_raw_html_and_normalizes_escaped_sections() -> None:
+    client = _make_client()
+    captured: dict[str, str] = {}
+
+    def fake_post(_url: str, data: dict, **_kwargs):
+        captured.update(data)
+        return _mock_response("OK")
+
+    client._post = fake_post
+    client._editor_hiddens = {"hdnInfraTipoPagina": "editor"}
+
+    sections = [
+        EditorSection(
+            name="txaEditor_217",
+            section_id="217",
+            content="&amp;amp;lt;p class=&amp;amp;quot;Texto_Justificado&amp;amp;quot;&amp;amp;gt;Cabe&amp;amp;ccedil;alho&amp;amp;lt;/p&amp;amp;gt;",
+            editable=True,
+        ),
+        EditorSection(
+            name="txaEditor_220",
+            section_id="220",
+            content='<p class="Texto_Justificado_Recuo_Primeira_Linha">Corpo <strong>real</strong> — teste&nbsp;final</p>',
+            editable=True,
+        ),
+    ]
+
+    assert client.save_document("https://sei.rn.gov.br/sei/editor/editor_processar.php?acao=editor_salvar", sections) is True
+    assert captured["hdnInfraTipoPagina"] == "editor"
+    assert captured["txaEditor_217"] == '<p class="Texto_Justificado">Cabeçalho</p>'
+    assert captured["txaEditor_220"] == (
+        '<p class="Texto_Justificado_Recuo_Primeira_Linha">'
+        "Corpo <strong>real</strong> &#8212; teste&nbsp;final</p>"
+    )
+    assert "&lt;p" not in captured["txaEditor_217"]
+    assert "&amp;lt;p" not in captured["txaEditor_217"]
+    assert "&lt;p" not in captured["txaEditor_220"]
+
+
+def test_edit_document_section_edits_only_target_body_and_preserves_other_sections_raw() -> None:
+    client = _make_client()
+    posted: dict[str, str] = {}
+
+    def fake_get_editor_sections(_id_documento: str, _id_procedimento: str):
+        return (
+            "https://sei.rn.gov.br/sei/editor/editor_processar.php?acao=editor_salvar",
+            [
+                EditorSection(
+                    name="txaEditor_217",
+                    section_id="217",
+                    content="&lt;p&gt;Template protegido&lt;/p&gt;",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_220",
+                    section_id="220",
+                    content="<p>Corpo antigo</p>",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_999",
+                    section_id="999",
+                    content="&lt;p&gt;Rodap&eacute;&lt;/p&gt;",
+                    editable=False,
+                ),
+            ],
+        )
+
+    def fake_post(_url: str, data: dict, **_kwargs):
+        posted.update(data)
+        return _mock_response("OK")
+
+    client.get_editor_sections = fake_get_editor_sections
+    client._post = fake_post
+
+    ok = client.edit_document_section(
+        "49287256",
+        "49286513",
+        "220",
+        '<p class="Texto_Justificado_Recuo_Primeira_Linha">Novo corpo <strong>sem escape</strong></p>',
+    )
+
+    assert ok is True
+    assert posted["txaEditor_217"] == "<p>Template protegido</p>"
+    assert posted["txaEditor_220"] == (
+        '<p class="Texto_Justificado_Recuo_Primeira_Linha">Novo corpo <strong>sem escape</strong></p>'
+    )
+    assert posted["txaEditor_999"] == "<p>Rodapé</p>"
+    assert all("&lt;" not in value and "&amp;lt;" not in value for key, value in posted.items() if key.startswith("txaEditor_"))
+
+
 class TestUploadExternalDocument:
     def setup_method(self):
         self.client = _make_client()
@@ -277,6 +368,42 @@ class TestUploadExternalDocument:
 
         assert created.id_documento == "77777"
         assert created.editor_url == "https://sei.rn.gov.br/sei/controlador.php?acao=editor_montar&id_documento=77777&infra_hash=ed"
+
+    def test_create_document_uses_documento_modelo_protocol_number(self):
+        cadastro_soup = BeautifulSoup(DOC_CADASTRO_FORM, "lxml")
+        self.client._load_document_creation_form = MagicMock(
+            return_value=(
+                cadastro_soup,
+                {
+                    "hdnFlagDocumentoCadastro": "1",
+                    "rdoNivelAcesso": "0",
+                    "rdoTextoInicial": "N",
+                    "txtProtocoloDocumentoTextoBase": "",
+                    "hdnIdDocumentoTextoBase": "",
+                },
+                "https://sei.rn.gov.br/sei/controlador.php?acao=documento_gerar_salvar&infra_hash=ghi",
+                "5",
+            )
+        )
+        response = _mock_response(
+            "<html><body><script>var linkEditarConteudo = 'controlador.php?acao=editor_montar&id_documento=77777&infra_hash=ed';</script></body></html>",
+            url="https://sei.rn.gov.br/sei/controlador.php?acao=arvore_visualizar&id_procedimento=55555",
+        )
+        self.client._post = MagicMock(return_value=response)
+        self.client._get_editor_url = MagicMock(return_value=None)
+
+        self.client.create_document(
+            "55555",
+            "despacho",
+            texto_inicial="N",
+            documento_modelo="40842131",
+            descricao="Teste",
+        )
+
+        posted = self.client._post.call_args.args[1]
+        assert posted["rdoTextoInicial"] == "D"
+        assert posted["txtProtocoloDocumentoTextoBase"] == "40842131"
+        assert posted["hdnIdDocumentoTextoBase"] == ""
 
     def test_create_document_raises_when_form_is_reloaded_without_id(self):
         cadastro_soup = BeautifulSoup(DOC_CADASTRO_FORM, "lxml")

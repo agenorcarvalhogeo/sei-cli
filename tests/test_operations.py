@@ -955,6 +955,7 @@ class FakeClient:
         *,
         nivel_acesso: str = "0",
         texto_inicial: str = "N",
+        documento_modelo: str = "",
         descricao: str = "",
         interessados: str = "",
         extra_fields: dict[str, str] | None = None,
@@ -964,6 +965,7 @@ class FakeClient:
             "tipo": tipo,
             "nivel_acesso": nivel_acesso,
             "texto_inicial": texto_inicial,
+            "documento_modelo": documento_modelo,
             "descricao": descricao,
             "interessados": interessados,
             "extra_fields": extra_fields or {},
@@ -1026,6 +1028,7 @@ class EmptyCreateDocumentClient(FakeClient):
         *,
         nivel_acesso: str = "0",
         texto_inicial: str = "N",
+        documento_modelo: str = "",
         descricao: str = "",
         interessados: str = "",
         extra_fields: dict[str, str] | None = None,
@@ -1035,6 +1038,7 @@ class EmptyCreateDocumentClient(FakeClient):
             "tipo": tipo,
             "nivel_acesso": nivel_acesso,
             "texto_inicial": texto_inicial,
+            "documento_modelo": documento_modelo,
             "descricao": descricao,
             "interessados": interessados,
             "extra_fields": extra_fields or {},
@@ -2177,6 +2181,22 @@ def test_document_create_preview_contract() -> None:
     assert result["data"]["access_policy"]["selected_hypothesis"]["value"] == "4"
 
 
+def test_document_create_preview_with_documento_modelo_forces_text_initial_d() -> None:
+    result = document_create_preview(
+        FakeClient(),
+        "47607237",
+        "despacho",
+        documento_modelo="40842131",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["payload_preview"]["texto_inicial"] == "D"
+    assert result["data"]["payload_preview"]["documento_modelo"] == "40842131"
+    params = result["next_actions"][0]["params"]
+    assert params["texto_inicial"] == "D"
+    assert params["documento_modelo"] == "40842131"
+
+
 def test_document_create_preview_sigiloso_exposes_both_required_fields() -> None:
     result = document_create_preview(
         FakeClient(),
@@ -2217,6 +2237,37 @@ def test_document_create_confirm_contract() -> None:
     assert result["data"]["created_document"]["editor_url"]
     assert client.last_created_document["nivel_acesso"] == "1"
     assert logged[0]["id_documento"] == "59999999"
+
+
+def test_document_create_confirm_passes_documento_modelo() -> None:
+    client = FakeClient()
+
+    result = document_create_confirm(
+        client,
+        "47607237",
+        "despacho",
+        documento_modelo="40842131",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert client.last_created_document["texto_inicial"] == "D"
+    assert client.last_created_document["documento_modelo"] == "40842131"
+    assert result["data"]["created_document"]["texto_inicial"] == "D"
+    assert result["data"]["created_document"]["documento_modelo"] == "40842131"
+
+
+def test_document_create_rejects_texto_padrao_with_documento_modelo() -> None:
+    result = document_create_preview(
+        FakeClient(),
+        "47607237",
+        "despacho",
+        texto_inicial="T",
+        documento_modelo="40842131",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "workflow_violation"
 
 
 def test_document_create_confirm_requires_confirmation() -> None:
@@ -2273,6 +2324,8 @@ def test_document_edit_confirm_contract() -> None:
     assert result["data"]["quality_check"]["line_count"] >= 1
     assert result["data"]["quality_check"]["editable_sections_count"] == 1
     assert result["data"]["quality_check"]["edited_sections"] == ["422"]
+    assert result["data"]["edited_section"]["preview"] == "<p>Despacho atualizado</p>"
+    assert result["data"]["save_validation"]["target_has_escaped_structural_html"] is False
 
 
 def test_document_quality_check_contract() -> None:
@@ -2327,6 +2380,102 @@ class EscapedBlankEditableSectionClient(BlankEditableSectionClient):
         )
 
 
+class TemplateLockedAndBodySectionClient(BlankEditableSectionClient):
+    def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
+        save_url, _sections = super().get_editor_sections(id_documento, id_procedimento)
+        return (
+            save_url,
+            [
+                EditorSection(
+                    name="txaEditor_217",
+                    content="<p>Modelo automático que não deve receber o corpo editado</p>",
+                    section_id="217",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_220",
+                    content="<p>&nbsp;</p>",
+                    section_id="220",
+                    editable=True,
+                ),
+            ],
+        )
+
+
+class MultiSectionEncaminhamentoClient(BlankEditableSectionClient):
+    def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
+        save_url, _sections = super().get_editor_sections(id_documento, id_procedimento)
+        return (
+            save_url,
+            [
+                EditorSection(
+                    name="txaEditor_1059",
+                    content='&lt;p class=&quot;Texto_Centralizado_Maiusculas_Negrito&quot;&gt;&lt;img src=&quot;data:image/png;base64,AAA&quot; /&gt;&lt;/p&gt;',
+                    section_id="1059",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_1060",
+                    content='&lt;p class=&quot;Texto_Centralizado_Maiusculas_Negrito&quot;&gt;ENCAMINHAMENTO&lt;/p&gt;',
+                    section_id="1060",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_1061",
+                    content='&lt;p class=&quot;Texto_Justificado_Recuo_Primeira_Linha&quot;&gt;Processo n&ordm; 08810254.000138/2026-88&lt;/p&gt;&lt;p class=&quot;Texto_Justificado_Recuo_Primeira_Linha&quot;&gt;Interessado: Fulano&lt;/p&gt;',
+                    section_id="1061",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_1062",
+                    content='&lt;p class=&quot;Texto_Justificado_Recuo_Primeira_Linha&quot;&gt;Corpo real do encaminhamento&lt;/p&gt;',
+                    section_id="1062",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_1064",
+                    content='&lt;hr /&gt;&lt;table&gt;&lt;tr&gt;&lt;td&gt;Rodape de autenticidade&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;',
+                    section_id="1064",
+                    editable=True,
+                ),
+            ],
+        )
+
+
+class MultiSectionJustificativaClient(BlankEditableSectionClient):
+    def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
+        save_url, _sections = super().get_editor_sections(id_documento, id_procedimento)
+        return (
+            save_url,
+            [
+                EditorSection(
+                    name="txaEditor_872",
+                    content='&lt;p class=&quot;Texto_Centralizado&quot;&gt;&lt;img src=&quot;data:image/png;base64,AAA&quot; /&gt;&lt;/p&gt;',
+                    section_id="872",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_1102",
+                    content='&lt;p class=&quot;Texto_Centralizado_Maiusculas_Negrito&quot;&gt;Justificativa&lt;/p&gt;',
+                    section_id="1102",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_873",
+                    content="&lt;p&gt;&nbsp;&lt;/p&gt;",
+                    section_id="873",
+                    editable=True,
+                ),
+                EditorSection(
+                    name="txaEditor_875",
+                    content="&lt;table&gt;&lt;tr&gt;&lt;td&gt;&lt;strong&gt;Referência:&lt;/strong&gt; Processo nº 08810254.000138/2026-88&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;",
+                    section_id="875",
+                    editable=True,
+                ),
+            ],
+        )
+
+
 class TemplateVariableEditableSectionClient(BlankEditableSectionClient):
     def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
         save_url, _sections = super().get_editor_sections(id_documento, id_procedimento)
@@ -2371,6 +2520,28 @@ def test_document_quality_check_detects_empty_body_with_escaped_editor_html() ->
 
     assert result["ok"] is True
     assert result["data"]["quality_check"]["empty_body_check"] is True
+
+
+def test_document_edit_preview_prefers_body_section_over_template_locked_section() -> None:
+    result = document_edit_preview(TemplateLockedAndBodySectionClient(), "59999999", process_id="47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["editor"]["selected_section"]["section_id"] == "220"
+    assert result["data"]["editor"]["sections"][0]["section_id"] == "217"
+
+
+def test_document_edit_preview_prefers_real_body_in_multi_section_encaminhamento() -> None:
+    result = document_edit_preview(MultiSectionEncaminhamentoClient(), "59999999", process_id="47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["editor"]["selected_section"]["section_id"] == "1062"
+
+
+def test_document_edit_preview_prefers_empty_body_over_reference_metadata() -> None:
+    result = document_edit_preview(MultiSectionJustificativaClient(), "59999999", process_id="47607237")
+
+    assert result["ok"] is True
+    assert result["data"]["editor"]["selected_section"]["section_id"] == "873"
 
 
 def test_document_quality_check_detects_empty_body_with_only_template_variable_in_editable_section() -> None:
@@ -3257,6 +3428,29 @@ def test_document_create_preview_cli_json(monkeypatch) -> None:
     assert payload["resolved_ids"]["tipo_documento_id"] == "5"
 
 
+def test_document_create_preview_cli_json_with_documento_modelo(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "document-create-preview",
+            "47607237",
+            "despacho",
+            "--documento-modelo",
+            "40842131",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["payload_preview"]["texto_inicial"] == "D"
+    assert payload["data"]["payload_preview"]["documento_modelo"] == "40842131"
+
+
 def test_document_create_confirm_cli_json(monkeypatch) -> None:
     monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
 
@@ -3727,6 +3921,30 @@ def test_process_marker_update_confirm_cli_json(monkeypatch) -> None:
     assert payload["ok"] is True
     assert payload["operation"] == "process-marker-update-confirm"
     assert payload["data"]["mutation"]["new_text"] == "Aguardando manifestação até 15/04."
+
+
+def test_process_marker_update_confirm_cli_accepts_text_alias(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-marker-update-confirm",
+            "47607237",
+            "--marker",
+            "11",
+            "--text",
+            "Aguardando manifestação.",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["data"]["mutation"]["new_text"] == "Aguardando manifestação."
 
 
 def test_signature_block_list_cli_json(monkeypatch) -> None:

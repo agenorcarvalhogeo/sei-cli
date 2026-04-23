@@ -16,6 +16,7 @@ creates a NEW PHPSESSID for /sei/. Must follow redirects manually
 from __future__ import annotations
 
 import contextlib
+import html
 import json
 import re
 import time
@@ -4640,6 +4641,7 @@ class SEIClient:
         *,
         nivel_acesso: str | None = None,  # None = keep form default / process pattern
         texto_inicial: str = "N",  # N=Nenhum, T=Texto Padrão, D=Documento Modelo
+        documento_modelo: str = "",
         descricao: str = "",
         interessados: str = "",
         extra_fields: dict[str, str] | None = None,
@@ -4651,6 +4653,7 @@ class SEIClient:
             tipo: Document type key (e.g. 'despacho', 'oficio') or numeric id_serie.
             nivel_acesso: '0' (Público), '1' (Restrito), '2' (Sigiloso).
             texto_inicial: 'N' (Nenhum), 'T' (Texto Padrão), 'D' (Documento Modelo).
+            documento_modelo: Optional SEI protocol number to use as Documento Modelo.
             descricao: Optional description field.
             interessados: Optional interested party.
 
@@ -4664,6 +4667,10 @@ class SEIClient:
         # Without this, SEI just re-renders the form instead of creating the doc.
         cdata["hdnFlagDocumentoCadastro"] = "2"
         cdata["rdoTextoInicial"] = texto_inicial
+        if documento_modelo:
+            cdata["rdoTextoInicial"] = "D"
+            cdata["txtProtocoloDocumentoTextoBase"] = documento_modelo
+            cdata.setdefault("hdnIdDocumentoTextoBase", "")
         if nivel_acesso is not None:
             cdata["rdoNivelAcesso"] = nivel_acesso
         cdata["rdoFormato"] = "N"  # Nato-digital
@@ -4826,33 +4833,19 @@ class SEIClient:
 
         **ESCAPE RULES (critical):**
 
-        Section content must be **1-level HTML-escaped** — exactly as
-        returned by ``get_editor_sections()``. This means tags appear as
-        ``&lt;p&gt;`` not ``<p>``, and attributes use ``&quot;``.
-
-        The SEI editor textarea stores content in this 1-level escaped form.
-        ``save_document`` posts it as-is; httpx handles URL-encoding
-        transparently (transport layer, not HTML escaping).
+        Section content must be raw SEI HTML when it is posted. The HTTP form
+        layer URL-encodes transport characters; callers must not HTML-escape
+        tags before saving. Escaped structural tags such as ``&lt;p&gt;`` are
+        normalized back to ``<p>`` here to avoid deterministic double-escape
+        failures in the CKEditor.
 
         **Common mistakes:**
 
-        - ❌ Passing raw HTML (``<p>text</p>``) → SEI may misparse tags
-        - ❌ Passing content from ``get_editor_sections`` through
-          ``html.escape()`` → double-escaping (``&amp;lt;p&amp;gt;``)
-        - ❌ Building new content with ``html.escape(html.escape(x))``
-        - ✅ Passing content from ``get_editor_sections`` as-is (already
-          1x escaped)
-        - ✅ Building new content with ONE ``html.escape()`` call on raw HTML
-
-        **Workflow for editing a section:**
-
-        1. ``save_url, sections = get_editor_sections(doc_id, proc_id)``
-        2. Content arrives 1x escaped. To modify:
-           a. ``html.unescape(section.content)`` → raw HTML
-           b. Edit the raw HTML
-           c. ``html.escape(edited_html, quote=True)`` → 1x escaped
-           d. Or build new raw HTML and escape once
-        3. ``save_document(save_url, sections)``
+        - Passing ``html.escape(raw_html)`` makes tags visible as text.
+        - Reposting untouched escaped textarea content can preserve
+          ``&lt;p&gt;`` literally.
+        - Raw HTML tags are correct; non-Latin-1 characters are converted to
+          numeric HTML entities before the ISO-8859-1 POST.
 
         Returns:
             True if save succeeded.
@@ -4862,9 +4855,10 @@ class SEIClient:
         # Include hidden fields from editor form
         data.update(getattr(self, "_editor_hiddens", {}))
 
-        # Add all sections as textarea values
+        # Add all sections as textarea values. Preserve the full document
+        # structure, but normalize every section to raw HTML before transport.
         for sec in sections:
-            data[sec.name] = sec.content
+            data[sec.name] = self._prepare_editor_content_for_save(sec.content)
 
         r = self._post(save_url, data)
 
@@ -4880,7 +4874,11 @@ class SEIClient:
 
     @staticmethod
     def escape_for_sei(raw_html: str) -> str:
-        """Escape raw HTML for SEI editor textarea (1-level escape).
+        """Legacy helper that produces 1-level escaped SEI editor HTML.
+
+        Do not use this for normal ``document-edit-*`` body saves. The
+        canonical editor path now posts raw HTML and ``save_document``
+        normalizes escaped structural tags back to raw HTML defensively.
 
         SEI uses ISO-8859-1 encoding for form submissions. Characters
         outside Latin-1 (e.g. ``—``, ``'``, ``"``) must be preserved
@@ -4892,8 +4890,9 @@ class SEIClient:
         2. Escapes HTML structural characters (``<``, ``>``, ``&``, ``"``)
            to 1-level escape (``&lt;``, ``&gt;``, ``&amp;``, ``&quot;``)
 
-        The result is safe for ``save_document()`` and will render
-        correctly in the SEI editor.
+        If this legacy escaped output is accidentally passed to
+        ``save_document()``, ``save_document`` will unescape structural tags
+        before posting to prevent visible ``&lt;p&gt;`` in the document.
 
         Args:
             raw_html: HTML with literal tags (``<p>text</p>``).
@@ -4930,8 +4929,20 @@ class SEIClient:
         return "".join(result)
 
     @staticmethod
-    def _prepare_free_section(raw_html: str) -> str:
-        """Prepare raw HTML for posting to SEI editor (free/editable sections).
+    def _has_escaped_structural_html(value: str) -> bool:
+        candidate = value or ""
+        for _ in range(6):
+            if re.search(r"&lt;\s*/?\s*(?:p|div|span|table|tbody|tr|td|th|strong|em|br|ol|ul|li|a)\b", candidate, re.IGNORECASE):
+                return True
+            updated = html.unescape(candidate)
+            if updated == candidate:
+                break
+            candidate = updated
+        return False
+
+    @staticmethod
+    def _prepare_editor_content_for_save(raw_html: str) -> str:
+        """Prepare editor HTML for posting to SEI.
 
         SEI stores the textarea value literally on the server — what you POST
         is what gets saved and rendered. Therefore:
@@ -4946,20 +4957,37 @@ class SEIClient:
         NOTE: Do NOT use html.escape() here — that would post &lt;p&gt;
         which the server stores literally and renders as text, not HTML.
 
-        Args:
-            raw_html: Raw HTML with literal tags and literal Unicode chars.
-
-        Returns:
-            HTML with non-Latin-1 chars replaced by &#nnn; entities.
+        If content came back from the editor with escaped structural tags
+        (``&lt;p&gt;``), normalize it back to raw HTML before saving. This also
+        protects preserved non-target sections from being reposted escaped.
         """
+        if raw_html is None:
+            return ""
+        if SEIClient._has_escaped_structural_html(raw_html):
+            for _ in range(8):
+                unescaped = html.unescape(raw_html)
+                if unescaped == raw_html:
+                    break
+                raw_html = unescaped
+                if "<" in raw_html and "&lt;" not in raw_html and "&amp;lt;" not in raw_html:
+                    break
+
         result = []
         for ch in raw_html:
+            if ch == "\xa0":
+                result.append("&nbsp;")
+                continue
             try:
                 ch.encode("iso-8859-1")
                 result.append(ch)
             except UnicodeEncodeError:
                 result.append(f"&#{ord(ch)};")
         return "".join(result)
+
+    @staticmethod
+    def _prepare_free_section(raw_html: str) -> str:
+        """Backward-compatible wrapper for raw editable section content."""
+        return SEIClient._prepare_editor_content_for_save(raw_html)
 
     def edit_document_section(
         self,
@@ -4973,7 +5001,7 @@ class SEIClient:
         Handles the full workflow:
         1. Opens editor (get_editor_sections)
         2. Finds the target section by section_id
-        3. Escapes new_raw_html via ``escape_for_sei`` (handles Latin-1)
+        3. Normalizes new_raw_html for SEI's ISO-8859-1 form POST
         4. Replaces only the target section, preserving all others
         5. Saves via save_document
 
@@ -4981,8 +5009,8 @@ class SEIClient:
             id_documento: SEI document ID.
             id_procedimento: SEI process ID.
             section_id: Numeric section ID (e.g. '422' for body).
-            new_raw_html: Raw HTML content (``<p>text</p>``). Will be
-                escaped for SEI (1-level + Latin-1 entity conversion).
+            new_raw_html: Raw HTML content (``<p>text</p>``). It must contain
+                real tags, not ``&lt;p&gt;`` escaped tags.
 
         Returns:
             True if save succeeded.

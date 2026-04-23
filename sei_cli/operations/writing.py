@@ -397,6 +397,30 @@ def _resolve_requested_access_level(value: str) -> str | None:
     return value
 
 
+def _resolve_texto_inicial(texto_inicial: str, *, documento_modelo: str = "") -> str:
+    normalized = (texto_inicial or "N").strip().upper()
+    if normalized in {"", "NENHUM", "NONE"}:
+        normalized = "N"
+    elif normalized in {"TEXTO_PADRAO", "TEXTO-PADRAO", "PADRAO", "PADRÃO"}:
+        normalized = "T"
+    elif normalized in {"DOCUMENTO_MODELO", "DOCUMENTO-MODELO", "MODELO"}:
+        normalized = "D"
+    elif normalized not in {"N", "T", "D"}:
+        raise WorkflowViolationError(
+            f"Texto inicial '{texto_inicial}' nao reconhecido.",
+            details={"texto_inicial": texto_inicial, "allowed_values": ["N", "T", "D"]},
+        )
+
+    if documento_modelo.strip():
+        if normalized not in {"N", "D"}:
+            raise WorkflowViolationError(
+                "Documento modelo exige texto_inicial 'D' ou omissao do texto inicial.",
+                details={"texto_inicial": texto_inicial, "documento_modelo": documento_modelo},
+            )
+        return "D"
+    return normalized
+
+
 def _resolve_created_document_context(document_ref: str) -> tuple[str | None, str | None]:
     normalized = str(document_ref).strip()
     for item in reversed(load_created_documents()):
@@ -1334,6 +1358,7 @@ def document_create_preview(
     descricao: str = "",
     interessados: str = "",
     texto_inicial: str = "N",
+    documento_modelo: str = "",
     nivel_acesso: str = "inherit",
     motivo_acesso: str = "",
     hipotese_acesso: str = "",
@@ -1352,6 +1377,10 @@ def document_create_preview(
                 preflight["switched"] = True
                 preflight["switched_to"] = switched_to
                 context = _context(client)
+            effective_texto_inicial = _resolve_texto_inicial(
+                texto_inicial,
+                documento_modelo=documento_modelo,
+            )
             tipo_id, tipo_alias, tipo_nome = _resolve_document_type(client, id_procedimento, tipo_documento)
             requested_access = _resolve_requested_access_level(nivel_acesso)
             inherited_access = client.get_process_access_metadata(id_procedimento) if requested_access is None else None
@@ -1414,7 +1443,8 @@ def document_create_preview(
                     "payload_preview": {
                         "descricao": descricao,
                         "interessados": interessados,
-                        "texto_inicial": texto_inicial,
+                        "texto_inicial": effective_texto_inicial,
+                        "documento_modelo": documento_modelo,
                     },
                     "confirmation_required": True,
                 },
@@ -1427,7 +1457,8 @@ def document_create_preview(
                             "tipo_documento": tipo_documento,
                             "descricao": descricao,
                             "interessados": interessados,
-                            "texto_inicial": texto_inicial,
+                            "texto_inicial": effective_texto_inicial,
+                            "documento_modelo": documento_modelo,
                             "nivel_acesso": (
                                 "inherit" if requested_access is None else access_policy["nivel_codigo"]
                             ),
@@ -1467,6 +1498,7 @@ def document_create_confirm(
     descricao: str = "",
     interessados: str = "",
     texto_inicial: str = "N",
+    documento_modelo: str = "",
     nivel_acesso: str = "inherit",
     motivo_acesso: str = "",
     hipotese_acesso: str = "",
@@ -1491,6 +1523,10 @@ def document_create_confirm(
                 preflight["switched"] = True
                 preflight["switched_to"] = switched_to
                 context = _context(client)
+            effective_texto_inicial = _resolve_texto_inicial(
+                texto_inicial,
+                documento_modelo=documento_modelo,
+            )
             tipo_id, tipo_alias, tipo_nome = _resolve_document_type(client, id_procedimento, tipo_documento)
             requested_access = _resolve_requested_access_level(nivel_acesso)
             inherited_access = client.get_process_access_metadata(id_procedimento) if requested_access is None else None
@@ -1520,7 +1556,8 @@ def document_create_confirm(
                 id_procedimento,
                 tipo_documento,
                 nivel_acesso=effective_access,
-                texto_inicial=texto_inicial,
+                texto_inicial=effective_texto_inicial,
+                documento_modelo=documento_modelo,
                 descricao=descricao,
                 interessados=interessados,
                 extra_fields=extra_fields,
@@ -1552,6 +1589,8 @@ def document_create_confirm(
                             "selected_hypothesis": selected_hypothesis,
                         },
                         "descricao": descricao,
+                        "texto_inicial": effective_texto_inicial,
+                        "documento_modelo": documento_modelo,
                     }
                 )
             except Exception as exc:
@@ -1589,6 +1628,8 @@ def document_create_confirm(
                         "id_procedimento": created.id_procedimento,
                         "tipo": created.tipo,
                         "editor_url": created.editor_url,
+                        "texto_inicial": effective_texto_inicial,
+                        "documento_modelo": documento_modelo,
                     },
                 },
                 next_actions=[
@@ -1614,13 +1655,83 @@ def document_create_confirm(
 
 
 def _section_preview(section: Any) -> dict[str, Any]:
+    content = section.content or ""
     return {
         "section_id": section.section_id,
         "name": section.name,
         "editable": getattr(section, "editable", True),
-        "content_length": len(section.content or ""),
-        "preview": (section.content or "")[:240],
+        "content_length": len(content),
+        "escaped_structural_html": _has_escaped_structural_html(content),
+        "looks_empty": _is_effectively_empty_editor_content(content),
+        "preview": content[:240],
     }
+
+
+def _has_escaped_structural_html(value: str) -> bool:
+    candidate = value or ""
+    for _ in range(6):
+        if re.search(r"&lt;\s*/?\s*(?:p|div|span|table|tbody|tr|td|th|strong|em|br|ol|ul|li|a)\b", candidate, re.IGNORECASE):
+            return True
+        updated = html.unescape(candidate)
+        if updated == candidate:
+            break
+        candidate = updated
+    return False
+
+
+def _section_sort_key(section: Any) -> tuple[int, int, int, int]:
+    section_id = str(getattr(section, "section_id", "") or "")
+    try:
+        numeric_id = int(section_id)
+    except ValueError:
+        numeric_id = 0
+    content = getattr(section, "content", "") or ""
+    decoded_content = content
+    for _ in range(5):
+        updated = html.unescape(decoded_content)
+        if updated == decoded_content:
+            break
+        decoded_content = updated
+    decoded_lower = decoded_content.lower()
+    normalized = _normalize_editor_text(content)
+    is_template_lock_candidate = section_id == "217"
+    is_standard_body_candidate = section_id == "220"
+    is_after_template_lock = numeric_id > 217
+    has_body_class = "Texto_Justificado_Recuo_Primeira_Linha" in content or "Texto_Justificado" in content
+    has_real_content = bool(normalized)
+    is_header_or_timbre = "data:image" in decoded_lower or (
+        "texto_centralizado_maiusculas_negrito" in decoded_lower
+        and not has_body_class
+    )
+    is_footer = "<hr" in decoded_lower or "documento assinado eletronicamente" in decoded_lower
+    is_process_metadata = (
+        "processo n" in normalized.lower()
+        and ("interessado:" in normalized.lower() or "referência:" in normalized.lower() or "referencia:" in normalized.lower())
+    )
+    is_reference_metadata = (
+        ("referência:" in normalized.lower() or "referencia:" in normalized.lower())
+        and "processo n" in normalized.lower()
+    )
+
+    if is_footer or is_header_or_timbre or is_reference_metadata:
+        body_score = 0
+    elif is_standard_body_candidate:
+        body_score = 100
+    elif has_body_class and not is_process_metadata:
+        body_score = 80
+    elif has_body_class:
+        body_score = 30
+    elif is_after_template_lock:
+        body_score = 40
+    else:
+        body_score = 10
+
+    return (
+        1 if not is_template_lock_candidate else 0,
+        body_score,
+        numeric_id,
+        1 if has_real_content else 0,
+    )
 
 
 def _pick_default_section(sections: list[Any], requested: str | None) -> Any:
@@ -1641,7 +1752,10 @@ def _pick_default_section(sections: list[Any], requested: str | None) -> Any:
         raise WorkflowViolationError("Documento nao expôs secoes editaveis.")
     editable_sections = [section for section in sections if getattr(section, "editable", True)]
     if editable_sections:
-        return max(editable_sections, key=lambda section: len(section.content or ""))
+        return max(
+            editable_sections,
+            key=lambda section: (*_section_sort_key(section), len(section.content or "")),
+        )
     return max(sections, key=lambda section: len(section.content or ""))
 
 
@@ -1991,6 +2105,9 @@ def document_edit_confirm(
             )
             if not ok:
                 raise WorkflowViolationError("SEI nao confirmou a gravacao do documento.")
+            prepare_for_save = getattr(client, "_prepare_editor_content_for_save", None)
+            normalized_saved_content = prepare_for_save(content) if callable(prepare_for_save) else content
+            target.content = normalized_saved_content
             resolved_ids = {
                 "id_documento": id_documento,
                 "id_procedimento": id_procedimento,
@@ -2017,6 +2134,19 @@ def document_edit_confirm(
                     "preflight": preflight,
                     "edited_section": _section_preview(target),
                     "save_url_present": bool(save_url),
+                    "save_validation": {
+                        "target_section_id": target.section_id,
+                        "target_has_escaped_structural_html": _has_escaped_structural_html(normalized_saved_content),
+                        "preserved_sections_total": max(len(sections) - 1, 0),
+                        "preserved_sections_with_escaped_structural_html_before_normalization": len(
+                            [
+                                section
+                                for section in sections
+                                if section.section_id != target.section_id
+                                and _has_escaped_structural_html(section.content or "")
+                            ]
+                        ),
+                    },
                     "quality_check": quality_payload,
                 },
                 next_actions=[

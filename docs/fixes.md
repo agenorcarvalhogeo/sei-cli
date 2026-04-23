@@ -91,6 +91,61 @@ client.save_document(save_url, sections)
 
 Ao **ler** conteúdo existente de uma section use `html.unescape(s.content)` para obter o HTML cru.
 
+### Endurecimento da canônica
+
+**Data:** 2026-04-23
+
+A canônica `document-edit-*` agora reforça a regra no próprio `save_document()`:
+
+- todas as seções `txaEditor_*` são normalizadas para HTML cru antes do POST
+- tags estruturais escapadas (`&lt;p&gt;`, `&lt;strong&gt;`, `&lt;table&gt;`, etc.) são revertidas para tags reais
+- caracteres fora de ISO-8859-1 são convertidos para entidades numéricas (`&#nnn;`)
+- `&nbsp;` é preservado como entidade HTML
+- a edição continua substituindo apenas a seção alvo, preservando as demais seções do documento
+
+Isso cobre também as seções não editadas que voltam do editor em forma escapada e seriam repostadas junto com o corpo.
+
+### Documento Modelo na criação canônica
+
+**Data:** 2026-04-23
+
+A canônica `document-create-*` agora aceita `--documento-modelo <numero_sei>`:
+
+- o contrato força `texto_inicial=D` quando há documento modelo
+- o POST preenche `txtProtocoloDocumentoTextoBase` com o número SEI informado
+- `hdnIdDocumentoTextoBase` permanece vazio no fluxo por número digitado
+- `document-edit-preview` evita cabeçalho, metadados e rodapé em documentos multi-seção
+
+No teste real de Encaminhamento, a seção correta de corpo foi `1062`; as seções `1059`, `1060`, `1061` e `1064` correspondiam a timbre/título/metadados/rodapé.
+
+### Matriz real de seção editável por tipo
+
+**Data:** 2026-04-23
+
+Teste executado no processo `08810254.000138/2026-88` / `49286513`, criando e editando cada tipo com marcador único. Todos os documentos validados por `document-read` sem ocorrência de `&lt;p`, `&amp;lt;`, `&lt;br` ou `&amp;amp;lt`.
+
+| Tipo | Seção de corpo validada |
+| --- | --- |
+| Parecer | `601` |
+| Ordem de Serviço | `341` |
+| Parte Genérica | `341` |
+| Despacho | `220` |
+| Memorando | `341` |
+| Autorização | `341` |
+| Despacho Diligencial | `220` |
+| Informação | `422` |
+| Justificativa | `873` |
+| Relatório de Viagem | `3690` |
+| Minuta de Portaria | `616` |
+| Solicitação de Providências | `341` |
+| Solicitação | `4499` |
+
+Observações:
+
+- `1062` é padrão do Encaminhamento testado, não padrão global.
+- Justificativa expõe `875` como tabela de referência/metadados; a seção de corpo real é `873`.
+- Famílias tipo memorando/ofício/solicitação tendem a usar `341`, mas a canônica deve continuar inferindo pelo conteúdo das seções, não por id fixo.
+
 ---
 
 ## Fix: `_execute_sign_form` usa credenciais hardcoded do desenvolvedor
