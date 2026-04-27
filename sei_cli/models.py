@@ -185,6 +185,8 @@ class TreeDocument:
     src_url: str | None = None         # documento_visualizar or documento_download_anexo
     html_content: str | None = None    # inline HTML (for docs with viewer info)
     sei_number: str | None = None      # SEI document number from title
+    origin_unit: str | None = None     # unidade geradora shown by the SEI tree
+    origin_description: str | None = None
     assinado: bool = False
     autenticado: bool = False
     assinaturas: list[SignatureInfo] = field(default_factory=list)

@@ -13,7 +13,7 @@ import pytest
 from bs4 import BeautifulSoup
 
 from sei_cli.client import SEIClient, _sanitize_for_iso_8859_1
-from sei_cli.models import EditorSection
+from sei_cli.models import BlockDocument, EditorSection, TreeDocument
 
 
 # --- HTML Fixtures ---
@@ -1024,6 +1024,94 @@ class TestBlockDetailHelpers:
 
         assert "Despacho de teste do bloco" in content
 
+    def test_build_arvore_visualizar_url_uses_current_unit_iframe_context(self):
+        self.client._get = MagicMock(
+            return_value=_mock_response(
+                '<iframe name="ifrArvore" src="controlador.php?acao=arvore_inicializar'
+                '&id_procedimento=49286513&infra_unidade_atual=110008367&infra_hash=abcDEF123"></iframe>'
+            )
+        )
+
+        url = self.client._build_arvore_visualizar_url("49302196", "49286513")
+
+        assert url is not None
+        assert "acao=arvore_visualizar" in url
+        assert "id_documento=49302196" in url
+        assert "id_procedimento=49286513" in url
+        assert "infra_unidade_atual=110008367" in url
+        assert "infra_hash=abcDEF123" in url
+
+    def test_get_editor_url_expands_lazy_tree_before_failing(self):
+        self.client._navigate_to_arvore = MagicMock(return_value="<script></script>")
+        self.client._auto_unit_switch = MagicMock()
+
+        class _UnitGuard:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *args):
+                return None
+
+        self.client._auto_unit_switch.return_value = _UnitGuard()
+        self.client.get_full_document_tree = MagicMock(
+            return_value=[
+                TreeDocument(
+                    id_documento="49302196",
+                    nome="Solicitação",
+                    tipo="interno",
+                    arvore_url="controlador.php?acao=arvore_visualizar&id_documento=49302196&infra_hash=abc",
+                )
+            ]
+        )
+        self.client._get = MagicMock(
+            return_value=_mock_response(
+                "var linkEditarConteudo = 'controlador.php?acao=editor_montar&id_documento=49302196&infra_hash=def';"
+            )
+        )
+
+        url = self.client._get_editor_url("49302196", "49286513")
+
+        assert url is not None
+        assert "acao=editor_montar" in url
+        self.client.get_full_document_tree.assert_called_once_with("49286513", expand_all=True)
+
+    def test_get_editor_url_builds_contextual_url_for_about_blank_lazy_doc(self):
+        self.client._navigate_to_arvore = MagicMock(return_value="<script></script>")
+        self.client._auto_unit_switch = MagicMock()
+
+        class _UnitGuard:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *args):
+                return None
+
+        self.client._auto_unit_switch.return_value = _UnitGuard()
+        self.client.get_full_document_tree = MagicMock(
+            return_value=[
+                TreeDocument(
+                    id_documento="49302196",
+                    nome="Solicitação",
+                    tipo="interno",
+                    arvore_url="about:blank",
+                )
+            ]
+        )
+        self.client._build_arvore_visualizar_url = MagicMock(
+            return_value="controlador.php?acao=arvore_visualizar&id_documento=49302196&infra_hash=fresh"
+        )
+        self.client._get = MagicMock(
+            return_value=_mock_response(
+                "var linkEditarConteudo = 'controlador.php?acao=editor_montar&id_documento=49302196&infra_hash=def';"
+            )
+        )
+
+        url = self.client._get_editor_url("49302196", "49286513")
+
+        assert url is not None
+        assert "acao=editor_montar" in url
+        self.client._build_arvore_visualizar_url.assert_called_once_with("49302196", "49286513")
+
     def test_sign_block_uses_row_specific_sign_url_for_single_index(self):
         self.client._get_block_detail_page = MagicMock(
             return_value=(
@@ -1081,6 +1169,45 @@ class TestBlockDetailHelpers:
         assert "acao=documento_assinar" in called_url
         assert called_data["hdnInfraItemId"] == "48218774-871299"
         assert called_data["hdnInfraItensSelecionados"] == "48218774-871299"
+
+    def test_sign_block_accepts_verification_when_document_is_no_longer_signable(self):
+        self.client._get_block_detail_page = MagicMock(
+            return_value=(
+                _mock_response(
+                    BLOCK_DETAIL_HTML_MULTI,
+                    url="https://sei.rn.gov.br/sei/controlador.php?acao=rel_bloco_protocolo_listar&id_bloco=871299&infra_hash=lista",
+                ),
+                BeautifulSoup(BLOCK_DETAIL_HTML_MULTI, "lxml"),
+            )
+        )
+        self.client._execute_sign = MagicMock(
+            return_value={
+                "doc_ids": "48783191",
+                "signed": ["48783191"],
+                "already_signed": [],
+                "errors": [],
+            }
+        )
+        self.client.get_block_documents = MagicMock(
+            return_value=[
+                BlockDocument(
+                    seq="2",
+                    processo="08810254.000117/2026-62",
+                    documento_id="48783191",
+                    tipo_documento="Despacho",
+                    numero_sei="40381240",
+                    numero_documento="40381240",
+                    assinado=False,
+                    can_sign=False,
+                )
+            ]
+        )
+
+        result = self.client.sign_block("871299", doc_indices=[2])
+
+        assert result["errors"] == []
+        assert "48783191" in result["signed"]
+        assert result["post_verification"]["remaining_signable_refs"] == []
 
     def test_sign_or_authenticate_recovers_when_form_returns_but_document_is_signed(self):
         from sei_cli.models import TreeDocument

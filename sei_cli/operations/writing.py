@@ -21,12 +21,16 @@ from .reading import (
     _error_result,
     _list_process_markers,
     _normalize_marker_item,
+    _normalize_tracking_group_item,
+    _process_in_tracking_list,
     _process_unit_preflight,
     _process_preview,
     _resolve_document_id_with_process,
     _resolve_document_ids,
     _resolve_marker_reference,
     _resolve_process_id,
+    _resolve_tracking_group_reference,
+    _resolve_visible_process_for_marker,
     _result,
     document_read,
     environment_triage_preview,
@@ -2454,6 +2458,7 @@ def process_marker_update_preview(
             resolved_ids=resolved_ids,
             data={
                 "processo": read_result["data"].get("processo"),
+                "marker_authority": read_result["data"].get("marker_authority"),
                 "selected_marker": selected_marker,
                 "current_markers_total": read_result["data"].get("current_markers_total"),
                 "current_markers": read_result["data"].get("current_markers"),
@@ -2527,6 +2532,7 @@ def process_marker_update_confirm(
             context=preview["context"],
             resolved_ids=resolved_ids,
             data={
+                "marker_authority": preview["data"].get("marker_authority"),
                 "selected_marker": selected_marker,
                 "mutation": {
                     "applied": True,
@@ -2547,6 +2553,524 @@ def process_marker_update_confirm(
             operation=operation,
             context=locals().get("context"),
             resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def tracking_group_create_preview(
+    client: Any,
+    nome: str,
+) -> dict[str, Any]:
+    operation = "tracking-group-create-preview"
+    try:
+        context = _context(client)
+        group_name = nome.strip()
+        if not group_name:
+            raise WorkflowViolationError("Nome do grupo de acompanhamento especial é obrigatório.")
+        groups = [
+            _normalize_tracking_group_item(item)
+            for item in client.listar_grupos_acompanhamento()
+        ]
+        groups = [item for item in groups if item.get("id") and item.get("nome")]
+        existing = _resolve_tracking_group_reference(groups, group_name)
+        warnings: list[str] = []
+        if existing:
+            warnings.append("Já existe grupo de acompanhamento especial com nome igual ou compatível na unidade atual.")
+        return _result(
+            operation=operation,
+            context=context,
+            data={
+                "tracking_scope": {
+                    "unit_specific": True,
+                    "current_unit": context.get("unidade_sigla"),
+                    "rule": "Grupo de acompanhamento especial é específico da unidade atual.",
+                },
+                "group_preview": {
+                    "nome": group_name,
+                    "already_exists": existing is not None,
+                    "existing_group": existing,
+                },
+                "available_groups_total": len(groups),
+                "available_groups": groups,
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="tracking-group-create-confirm",
+                    label="Criar grupo de acompanhamento especial",
+                    params={"nome": group_name},
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            exc=exc,
+        )
+
+
+def tracking_group_create_confirm(
+    client: Any,
+    nome: str,
+    *,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "tracking-group-create-confirm"
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmação explícita obrigatória para criar grupo de acompanhamento especial.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = tracking_group_create_preview(client, nome)
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+        existing = preview["data"]["group_preview"].get("existing_group")
+        if existing:
+            return _result(
+                operation=operation,
+                context=preview["context"],
+                resolved_ids={"grupo_id": existing.get("id")},
+                data={
+                    "tracking_scope": preview["data"].get("tracking_scope"),
+                    "group": existing,
+                    "mutation": {
+                        "created": False,
+                        "already_exists": True,
+                        "message": f"Grupo {existing.get('nome')} já existia na unidade atual.",
+                    },
+                },
+                warnings=preview.get("warnings", []),
+            )
+        group_id = client.criar_grupo_acompanhamento(preview["data"]["group_preview"]["nome"])
+        groups = [
+            _normalize_tracking_group_item(item)
+            for item in client.listar_grupos_acompanhamento()
+        ]
+        created = _resolve_tracking_group_reference(groups, str(group_id)) or _resolve_tracking_group_reference(
+            groups,
+            preview["data"]["group_preview"]["nome"],
+        )
+        if not created:
+            raise WorkflowViolationError(
+                "SEI retornou sucesso, mas o grupo não apareceu na lista após a criação.",
+                details={"grupo_id": group_id, "nome": preview["data"]["group_preview"]["nome"]},
+            )
+        return _result(
+            operation=operation,
+            context=preview["context"],
+            resolved_ids={"grupo_id": created.get("id")},
+            data={
+                "tracking_scope": preview["data"].get("tracking_scope"),
+                "group": created,
+                "mutation": {
+                    "created": True,
+                    "already_exists": False,
+                    "message": f"Grupo {created.get('nome')} criado na unidade atual.",
+                },
+            },
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("preview", {}).get("context"),
+            resolved_ids=locals().get("resolved_ids"),
+            exc=exc,
+        )
+
+
+def process_watch_preview(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    group: str,
+    observacao: str | None = None,
+) -> dict[str, Any]:
+    operation = "process-watch-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        id_procedimento, numero_processo, visible_process = _resolve_visible_process_for_marker(
+            client,
+            numero_ou_id,
+        )
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id,
+        }
+        groups = [
+            _normalize_tracking_group_item(item)
+            for item in client.listar_grupos_acompanhamento()
+        ]
+        groups = [item for item in groups if item.get("id") and item.get("nome")]
+        selected_group = _resolve_tracking_group_reference(groups, group)
+        if not selected_group:
+            raise WorkflowViolationError(
+                f"Grupo de acompanhamento especial '{group}' não encontrado na unidade atual.",
+                details={"group": group, "available_groups": groups},
+            )
+        current_tracking = _process_in_tracking_list(client, id_procedimento, numero_processo)
+        mutation_action = "update" if current_tracking else "add"
+        note = (observacao or "").strip()
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids={
+                **resolved_ids,
+                "grupo_id": selected_group.get("id"),
+            },
+            data={
+                "processo": _process_preview(visible_process),
+                "tracking_authority": {
+                    "source": "current_unit_process_list",
+                    "visible_in_current_unit": True,
+                    "caixa": visible_process.caixa,
+                    "unit_specific": True,
+                    "rule": "Processo visível em recebidos/gerados da unidade atual pode ser colocado em acompanhamento especial nesta unidade, independentemente da unidade de origem.",
+                },
+                "current_tracking": {
+                    "tracked": current_tracking is not None,
+                    "processo": current_tracking,
+                },
+                "selected_group": selected_group,
+                "observacao": note,
+                "mutation_preview": {
+                    "action": mutation_action,
+                    "grupo_id": selected_group.get("id"),
+                    "observacao": note,
+                },
+                "available_groups_total": len(groups),
+                "available_groups": groups,
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-watch-confirm",
+                    label="Colocar processo em acompanhamento especial",
+                    params={
+                        "numero_ou_id": id_procedimento,
+                        "group": selected_group.get("id"),
+                        "observacao": note,
+                    },
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_watch_confirm(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    group: str,
+    observacao: str | None = None,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-watch-confirm"
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmação explícita obrigatória para colocar processo em acompanhamento especial.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = process_watch_preview(client, numero_ou_id, group=group, observacao=observacao)
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+        process_id = preview["resolved_ids"]["id_procedimento"]
+        selected_group = preview["data"]["selected_group"]
+        group_id = str(selected_group["id"])
+        note = preview["data"].get("observacao") or ""
+        action = preview["data"]["mutation_preview"]["action"]
+        if action == "update":
+            ok = client.alterar_acompanhamento_especial(process_id, group_id, note)
+        else:
+            ok = client.add_acompanhamento_especial(process_id, group_id, note)
+        if not ok:
+            raise WorkflowViolationError(
+                "SEI não confirmou o acompanhamento especial do processo.",
+                details={"id_procedimento": process_id, "grupo_id": group_id, "action": action},
+            )
+        tracked_process = _process_in_tracking_list(
+            client,
+            process_id,
+            preview["resolved_ids"].get("numero_processo"),
+        )
+        if not tracked_process:
+            raise WorkflowViolationError(
+                "SEI retornou sucesso, mas o processo não apareceu em acompanhamento especial após releitura.",
+                details={"id_procedimento": process_id, "grupo_id": group_id},
+            )
+        return _result(
+            operation=operation,
+            context=preview["context"],
+            resolved_ids=preview["resolved_ids"],
+            data={
+                "processo": preview["data"].get("processo"),
+                "tracking_authority": preview["data"].get("tracking_authority"),
+                "selected_group": selected_group,
+                "observacao": note,
+                "mutation": {
+                    "applied": True,
+                    "action": action,
+                    "message": f"Processo {process_id} em acompanhamento especial no grupo {group_id}.",
+                },
+                "verification": {
+                    "tracked": True,
+                    "processo": tracked_process,
+                },
+            },
+            next_actions=[
+                NextAction(
+                    action="process-watch-read",
+                    label="Rever acompanhamento especial do processo",
+                    params={"numero_ou_id": process_id},
+                ),
+                NextAction(
+                    action="process-conclude-preview",
+                    label="Preparar conclusão do processo na unidade atual",
+                    params={"numero_ou_id": process_id},
+                ),
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("preview", {}).get("context"),
+            resolved_ids=locals().get("preview", {}).get("resolved_ids"),
+            exc=exc,
+        )
+
+
+def _default_archive_observation(process_data: dict[str, Any]) -> str:
+    parts = [
+        "Concluído/arquivado na unidade atual",
+        str(process_data.get("tipo") or "").strip(),
+        str(process_data.get("especificacao") or "").strip(),
+    ]
+    return " - ".join(item for item in parts if item)
+
+
+def process_archive_preview(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    group: str | None = None,
+    observacao: str | None = None,
+    reabrir_em: str | None = None,
+    reabrir_dias: str | None = None,
+    reabrir_dias_uteis: bool = False,
+) -> dict[str, Any]:
+    operation = "process-archive-preview"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        id_procedimento, numero_processo, visible_process = _resolve_visible_process_for_marker(
+            client,
+            numero_ou_id,
+        )
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id,
+        }
+        process_data = _process_preview(visible_process)
+        tracked_process = _process_in_tracking_list(client, id_procedimento, numero_processo)
+        groups = [
+            _normalize_tracking_group_item(item)
+            for item in client.listar_grupos_acompanhamento()
+        ]
+        groups = [item for item in groups if item.get("id") and item.get("nome")]
+        selected_group = _resolve_tracking_group_reference(groups, group)
+        if not tracked_process and not selected_group:
+            raise WorkflowViolationError(
+                "Para arquivar processo ainda não acompanhado, informe --group/--grupo com ID ou nome de grupo de acompanhamento especial.",
+                details={
+                    "group": group,
+                    "available_groups": groups,
+                    "hint": "Use tracking-group-catalog para listar grupos ou tracking-group-create-* para criar um grupo.",
+                },
+            )
+        note = (observacao or "").strip() or _default_archive_observation(process_data)
+        tracking_action = "skip_already_tracked" if tracked_process else "add"
+        conclude_preview = process_conclude_preview(
+            client,
+            id_procedimento,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+        )
+        if not conclude_preview.get("ok"):
+            conclude_preview["operation"] = operation
+            return conclude_preview
+        resolved_ids = {
+            **(conclude_preview.get("resolved_ids") or {}),
+            **resolved_ids,
+        }
+        if selected_group:
+            resolved_ids["grupo_id"] = selected_group.get("id")
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "processo": process_data,
+                "tracking_authority": {
+                    "source": "current_unit_process_list",
+                    "visible_in_current_unit": True,
+                    "caixa": visible_process.caixa,
+                    "unit_specific": True,
+                    "rule": "Arquivamento seguro exige acompanhamento especial na unidade atual antes da conclusão.",
+                },
+                "current_tracking": {
+                    "tracked": tracked_process is not None,
+                    "processo": tracked_process,
+                },
+                "selected_group": selected_group,
+                "observacao": note,
+                "archive_plan": {
+                    "tracking_action": tracking_action,
+                    "will_apply_tracking": tracking_action != "skip_already_tracked",
+                    "will_conclude": True,
+                    "order": ["ensure_tracking", "conclude_process"],
+                },
+                "conclude_preview": conclude_preview["data"],
+                "available_groups_total": len(groups),
+                "available_groups": groups,
+                "confirmation_required": True,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-archive-confirm",
+                    label="Colocar em acompanhamento especial se necessário e concluir processo",
+                    params={
+                        "numero_ou_id": id_procedimento,
+                        "group": (selected_group or {}).get("id") if selected_group else group,
+                        "observacao": note,
+                        "reabrir_em": reabrir_em,
+                        "reabrir_dias": reabrir_dias,
+                        "reabrir_dias_uteis": reabrir_dias_uteis,
+                    },
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_archive_confirm(
+    client: Any,
+    numero_ou_id: str,
+    *,
+    group: str | None = None,
+    observacao: str | None = None,
+    reabrir_em: str | None = None,
+    reabrir_dias: str | None = None,
+    reabrir_dias_uteis: bool = False,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    operation = "process-archive-confirm"
+    try:
+        if not confirm:
+            raise WorkflowViolationError(
+                "Confirmação explícita obrigatória para arquivar/concluir processo.",
+                details={"expected_flag": "--confirm"},
+            )
+        preview = process_archive_preview(
+            client,
+            numero_ou_id,
+            group=group,
+            observacao=observacao,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+        )
+        if not preview.get("ok"):
+            preview["operation"] = operation
+            return preview
+        process_id = preview["resolved_ids"]["id_procedimento"]
+        tracking_result: dict[str, Any] | None = None
+        if preview["data"]["archive_plan"]["will_apply_tracking"]:
+            selected_group = preview["data"].get("selected_group") or {}
+            tracking_result = process_watch_confirm(
+                client,
+                process_id,
+                group=str(selected_group.get("id") or group or ""),
+                observacao=preview["data"].get("observacao") or "",
+                confirm=True,
+            )
+            if not tracking_result.get("ok"):
+                tracking_result["operation"] = operation
+                return tracking_result
+        else:
+            tracking_result = {
+                "ok": True,
+                "operation": "process-watch-read",
+                "data": {
+                    "current_tracking": preview["data"].get("current_tracking"),
+                    "mutation": {"applied": False, "action": "skip_already_tracked"},
+                },
+            }
+        conclude_result = process_conclude_confirm(
+            client,
+            process_id,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+            confirm=True,
+        )
+        if not conclude_result.get("ok"):
+            conclude_result["operation"] = operation
+            return conclude_result
+        return _result(
+            operation=operation,
+            context=conclude_result.get("context") or preview["context"],
+            resolved_ids=preview["resolved_ids"],
+            data={
+                "processo": preview["data"].get("processo"),
+                "tracking_authority": preview["data"].get("tracking_authority"),
+                "selected_group": preview["data"].get("selected_group"),
+                "observacao": preview["data"].get("observacao"),
+                "archive": {
+                    "tracked_before_conclude": True,
+                    "concluded": True,
+                    "order": ["ensure_tracking", "conclude_process"],
+                },
+                "tracking_result": {
+                    "operation": tracking_result.get("operation"),
+                    "mutation": (tracking_result.get("data") or {}).get("mutation"),
+                    "verification": (tracking_result.get("data") or {}).get("verification"),
+                    "current_tracking": (tracking_result.get("data") or {}).get("current_tracking"),
+                },
+                "conclude_result": conclude_result.get("data"),
+            },
+            next_actions=[
+                NextAction(
+                    action="process-reopen-preview",
+                    label="Verificar se a reabertura está disponível nesta unidade",
+                    params={"numero_ou_id_processo": process_id},
+                )
+            ],
+            warnings=preview.get("warnings", []) + conclude_result.get("warnings", []),
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("preview", {}).get("context"),
+            resolved_ids=locals().get("preview", {}).get("resolved_ids"),
             exc=exc,
         )
 
@@ -3641,6 +4165,37 @@ def signature_block_sign_preview(
         )
 
 
+def _is_block_post_verification_error(message: str | None) -> bool:
+    if not message:
+        return False
+    normalized = message.casefold()
+    return (
+        "documentos permanecem pendentes" in normalized
+        or "documentos permanecem assináveis" in normalized
+        or "documentos permanecem assinaveis" in normalized
+        or "após releitura do bloco" in normalized
+        or "apos releitura do bloco" in normalized
+    )
+
+
+def _sanitize_ignored_block_postcheck_errors(results: list[dict[str, Any]]) -> None:
+    for result in results:
+        ignored: list[str] = []
+        if _is_block_post_verification_error(result.get("error")):
+            ignored.append(str(result.pop("error")))
+
+        kept_errors: list[str] = []
+        for item in result.get("errors", []) or []:
+            if _is_block_post_verification_error(str(item)):
+                ignored.append(str(item))
+            else:
+                kept_errors.append(str(item))
+
+        if ignored:
+            result["errors"] = kept_errors
+            result["ignored_postcheck_errors"] = ignored
+
+
 def signature_block_sign_confirm(
     client: Any,
     block_numero: str,
@@ -3683,7 +4238,12 @@ def signature_block_sign_confirm(
             result["block_numero"] = block_numero
             result["document_indices"] = selected_indices
             results.append(result)
-            if not result.get("already_signed") and (result.get("error") or result.get("errors")):
+            result_messages = [result.get("error")] + list(result.get("errors") or [])
+            non_verification_errors = [
+                item for item in result_messages
+                if item and not _is_block_post_verification_error(str(item))
+            ]
+            if not result.get("already_signed") and non_verification_errors:
                 errors.append(result)
         else:
             for item in selected_documents:
@@ -3779,6 +4339,7 @@ def signature_block_sign_confirm(
                 },
             )
 
+        _sanitize_ignored_block_postcheck_errors(results)
         resolved_ids["document_ids"] = requested_ids
         return _result(
             operation=operation,
@@ -3816,7 +4377,7 @@ def process_marker_set_preview(
     *,
     marker: str,
     texto: str | None = None,
-    mode: str = "summary",
+    mode: str = "contextual",
     date_from: str | None = None,
     date_to: str | None = None,
     sample_size: int = 3,
@@ -3890,7 +4451,7 @@ def process_marker_set_confirm(
     marker: str,
     texto: str | None = None,
     confirm: bool = False,
-    mode: str = "summary",
+    mode: str = "contextual",
     date_from: str | None = None,
     date_to: str | None = None,
     sample_size: int = 3,
@@ -3933,6 +4494,7 @@ def process_marker_set_confirm(
             resolved_ids=preview["resolved_ids"],
             data={
                 "processo": preview["data"].get("processo"),
+                "marker_authority": preview["data"].get("marker_authority"),
                 "selected_marker": selected_marker,
                 "marker_text": marker_text,
                 "mutation": {
@@ -4054,6 +4616,7 @@ def process_marker_remove_confirm(
             resolved_ids=preview["resolved_ids"],
             data={
                 "processo": preview["data"].get("processo"),
+                "marker_authority": preview["data"].get("marker_authority"),
                 "selected_marker": selected_marker or None,
                 "mutation": {
                     "removed": True,

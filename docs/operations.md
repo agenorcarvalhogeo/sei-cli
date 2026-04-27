@@ -148,6 +148,14 @@ comando nesta lista, skills e workflows devem preferi-lo aos comandos legados.
 - `environment-triage-preview`
 - `environment-triage-parallel`
 - `environment-triage-apply`
+- `tracking-group-catalog`
+- `tracking-group-create-preview`
+- `tracking-group-create-confirm`
+- `process-watch-read`
+- `process-watch-preview`
+- `process-watch-confirm`
+- `process-archive-preview`
+- `process-archive-confirm`
 
 ### Processo, PDF e finalizacao
 
@@ -194,10 +202,41 @@ Capacidades estabilizadas:
 - heranca real de acesso do processo na criacao documental
 - resolucao de tipo documental pelo formulario real
 - criacao a partir de Documento Modelo com `--documento-modelo <numero_sei>`
+- `--texto-inicial` representa apenas o modo inicial (`N`, `T`, `D`), nao o
+  corpo do documento
+- `T` significa Texto Padrao cadastrado no SEI; para copiar documento SEI
+  existente, usar `--documento-modelo <numero_sei>`, que força `D`
+- para escrever corpo novo, criar o documento e depois usar `document-edit-*`
 - identificacao de secoes `editable` vs `readOnly`
 - gravacao na secao editavel correta
 - reler documento apos gravacao
 - quality-check com sinais de padronizacao e placeholders
+
+### Referencias internas no corpo do documento
+
+Quando o corpo HTML citar documento ou processo SEI ja existente, a referencia
+deve usar o link nativo do editor, nao `href` externo.
+
+Padrao:
+
+```html
+<span contenteditable="false" style="text-indent:0;">
+  <a class="ancora_sei" id="lnkSei{id_interno}" style="text-indent:0;">{numero_visivel}</a>
+</span>
+```
+
+Regras:
+
+- para documento, `{id_interno}` e o `id_documento` da arvore/process-read
+- para processo, `{id_interno}` e o `id_procedimento` resolvido
+- `{numero_visivel}` e o numero que aparece para o usuario, por exemplo
+  `40715880` ou `08810105.000066/2026-82`
+- deixe o texto narrativo fora da ancora: `Portaria-SEI ... (` + link +
+  `)` ou `Processo SEI nº ` + link
+- se o id interno nao estiver disponivel com seguranca, mantenha o numero em
+  texto simples e sinalize para resolver antes de salvar
+- nunca montar link com URL fixa do SEI; `infra_hash` muda e tende a levar ao
+  login ou a contexto invalido
 
 Observacao importante:
 
@@ -321,6 +360,16 @@ Implicações:
 
 - priorizar `process-marker-preview`, `process-marker-read`, `process-marker-history`,
   `process-marker-set-*`, `process-marker-update-*` e `process-marker-remove-*`
+- para marcador, a fonte de verdade é a caixa da unidade atual (`inbox-snapshot` /
+  `client.list_processes()`): se o processo aparece em `recebidos` ou `gerados`,
+  ele pode ser marcado naquela unidade
+- falha de `process-read` não bloqueia marcador; leitura serve para enriquecer
+  classificação e sugestão de texto, não para decidir se a mutação é permitida
+- a investigação padrão para gerar resumo/texto meaningful é `contextual`
+- usar `fast` apenas quando o usuário pedir velocidade/triagem ampla ou quando a leitura contextual falhar/demorar
+- usar `deep`/`all` apenas quando o usuário pedir aprofundamento ou quando o caso exigir leitura integral
+- marcadores são por ambiente/unidade; o mesmo processo pode ter marcadores
+  diferentes em unidades diferentes
 - o texto sugerido do marcador deve continuar curto, operacional e útil para triagem
 - histórico e alteração de texto no próprio processo têm mais valor do que mutação em lote
 
@@ -472,6 +521,7 @@ Pos-condicoes:
 - bloco de assinatura: `signature-block-read/review/refresh/sign`
 - finalizacao: `process-finalize-*`
 - triagem: `environment-triage-*`
+- acompanhamento especial: `tracking-group-*`, `process-watch-*`
 
 Para cada teste real, registrar:
 
@@ -489,6 +539,56 @@ Próximos refinamentos desejáveis dentro desta frente:
 - histórico de marcador mais rico, quando a UI expuser mais metadados
 - melhoria incremental da sugestão de texto
 - manutenção segura de marcador existente sem remover/recriar desnecessariamente
+
+## Acompanhamento Especial — Diretriz de Produto
+
+Decisão operacional atual:
+
+- acompanhamento especial é específico da unidade atual
+- ele pode ser usado como etapa anterior à conclusão para "arquivar" processos sem perder rastreabilidade operacional
+- a permissão de acompanhar é derivada da visibilidade do processo na caixa da unidade atual, em `recebidos` ou `gerados`
+- a origem do processo ou falha de leitura contextual não bloqueia acompanhamento quando o processo está visível na unidade
+
+Primeira leva implementada:
+
+- `tracking-group-catalog`
+- `tracking-group-create-preview`
+- `tracking-group-create-confirm`
+- `process-watch-read`
+- `process-watch-preview`
+- `process-watch-confirm`
+- `process-archive-preview`
+- `process-archive-confirm`
+
+Regra de uso:
+
+- usar `tracking-group-catalog` para resolver grupo por ID ou nome
+- criar grupo ausente com `tracking-group-create-preview/confirm`
+- usar `process-watch-preview` para mostrar processo, grupo, observação, estado atual e se a mutação será `add` ou `update`
+- usar `process-watch-confirm --confirm` para aplicar e reler a lista de acompanhamento especial
+- só considerar pronto para conclusão quando a verificação indicar `tracked=true`
+- para concluir depois de acompanhar, seguir com `process-conclude-preview/confirm`
+- quando a intenção do usuário for "arquivar", preferir `process-archive-preview/confirm`
+
+### Arquivamento seguro
+
+`process-archive-preview/confirm` encadeia acompanhamento especial e conclusão do processo na unidade atual.
+
+Comportamento:
+
+- resolve o processo pela caixa da unidade atual
+- verifica se ele já está em acompanhamento especial nessa unidade
+- se já estiver acompanhado, pula a etapa de acompanhamento e prepara a conclusão
+- se não estiver acompanhado, exige `--group/--grupo` para resolver o grupo de acompanhamento
+- aplica o acompanhamento especial antes de concluir
+- só conclui depois de `process-watch-confirm` retornar verificação positiva
+
+Exemplo:
+
+```bash
+sei process-archive-preview 08810254.000138/2026-88 --group "Concluídos" --json
+sei process-archive-confirm 08810254.000138/2026-88 --group "Concluídos" --confirm --json
+```
 
 ### Riscos a tratar desde o inicio
 
@@ -528,7 +628,9 @@ Esta frente agora passa a ter uma camada canônica inicial focada no fluxo por p
 ### Regra de uso nesta fase
 
 - usar apenas processos de teste para validação real
-- a sugestão de texto do marcador é derivada de `process-summary`
+- a permissão de marcar é derivada da visibilidade do processo na caixa da unidade atual
+- a sugestão de texto do marcador tenta usar `process-summary --mode contextual`, mas falha de leitura
+  não bloqueia `process-marker-set-*` quando o processo está visível em `recebidos` ou `gerados`
 - a canônica atual cobre o fluxo dentro do processo específico
 
 ### Segunda fase planejada
@@ -581,6 +683,17 @@ Existem dois fluxos distintos e eles nao devem ser misturados:
 - o documento e colocado em bloco de assinatura
 - o bloco e disponibilizado para a outra unidade
 - a assinatura deve ocorrer na unidade destinataria, pelo fluxo `signature-block-sign-*`
+- a pos-checagem deve considerar sucesso quando o documento selecionado deixa
+  de estar `can_sign=true` para o usuario atual
+- `assinado=false` no bloco nao significa, sozinho, falha da assinatura atual:
+  pode indicar que ainda ha outro assinante pendente no mesmo documento
+- em `signature-block-review`, `raw_can_sign` preserva o sinal bruto da tela do
+  SEI; `can_sign` e `can_sign_for_current_user` representam a possibilidade
+  efetiva de assinatura pelo usuario atual
+- se o submit retorna erro legado de releitura como "documentos permanecem
+  pendentes", confrontar com `signature-block-review`; se o documento selecionado
+  nao aparece mais em `signable_document_ids`, a assinatura deve ser considerada
+  aplicada
 
 2. Assinatura local da unidade geradora
 
@@ -958,6 +1071,28 @@ Comportamento esperado:
   - documento nao assinado fora da unidade acessivel
   - processo/documento privado ou restrito
   - processo/documento sigiloso
+- Se o processo esta visivel na caixa atual e a arvore atual oferece URL
+  contextual (`arvore_url`/`src_url`, inclusive com `infra_unidade_atual`) para
+  o documento, `document-read` e `process-read` devem usar essa URL antes de
+  tentar trocar para a unidade autora/origem.
+- A unidade autora do documento nao deve ser tratada como autoridade primaria
+  de acesso quando o documento ja esta visualizavel no contexto atual.
+- Troca automatica de unidade so deve ocorrer como fallback quando a arvore
+  atual nao trouxer URL visualizavel para os documentos.
+- Quando a arvore expuser `UNIDADE_GERADORA`, a unidade autora deve ser
+  preservada como metadado (`origin_unit`/`origin_description`) para melhorar
+  selecao contextual, sem virar bloqueio de acesso.
+- Em modo `contextual`, a selecao padrao deve combinar:
+  - documentos iniciais, que normalmente explicam o pedido/contexto original
+  - documentos CBM, que normalmente indicam providencia institucional atual
+  - documentos finais apenas como fallback quando nao houver sinal institucional
+- Em processos recebidos por encaminhamento, documentos de unidade autora podem
+  aparecer como `about:blank`. Isso nao deve bloquear `document-create-*` nem
+  `document-edit-*` quando a arvore atual tambem expuser acao da unidade atual,
+  como incluir documento.
+- Para editar documento em processo encaminhado, a busca do editor deve expandir
+  pastas lazy-loaded e, se necessario, reconstruir `arvore_visualizar` com
+  `infra_unidade_atual` e `infra_hash` da sessao atual antes de declarar falha.
 - a resposta JSON deve marcar leitura parcial de forma explicita
 - a operacao nao deve mascarar o problema como erro generico de parser
 

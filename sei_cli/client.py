@@ -2009,7 +2009,7 @@ class SEIClient:
         "CMDO CIA JC/1GBM": "110010413",
         "SEC CIA JC/1GBM": "110010414",
         "OP CIA JC/1GBM": "110010415",
-        "PAD-PDF": "110003697",
+        "PAD-PDF": "110006929",
         # === DAT (Atividades Técnicas) ===
         "DAT-1CAT": "110005347",
         "DAT-1CAT CHEFIA": "110007609",
@@ -5593,7 +5593,7 @@ class SEIClient:
         has_blank_docs = bool(
             re.search(r'"about:blank","ifrConteudoVisualizacao"', arvore_html)
         )
-        if has_blank_docs:
+        if has_blank_docs and not self._tree_has_current_unit_process_action(arvore_html):
             # Extract the unit sigla from UNIDADE_GERADORA actions (last param)
             ug_siglas = re.findall(
                 r'new infraArvoreAcao\("UNIDADE_GERADORA"[^)]*,"([^"]+)"\)',
@@ -5604,6 +5604,27 @@ class SEIClient:
                 return ug_siglas[0].strip()
 
         return None
+
+    def _tree_has_current_unit_process_action(self, arvore_html: str) -> bool:
+        """Return True when the current tree exposes process actions in this unit.
+
+        Forwarded processes may contain foreign ``about:blank`` documents while
+        still allowing the receiving unit to include/edit its own documents.
+        These action tokens are a stronger authority signal than document
+        origin-unit metadata.
+        """
+        return any(
+            token in arvore_html
+            for token in (
+                "linkIncluirDocumento",
+                "documento_escolher_tipo",
+                "documento_incluir.svg",
+                "linkAlterarProcesso",
+                "procedimento_alterar",
+                "andamento_marcador_gerenciar",
+                "procedimento_enviar",
+            )
+        )
 
     def _detect_document_units(self, arvore_html: str) -> dict[str, str]:
         """Map document IDs to their origin unit siglas.
@@ -5729,15 +5750,39 @@ class SEIClient:
     def _is_process_inaccessible(self, arvore_html: str) -> bool:
         """Check if documents in the arvore are inaccessible (about:blank URLs).
 
-        Returns True if ANY document has about:blank URL, indicating the
-        current unit can't view the documents.
+        Returns True only when document nodes exist and none exposes a
+        contextual tree/view URL or process action for the current unit.
+        Received processes can legitimately contain documents from other origin
+        units; origin-unit metadata must not block reading or writing when the
+        current tree already proves the current unit can act.
         """
-        return bool(
-            re.search(
-                r'new infraArvoreNo\("DOCUMENTO",[^)]*"about:blank"',
+        if self._tree_has_current_unit_process_action(arvore_html):
+            return False
+
+        document_nodes = list(
+            re.finditer(
+                r'new\s+infraArvoreNo\("DOCUMENTO",(.+?)\);?',
                 arvore_html,
             )
         )
+        if not document_nodes:
+            return False
+
+        has_blank_doc = False
+        for match in document_nodes:
+            params = re.findall(r'"([^"]*)"', match.group(1))
+            if len(params) < 3:
+                continue
+            arvore_url = params[2].strip()
+            if arvore_url and arvore_url.casefold() != "about:blank":
+                return False
+            has_blank_doc = True
+
+        src_urls = re.findall(r"Nos\[\d+\]\.src\s*=\s*'([^']*)'", arvore_html)
+        if any(src.strip() and src.strip().casefold() != "about:blank" for src in src_urls):
+            return False
+
+        return has_blank_doc
 
     @contextlib.contextmanager
     def _auto_unit_switch(
@@ -5797,10 +5842,14 @@ class SEIClient:
 
         # Check access and switch
         if not self._can_switch_to(required):
-            raise RuntimeError(
-                f"Processo requer unidade '{required}' mas você não tem acesso. "
-                f"Unidades disponíveis: {', '.join(u.sigla for u in self.list_units())}"
-            )
+            explicit_restriction = self._detect_unit_restriction(arvore_html)
+            if explicit_restriction and not self._tree_has_current_unit_process_action(arvore_html):
+                raise RuntimeError(
+                    f"Processo requer unidade '{required}' mas você não tem acesso. "
+                    f"Unidades disponíveis: {', '.join(u.sigla for u in self.list_units())}"
+                )
+            yield None
+            return
 
         self.switch_unit(required)
         try:
@@ -5944,6 +5993,46 @@ class SEIClient:
         self._control_html = None
         return None
 
+    def _build_arvore_visualizar_url(
+        self,
+        id_documento: str,
+        id_procedimento: str,
+    ) -> str | None:
+        """Build an ``arvore_visualizar`` URL using the current unit context.
+
+        In forwarded processes, the tree returned by the SEI may include
+        ``about:blank`` for documents owned by the receiving/current unit when
+        the frame was rendered with another unit's context. Re-navigating to the
+        process page lets us reuse the current session's ``infra_unidade_atual``
+        and ``infra_hash`` to select the document directly.
+        """
+        url = self._sei_url(
+            f"controlador.php?acao=procedimento_trabalhar"
+            f"&id_procedimento={id_procedimento}"
+        )
+        response = self._get(url)
+        soup = BeautifulSoup(response.text, "lxml")
+        iframe = soup.find("iframe", {"name": "ifrArvore"})
+        if not iframe or not iframe.get("src"):
+            return None
+
+        arvore_src = str(iframe["src"]).replace("&amp;", "&")
+        unit_match = re.search(r"[?&]infra_unidade_atual=(\d+)", arvore_src)
+        hash_match = re.search(r"[?&]infra_hash=([A-Za-z0-9]+)", arvore_src)
+        if not unit_match or not hash_match:
+            return None
+
+        return urljoin(
+            self._sei_url(""),
+            "controlador.php?acao=arvore_visualizar"
+            "&acao_origem=arvore_inicializar"
+            f"&id_procedimento={id_procedimento}"
+            f"&id_documento={id_documento}"
+            "&infra_sistema=100000100"
+            f"&infra_unidade_atual={unit_match.group(1)}"
+            f"&infra_hash={hash_match.group(1)}",
+        )
+
     def _get_editor_url(
         self, id_documento: str, id_procedimento: str
     ) -> str | None:
@@ -5968,9 +6057,19 @@ class SEIClient:
             )
             doc_match = doc_pattern.search(arvore_html)
             if not doc_match:
-                return None
-
-            doc_url = urljoin(self._sei_url(""), doc_match.group())
+                all_docs = self.get_full_document_tree(id_procedimento, expand_all=True)
+                tree_doc = next(
+                    (doc for doc in all_docs if doc.id_documento == id_documento),
+                    None,
+                )
+                if tree_doc and tree_doc.arvore_url and tree_doc.arvore_url.casefold() != "about:blank":
+                    doc_url = tree_doc.arvore_url
+                else:
+                    doc_url = self._build_arvore_visualizar_url(id_documento, id_procedimento)
+                    if not doc_url:
+                        return None
+            else:
+                doc_url = urljoin(self._sei_url(""), doc_match.group().replace("&amp;", "&"))
             rd = self._get(doc_url)
 
             # Extract linkEditarConteudo
@@ -6817,10 +6916,10 @@ class SEIClient:
             )
             if ref
         }
-        still_pending = [
+        still_signable = [
             doc
             for doc in verification_docs
-            if not doc.assinado
+            if doc.can_sign
             and any(
                 ref and ref in {
                     doc.documento_id or "",
@@ -6830,7 +6929,15 @@ class SEIClient:
                 for ref in selected_refs
             )
         ]
-        if not still_pending:
+        result["post_verification"] = {
+            "selected_refs": sorted(selected_refs),
+            "remaining_signable_refs": [
+                doc.documento_id or doc.numero_sei or doc.numero_documento
+                for doc in still_signable
+            ],
+            "method": "block_documents_can_sign",
+        }
+        if not still_signable:
             result["errors"] = []
             for entry in selected_entries:
                 doc_ref = (
@@ -6841,7 +6948,7 @@ class SEIClient:
                 if doc_ref and doc_ref not in result["signed"]:
                     result["signed"].append(str(doc_ref))
         elif not result.get("already_signed"):
-            result["errors"].append("Documentos permanecem pendentes após releitura do bloco.")
+            result["errors"].append("Documentos permanecem assináveis após releitura do bloco.")
         return result
 
     def _execute_sign(self, sign_url: str, doc_id: str) -> dict:

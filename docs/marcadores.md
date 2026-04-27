@@ -16,10 +16,20 @@
 3. Parsear tabela de marcadores (id, nome, descricao e cor por icone SVG).
 
 ### Definir marcador no processo
-1. Abrir pagina do processo (`procedimento_trabalhar`).
-2. Encontrar acao `andamento_marcador_gerenciar` (fallback: `..._cadastrar`).
-3. Parsear formulario de marcador.
-4. POST com `marcador_id` e texto opcional.
+1. Confirmar que o processo aparece na caixa da unidade atual (`recebidos` ou `gerados`).
+2. Abrir pagina/gerenciamento do processo visivel na unidade atual.
+3. Encontrar acao `andamento_marcador_gerenciar` (fallback: `..._cadastrar`).
+4. Parsear formulario de marcador.
+5. POST com `marcador_id` e texto opcional.
+
+Regra canonica:
+
+- marcador e por ambiente/unidade
+- processo visivel na caixa da unidade atual pode ser marcado ali, mesmo que tenha sido criado em outra unidade
+- o mesmo processo pode ter marcadores diferentes em unidades diferentes
+- falha de `process-read` nao bloqueia marcacao; ela so reduz a qualidade da classificacao/sugestao de texto
+- a investigacao padrao para sugestao de texto e `contextual`; usar `fast` so por escolha explicita ou fallback, e `deep`/`all` so quando o usuario pedir aprofundamento
+- no modo `contextual`, processos grandes com varias unidades devem preservar os documentos iniciais e priorizar documentos CBM quando a arvore indicar `UNIDADE_GERADORA`
 
 ### Remover marcador
 1. Abrir processo.

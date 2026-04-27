@@ -29,6 +29,25 @@ NosAcoes[0] = new infraArvoreAcao("GERAR_PDF","GP","48568435","controlador.php?a
 </script>
 '''
 
+ARVORE_MIXED_CONTEXTUAL = '''
+<script>
+Nos[0] = new infraArvoreNo("PROCESSO","99999",null,"controlador.php?acao=arvore_visualizar&id_procedimento=99999&infra_unidade_atual=110008367","ifrVisualizacao","proc","tipo","svg","svg","svg",true,true,null,null,null,"proc");
+Nos[1] = new infraArvoreNo("DOCUMENTO","111","99999","controlador.php?acao=arvore_visualizar&id_documento=111&id_procedimento=99999&infra_unidade_atual=110008367","ifrConteudoVisualizacao","Doc acessível","Doc acessível","svg/documento_interno.svg","svg","svg",true,false,null,null,null,"111");
+Nos[1].src = 'controlador.php?acao=documento_visualizar&id_documento=111&id_procedimento=99999&infra_unidade_atual=110008367';
+Nos[2] = new infraArvoreNo("DOCUMENTO","222","99999","about:blank","ifrConteudoVisualizacao","Doc de outra unidade","Doc de outra unidade","svg/documento_interno.svg","svg","svg",true,false,null,null,null,"222");
+NosAcoes[0] = new infraArvoreAcao("UNIDADE_GERADORA","UG222","222","#",null,"UNIDADE AUTORA",null,true,"CBM - UNIDADE AUTORA");
+</script>
+'''
+
+ARVORE_FORWARDED_CAN_CREATE = '''
+<script>
+Nos[0] = new infraArvoreNo("PROCESSO","99999",null,"controlador.php?acao=arvore_visualizar&id_procedimento=99999","ifrVisualizacao","proc","tipo","svg","svg","svg",true,true,null,null,null,"proc");
+Nos[1] = new infraArvoreNo("DOCUMENTO","111","99999","about:blank","ifrConteudoVisualizacao","Doc CACF","Doc CACF","svg/documento_interno.svg","svg","svg",true,false,null,null,null,"111");
+NosAcoes[0] = new infraArvoreAcao("UNIDADE_GERADORA","UG111","111","#",null,"UNIDADE AUTORA",null,true,"CBM - CACF");
+</script>
+<a href="controlador.php?acao=documento_escolher_tipo&id_procedimento=99999"><img src="svg/documento_incluir.svg?18" title="Incluir Documento" /></a>
+'''
+
 ARVORE_MULTI_UNIT = '''
 <script>
 Nos[0] = new infraArvoreNo("PROCESSO","99999",null,"controlador.php?acao=arvore_visualizar","ifrVisualizacao","proc","tipo","svg","svg","svg",true,true,null,null,null,"proc");
@@ -56,6 +75,10 @@ class TestDetectUnitRestriction:
     def test_detects_from_multi_unit_process(self):
         result = self.client._detect_unit_restriction(ARVORE_MULTI_UNIT)
         assert result == "CBM - DAT - 1º CAT (MOSSORÓ)"
+
+    def test_forwarded_process_with_create_action_is_not_restricted_by_origin_unit(self):
+        result = self.client._detect_unit_restriction(ARVORE_FORWARDED_CAN_CREATE)
+        assert result is None
 
 
 class TestDetectDocumentUnits:
@@ -89,6 +112,20 @@ class TestAutoUnitSwitch:
     def test_no_switch_when_unrestricted(self, mock_status):
         """Should yield None without calling switch_unit."""
         with self.client._auto_unit_switch(ARVORE_UNRESTRICTED) as switched:
+            assert switched is None
+        mock_status.assert_not_called()
+
+    @patch.object(SEIClient, 'status')
+    def test_no_switch_when_current_tree_has_contextual_document_url(self, mock_status):
+        """A received mixed process must prefer contextual tree URLs."""
+        with self.client._auto_unit_switch(ARVORE_MIXED_CONTEXTUAL) as switched:
+            assert switched is None
+        mock_status.assert_not_called()
+
+    @patch.object(SEIClient, 'status')
+    def test_no_switch_when_forwarded_process_can_create_in_current_unit(self, mock_status):
+        """Foreign about:blank documents should not block current-unit actions."""
+        with self.client._auto_unit_switch(ARVORE_FORWARDED_CAN_CREATE) as switched:
             assert switched is None
         mock_status.assert_not_called()
 
@@ -356,3 +393,9 @@ class TestIsProcessInaccessible:
 
     def test_accessible_process(self):
         assert self.client._is_process_inaccessible(ARVORE_UNRESTRICTED) is False
+
+    def test_mixed_process_with_contextual_url_is_accessible(self):
+        assert self.client._is_process_inaccessible(ARVORE_MIXED_CONTEXTUAL) is False
+
+    def test_forwarded_process_with_create_action_is_accessible(self):
+        assert self.client._is_process_inaccessible(ARVORE_FORWARDED_CAN_CREATE) is False

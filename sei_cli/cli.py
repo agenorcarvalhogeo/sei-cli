@@ -26,6 +26,8 @@ from sei_cli.operations import (
     environment_triage_preview as op_environment_triage_preview,
     inbox_snapshot as op_inbox_snapshot,
     marker_catalog as op_marker_catalog,
+    process_archive_confirm as op_process_archive_confirm,
+    process_archive_preview as op_process_archive_preview,
     process_create_confirm as op_process_create_confirm,
     process_create_preview as op_process_create_preview,
     process_conclude_confirm as op_process_conclude_confirm,
@@ -47,6 +49,9 @@ from sei_cli.operations import (
     process_marker_set_preview as op_process_marker_set_preview,
     process_marker_update_confirm as op_process_marker_update_confirm,
     process_marker_update_preview as op_process_marker_update_preview,
+    process_watch_confirm as op_process_watch_confirm,
+    process_watch_preview as op_process_watch_preview,
+    process_watch_read as op_process_watch_read,
     process_open as op_process_open,
     process_read as op_process_read,
     process_report as op_process_report,
@@ -63,6 +68,9 @@ from sei_cli.operations import (
     signature_block_sign_confirm as op_signature_block_sign_confirm,
     signature_block_sign_preview as op_signature_block_sign_preview,
     signature_block_review as op_signature_block_review,
+    tracking_group_catalog as op_tracking_group_catalog,
+    tracking_group_create_confirm as op_tracking_group_create_confirm,
+    tracking_group_create_preview as op_tracking_group_create_preview,
     workflow_next as op_workflow_next,
     workflow_show as op_workflow_show,
 )
@@ -1634,7 +1642,7 @@ def document_read_cmd(numero_ou_id: str, process_id: str | None, as_json: bool) 
 
 @cli.command("process-read")
 @click.argument("numero_ou_id")
-@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--mode", default="contextual", show_default=True, type=click.Choice(["fast", "contextual", "summary", "deep", "all"]))
 @click.option("--date-from", default=None, help="Filtrar documentos a partir desta data")
 @click.option("--date-to", default=None, help="Filtrar documentos até esta data")
 @click.option("--sample-size", default=3, show_default=True, type=int)
@@ -1661,7 +1669,7 @@ def process_read_cmd(
 
 @cli.command("process-summary")
 @click.argument("numero_ou_id")
-@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--mode", default="contextual", show_default=True, type=click.Choice(["fast", "contextual", "summary", "deep", "all"]))
 @click.option("--date-from", default=None)
 @click.option("--date-to", default=None)
 @click.option("--sample-size", default=3, show_default=True, type=int)
@@ -1698,7 +1706,7 @@ def marker_catalog_cmd(as_json: bool) -> None:
 @click.argument("numero_ou_id")
 @click.option("--marker", default=None, help="ID ou nome do marcador")
 @click.option("--texto", "--text", "texto", default=None, help="Texto sugerido explícito para o marcador")
-@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--mode", default="contextual", show_default=True, type=click.Choice(["fast", "contextual", "summary", "deep", "all"]))
 @click.option("--date-from", default=None)
 @click.option("--date-to", default=None)
 @click.option("--sample-size", default=3, show_default=True, type=int)
@@ -1750,7 +1758,7 @@ def process_marker_history_cmd(numero_ou_id: str, marker: str | None, as_json: b
 @click.argument("numero_ou_id")
 @click.option("--marker", required=True, help="ID ou nome do marcador")
 @click.option("--texto", "--text", "texto", default=None, help="Texto do marcador")
-@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--mode", default="contextual", show_default=True, type=click.Choice(["fast", "contextual", "summary", "deep", "all"]))
 @click.option("--date-from", default=None)
 @click.option("--date-to", default=None)
 @click.option("--sample-size", default=3, show_default=True, type=int)
@@ -1783,7 +1791,7 @@ def process_marker_set_preview_cmd(
 @click.argument("numero_ou_id")
 @click.option("--marker", required=True, help="ID ou nome do marcador")
 @click.option("--texto", "--text", "texto", default=None, help="Texto do marcador")
-@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--mode", default="contextual", show_default=True, type=click.Choice(["fast", "contextual", "summary", "deep", "all"]))
 @click.option("--date-from", default=None)
 @click.option("--date-to", default=None)
 @click.option("--sample-size", default=3, show_default=True, type=int)
@@ -1876,9 +1884,148 @@ def process_marker_update_confirm_cmd(
     _emit_operation_result(result, as_json)
 
 
+@cli.command("tracking-group-catalog")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def tracking_group_catalog_cmd(as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_tracking_group_catalog(client)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("tracking-group-create-preview")
+@click.argument("nome")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def tracking_group_create_preview_cmd(nome: str, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_tracking_group_create_preview(client, nome)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("tracking-group-create-confirm")
+@click.argument("nome")
+@click.option("--confirm", is_flag=True, help="Confirma a criação do grupo")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def tracking_group_create_confirm_cmd(nome: str, confirm: bool, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_tracking_group_create_confirm(client, nome, confirm=confirm)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-watch-read")
+@click.argument("numero_ou_id")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_watch_read_cmd(numero_ou_id: str, as_json: bool) -> None:
+    with SEIClient() as client:
+        result = op_process_watch_read(client, numero_ou_id)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-watch-preview")
+@click.argument("numero_ou_id")
+@click.option("--group", "--grupo", "group", required=True, help="ID ou nome do grupo de acompanhamento")
+@click.option("--obs", "--observacao", "observacao", default=None, help="Observação do acompanhamento")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_watch_preview_cmd(
+    numero_ou_id: str,
+    group: str,
+    observacao: str | None,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_watch_preview(client, numero_ou_id, group=group, observacao=observacao)
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-watch-confirm")
+@click.argument("numero_ou_id")
+@click.option("--group", "--grupo", "group", required=True, help="ID ou nome do grupo de acompanhamento")
+@click.option("--obs", "--observacao", "observacao", default=None, help="Observação do acompanhamento")
+@click.option("--confirm", is_flag=True, help="Confirma o acompanhamento especial")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_watch_confirm_cmd(
+    numero_ou_id: str,
+    group: str,
+    observacao: str | None,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_watch_confirm(
+            client,
+            numero_ou_id,
+            group=group,
+            observacao=observacao,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-archive-preview")
+@click.argument("numero_ou_id")
+@click.option("--group", "--grupo", "group", default=None, help="ID ou nome do grupo de acompanhamento")
+@click.option("--obs", "--observacao", "observacao", default=None, help="Observação do acompanhamento")
+@click.option("--reabrir-em", default=None, help="Data para reabrir automaticamente")
+@click.option("--reabrir-dias", default=None, help="Prazo em dias para reabrir automaticamente")
+@click.option("--reabrir-dias-uteis", is_flag=True, help="Usa dias uteis para reabertura programada")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_archive_preview_cmd(
+    numero_ou_id: str,
+    group: str | None,
+    observacao: str | None,
+    reabrir_em: str | None,
+    reabrir_dias: str | None,
+    reabrir_dias_uteis: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_archive_preview(
+            client,
+            numero_ou_id,
+            group=group,
+            observacao=observacao,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+        )
+    _emit_operation_result(result, as_json)
+
+
+@cli.command("process-archive-confirm")
+@click.argument("numero_ou_id")
+@click.option("--group", "--grupo", "group", default=None, help="ID ou nome do grupo de acompanhamento")
+@click.option("--obs", "--observacao", "observacao", default=None, help="Observação do acompanhamento")
+@click.option("--reabrir-em", default=None, help="Data para reabrir automaticamente")
+@click.option("--reabrir-dias", default=None, help="Prazo em dias para reabrir automaticamente")
+@click.option("--reabrir-dias-uteis", is_flag=True, help="Usa dias uteis para reabertura programada")
+@click.option("--confirm", is_flag=True, help="Confirma o acompanhamento e a conclusão")
+@click.option("--json", "as_json", is_flag=True, help="Saída JSON")
+def process_archive_confirm_cmd(
+    numero_ou_id: str,
+    group: str | None,
+    observacao: str | None,
+    reabrir_em: str | None,
+    reabrir_dias: str | None,
+    reabrir_dias_uteis: bool,
+    confirm: bool,
+    as_json: bool,
+) -> None:
+    with SEIClient() as client:
+        result = op_process_archive_confirm(
+            client,
+            numero_ou_id,
+            group=group,
+            observacao=observacao,
+            reabrir_em=reabrir_em,
+            reabrir_dias=reabrir_dias,
+            reabrir_dias_uteis=reabrir_dias_uteis,
+            confirm=confirm,
+        )
+    _emit_operation_result(result, as_json)
+
+
 @cli.command("process-report")
 @click.argument("numero_ou_id")
-@click.option("--mode", default="summary", show_default=True, type=click.Choice(["summary", "all"]))
+@click.option("--mode", default="contextual", show_default=True, type=click.Choice(["fast", "contextual", "summary", "deep", "all"]))
 @click.option("--date-from", default=None)
 @click.option("--date-to", default=None)
 @click.option("--sample-size", default=3, show_default=True, type=int)
@@ -1989,8 +2136,8 @@ def process_create_confirm_cmd(
 @click.argument("tipo_documento")
 @click.option("--descricao", default="")
 @click.option("--interessados", default="")
-@click.option("--texto-inicial", default="N")
-@click.option("--documento-modelo", default="", help="Número SEI de documento existente para usar como modelo")
+@click.option("--texto-inicial", default="N", help="Modo do texto inicial: N=Nenhum, T=Texto Padrão cadastrado no SEI, D=Documento Modelo. Não é o corpo do documento.")
+@click.option("--documento-modelo", default="", help="Número SEI de documento existente para copiar como Documento Modelo; força texto inicial D.")
 @click.option("--nivel", "nivel_acesso", default="inherit")
 @click.option("--motivo-acesso", default="")
 @click.option("--hipotese-acesso", default="")
@@ -2031,8 +2178,8 @@ def document_create_preview_cmd(
 @click.argument("tipo_documento")
 @click.option("--descricao", default="")
 @click.option("--interessados", default="")
-@click.option("--texto-inicial", default="N")
-@click.option("--documento-modelo", default="", help="Número SEI de documento existente para usar como modelo")
+@click.option("--texto-inicial", default="N", help="Modo do texto inicial: N=Nenhum, T=Texto Padrão cadastrado no SEI, D=Documento Modelo. Não é o corpo do documento.")
+@click.option("--documento-modelo", default="", help="Número SEI de documento existente para copiar como Documento Modelo; força texto inicial D.")
 @click.option("--nivel", "nivel_acesso", default="inherit")
 @click.option("--motivo-acesso", default="")
 @click.option("--hipotese-acesso", default="")

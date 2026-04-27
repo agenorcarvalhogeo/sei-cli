@@ -116,6 +116,18 @@ A canônica `document-create-*` agora aceita `--documento-modelo <numero_sei>`:
 - `hdnIdDocumentoTextoBase` permanece vazio no fluxo por número digitado
 - `document-edit-preview` evita cabeçalho, metadados e rodapé em documentos multi-seção
 
+Semântica dos modos de texto inicial:
+
+- `N` = Nenhum
+- `T` = Texto Padrão cadastrado no SEI
+- `D` = Documento Modelo
+
+`--texto-inicial` não recebe o corpo do documento nem número SEI de modelo.
+Para copiar conteúdo de um documento SEI existente, usar
+`--documento-modelo <numero_sei>`; a canônica força `D` automaticamente. Para
+redigir corpo novo, criar com `N` e editar depois com `document-edit-confirm
+--text/--content`.
+
 No teste real de Encaminhamento, a seção correta de corpo foi `1062`; as seções `1059`, `1060`, `1061` e `1064` correspondiam a timbre/título/metadados/rodapé.
 
 ### Matriz real de seção editável por tipo

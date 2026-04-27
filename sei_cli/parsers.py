@@ -349,6 +349,14 @@ def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument
 
     docs: list[TreeDocument] = []
     signature_map = parse_tree_signatures(content)
+    origin_map: dict[str, tuple[str | None, str | None]] = {}
+    for match in re.finditer(
+        r'new\s+infraArvoreAcao\("UNIDADE_GERADORA",'
+        r'"UG(\d+)","(\d+)","[^"]*",[^,]*,"([^"]*)",[^,]*,[^,]*,"([^"]*)"\)',
+        content,
+    ):
+        _ug_id, doc_id, description, unit = match.groups()
+        origin_map[doc_id] = (unit or None, description or None)
     lines = content.split('\n')
 
     # Parse all Nos[N] definitions and their .src/.html assignments
@@ -437,6 +445,7 @@ def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument
         assinaturas = signature_map.get(node.get('id', ''), [])
         assinado = any(sig.kind == 'assinatura' for sig in assinaturas)
         autenticado = any(sig.kind == 'autenticacao' for sig in assinaturas)
+        origin_unit, origin_description = origin_map.get(node.get('id', ''), (None, None))
 
         docs.append(TreeDocument(
             id_documento=node.get('id', ''),
@@ -447,6 +456,8 @@ def parse_expanded_folder(content: str, base_url: str = '') -> list[TreeDocument
             src_url=urljoin(base_url, node['src_url']) if node.get('src_url') else None,
             html_content=node.get('html_content'),
             sei_number=sei_number,
+            origin_unit=origin_unit,
+            origin_description=origin_description,
             assinado=assinado,
             autenticado=autenticado,
             assinaturas=assinaturas,

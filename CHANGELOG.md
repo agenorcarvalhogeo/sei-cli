@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.6.1 — Acompanhamento especial e arquivamento seguro
+
+### Acompanhamento especial
+
+- Adiciona canônicas `tracking-group-catalog`, `tracking-group-create-preview/confirm`, `process-watch-read` e `process-watch-preview/confirm`.
+- Acompanhamento especial passa a seguir a mesma regra operacional dos marcadores: a fonte de verdade é a caixa da unidade atual.
+- Processos visíveis em `recebidos` ou `gerados` podem ser colocados em acompanhamento especial naquela unidade, independentemente da unidade de origem.
+- `process-watch-confirm` relê a lista de acompanhamentos especiais e só confirma sucesso quando o processo aparece como acompanhado.
+- O fluxo fica preparado para uso antes de `process-conclude-*`, permitindo concluir processos sem perder o controle local na unidade.
+- Adiciona `process-archive-preview/confirm` para verificar acompanhamento especial, aplicar quando faltar e concluir o processo na unidade atual em uma sequência canônica.
+
+### Marcadores
+
+- Ajusta a canônica `process-marker-*` para usar a caixa da unidade atual como fonte de verdade.
+- Processos visíveis em `recebidos` ou `gerados` podem ser marcados naquela unidade, mesmo quando `process-read` falha ou aponta restrição de leitura em outra unidade.
+- `process-read`/`process-summary` passam a ser enriquecimento best-effort para classificação e sugestão de texto, sem bloquear `process-marker-set-*`.
+- A modalidade padrão de investigação para marcadores passa a ser `contextual`; `fast` e `deep`/`all` ficam como escolha explícita ou fallback operacional.
+- O contrato passa a expor `marker_authority`, indicando que a decisão veio da lista de processos da unidade atual.
+
+### Leitura contextual
+
+- Corrige a decisão de troca automática de unidade em `process-read`, `process-summary` e `document-read`.
+- Quando a árvore do processo visível na unidade atual traz URL contextual válida para o documento, a leitura usa essa URL e não bloqueia pela unidade autora/origem do documento.
+- A troca para unidade autora fica reservada para casos em que a árvore atual não oferece URL visualizável para os documentos.
+- A árvore passa a preservar `origin_unit` e `origin_description` dos documentos quando o SEI expõe `UNIDADE_GERADORA`.
+- A seleção `contextual` passa a priorizar os primeiros documentos do processo e, no restante da amostra, documentos com origem/assinatura CBM; os últimos documentos continuam como fallback quando não houver sinal CBM.
+
+### Documentos em processos encaminhados
+
+- Ajusta a canônica para não tratar documentos `about:blank` de unidade autora como bloqueio quando a árvore atual expõe ação da unidade recebedora, como incluir documento.
+- `document-create-*` pode seguir na unidade atual em processo recebido, deixando o próprio SEI rejeitar apenas se a ação realmente não existir.
+- `_get_editor_url()` passa a expandir pastas lazy-loaded antes de falhar e tenta reconstruir `arvore_visualizar` com `infra_unidade_atual`/`infra_hash` atuais quando o documento aparece como `about:blank`.
+- Documenta explicitamente que `--texto-inicial` aceita apenas `N/T/D`: `T` é Texto Padrão do SEI, enquanto cópia de documento existente deve usar `--documento-modelo <numero_sei>` e portanto `D`.
+- Validação real no SEI: processo encaminhado `08810196.000046/2026-30`, documento criado `49382032` / SEI `40929963`, editado na seção `220` pela unidade `CMDO PABM APODI` sem troca para unidade autora.
+
+### Blocos de assinatura
+
+- Ajusta a pós-checagem de `signature-block-sign-confirm`/`sign_block`: documento de bloco assinado com sucesso é validado por deixar de estar `can_sign=true` para o usuário atual, mesmo que o bloco ainda mostre `assinado=false` por haver outras assinaturas pendentes.
+- A operação deixa de abortar com o erro legado "Documentos permanecem pendentes após releitura do bloco" quando a releitura canônica confirma `remaining_signable_total=0` para os documentos selecionados.
+- `signature-block-review` passa a separar `raw_can_sign` do SEI de `can_sign`/`can_sign_for_current_user`, evitando mostrar como assinável documento que já traz assinatura do usuário atual.
+- Erros de pós-checagem ignorados com sucesso passam para `ignored_postcheck_errors` em vez de permanecerem em `sign_results[].errors`.
+
 ## 0.6.0 — Canônicas documentais e Documento Modelo
 
 ### Destaques

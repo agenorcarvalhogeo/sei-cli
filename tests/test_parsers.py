@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from sei_cli.parsers import (
+    parse_block_documents,
+    parse_blocks,
+    parse_expanded_folder,
     parse_marcador_form,
     parse_marcadores_list,
     parse_menu_links,
-    parse_block_documents,
-    parse_blocks,
     parse_processes,
     parse_system_status,
     parse_tramitar_form,
@@ -41,6 +42,22 @@ def test_parse_menu_links(controle_html: str) -> None:
     links = parse_menu_links(controle_html, BASE)
     assert "blocos_assinatura" in links
     assert "marcadores" in links
+
+
+def test_parse_expanded_folder_extracts_document_origin_unit() -> None:
+    html = '''
+    <script>
+    Nos[1] = new infraArvoreNo("DOCUMENTO","48568466","48568435","controlador.php?acao=arvore_visualizar&id_documento=48568466","ifrConteudoVisualizacao","Memorando 5 (40182408)","Memorando 5","svg/documento_interno.svg?18","svg/documento_interno.svg?18","svg/documento_interno.svg?18",true,false,null,null,"noVisitado","40182408");
+    Nos[1].src = 'controlador.php?acao=documento_visualizar&id_documento=48568466';
+    NosAcoes[1] = new infraArvoreAcao("UNIDADE_GERADORA","UG48568466","48568466","#",null,"COMANDO DO POSTO AVANÇADO BOMBEIRO MILITAR DE APODI / RN",null,true,"CBM - COBM - CMDO PABM APODI");
+    </script>
+    '''
+
+    docs = parse_expanded_folder(html, BASE)
+
+    assert len(docs) == 1
+    assert docs[0].origin_unit == "CBM - COBM - CMDO PABM APODI"
+    assert docs[0].origin_description == "COMANDO DO POSTO AVANÇADO BOMBEIRO MILITAR DE APODI / RN"
 
 
 def test_parse_tramitar_form() -> None:

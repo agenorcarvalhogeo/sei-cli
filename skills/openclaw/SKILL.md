@@ -56,6 +56,16 @@ Isso é aquecimento de contexto, não pré-requisito obrigatório para toda tare
 - `sei document-read <documento> --process-id <processo> --json`
 - `sei relatorio-read <documento> --process-id <processo> --json`
 
+Regra operacional de leitura:
+
+- Se o processo esta visivel na caixa/unidade atual e a arvore traz URL contextual valida para o documento, use a canônica de leitura nesse contexto.
+- Nao trate a unidade autora/origem do documento como bloqueio quando a URL contextual da arvore atual esta disponivel.
+- Troca para unidade autora e fallback para caso sem URL visualizavel no contexto atual, nao criterio primario.
+- Em `process-read`/`process-summary` contextual, espere que a canônica leia primeiro documentos iniciais e depois priorize documentos CBM quando a arvore trouxer `UNIDADE_GERADORA`; isso ajuda em processos grandes com varias instituicoes respondendo.
+- Se o resumo contextual mencionar uma norma, portaria conjunta ou documento-chave nao lido, aprofunde com `process-read --mode deep` ou `document-read` no documento citado.
+- Em processo encaminhado/recebido, `about:blank` em documentos da unidade autora nao bloqueia criacao/edicao se a unidade atual tem acao no processo. Use `document-create-*` normalmente na unidade recebedora.
+- Se `document-edit-preview` nao achar editor de primeira, a canônica deve expandir pastas lazy e tentar URL contextual atual antes de concluir que o editor nao existe.
+
 ### Criação e edição de rascunho
 
 - `sei process-create-preview ... --json`
@@ -63,9 +73,24 @@ Isso é aquecimento de contexto, não pré-requisito obrigatório para toda tare
 - `sei document-create-preview ... --json`
 - `sei document-create-confirm ... --confirm --json`
 - Para reutilizar conteudo existente, use `--documento-modelo <numero_sei>` em `document-create-*`; isso seleciona `Documento Modelo` (`rdoTextoInicial=D`) e preenche `txtProtocoloDocumentoTextoBase`.
+- `--texto-inicial` nao e o corpo do documento. Ele aceita apenas `N`, `T` ou `D`: `N` = nenhum, `T` = Texto Padrão cadastrado no SEI, `D` = Documento Modelo.
+- Para copiar conteudo de um documento SEI existente, nunca use `T`; use `--documento-modelo <numero_sei>`, que força `D` automaticamente.
+- Para escrever corpo novo, crie o documento com `N` e depois use `document-edit-confirm --text/--content`.
 - `sei document-edit-preview ... --json`
 - `sei document-edit-confirm ... --confirm --json`
 - `sei document-quality-check ... --json`
+
+Regra para referencias SEI no corpo HTML:
+
+- Quando citar documento ou processo SEI ja existente, use o link nativo
+  `ancora_sei`, nunca `href` externo.
+- Formato: `<span contenteditable="false" style="text-indent:0;"><a class="ancora_sei" id="lnkSei{id_interno}" style="text-indent:0;">{numero_visivel}</a></span>`.
+- Para documento, `{id_interno}` e o `id_documento`; para processo, e o
+  `id_procedimento`.
+- O texto narrativo fica fora da ancora: `Portaria-SEI ... (` + link + `)` ou
+  `Processo SEI nº ` + link.
+- Se o id interno nao estiver resolvido, deixe como texto simples e avise que a
+  referencia precisa ser vinculada antes de salvar/assinar.
 
 ### PDF nativo
 
@@ -88,6 +113,36 @@ Isso é aquecimento de contexto, não pré-requisito obrigatório para toda tare
 - `sei process-marker-remove-confirm <processo> --confirm --json`
 - `sei environment-triage-preview [--mode fast|contextual|deep] --json`
 - `sei environment-triage-parallel [--mode fast|contextual|deep] --json`
+- `sei tracking-group-catalog --json`
+- `sei tracking-group-create-preview "<nome>" --json`
+- `sei tracking-group-create-confirm "<nome>" --confirm --json`
+- `sei process-watch-read <processo> --json`
+- `sei process-watch-preview <processo> --group <nome-ou-id> --json`
+- `sei process-watch-confirm <processo> --group <nome-ou-id> --confirm --json`
+- `sei process-archive-preview <processo> [--group <nome-ou-id>] --json`
+- `sei process-archive-confirm <processo> [--group <nome-ou-id>] --confirm --json`
+
+Regra operacional para marcadores:
+
+- marcador é por ambiente/unidade
+- se o processo aparece no `inbox-snapshot` da unidade atual, em `recebidos` ou `gerados`, ele pode ser marcado naquela unidade
+- não use falha de `process-read` como bloqueio para marcar processo visível na caixa atual
+- `process-read` serve para classificar melhor o caso e sugerir texto, não para decidir a permissão de marcação
+- a modalidade padrão de investigação para resumo/texto do marcador é `contextual`
+- use `fast` quando o usuário pedir velocidade/triagem ampla ou quando o contextual falhar/demorar
+- use `deep`/`all` quando o usuário pedir aprofundamento ou quando a decisão exigir leitura integral
+- o mesmo processo pode ter marcadores diferentes em unidades diferentes
+
+Regra operacional para acompanhamento especial:
+
+- acompanhamento especial é por ambiente/unidade
+- se o processo aparece no `inbox-snapshot` da unidade atual, em `recebidos` ou `gerados`, ele pode ser colocado em acompanhamento especial naquela unidade
+- não use falha de `process-read` como bloqueio para acompanhar processo visível na caixa atual
+- o mesmo processo pode estar em acompanhamentos diferentes em unidades diferentes
+- para "arquivar" sem perder o processo, primeiro use `process-watch-preview/confirm`; só depois use `process-conclude-preview/confirm`
+- preferir `process-archive-preview/confirm` quando o usuário pedir "arquivar", pois a canônica garante a ordem: verificar acompanhamento especial, aplicar se faltar e concluir o processo na unidade
+- se o processo ainda não estiver acompanhado, `process-archive-*` precisa de `--group/--grupo`; se já estiver acompanhado, pode concluir sem grupo
+- use `tracking-group-catalog` para resolver grupo por nome/ID; se o grupo não existir, crie com `tracking-group-create-preview/confirm`
 - `sei environment-triage-apply ... --confirm --json`
 
 ### Encaminhamento, conclusão e reabertura
@@ -184,6 +239,9 @@ São fluxos diferentes.
 - **Assinatura por bloco:** usar `signature-block-sign-*` apenas na unidade destinatária do bloco disponibilizado.
 - Se o documento está no bloco e o bloco ainda expõe ação de assinar para a unidade atual, continue no fluxo `signature-block-sign-*` mesmo que já exista assinatura anterior de outro militar.
 - Não desviar para assinatura local só porque o documento já tem alguma assinatura anterior. O sinal correto é o bloco ainda estar com `can_sign=true` / `signable_document_ids` preenchido.
+- Pós-checagem correta: assinatura por bloco fechou para o usuário atual quando os documentos selecionados deixam de aparecer em `signable_document_ids`. Não exigir `assinado=true` se o documento ainda pode depender de outro assinante.
+- Se aparecer erro de releitura do tipo "documentos permanecem pendentes", rode `signature-block-review`; se `remaining_signable_total`/`signable_document_ids` zerou para os documentos selecionados, trate como assinatura aplicada.
+- Em `signature-block-review`, prefira `can_sign_for_current_user`/`signable_document_ids` para decisão operacional; `raw_can_sign` é apenas o sinal bruto da tela do SEI.
 
 Cenário de referência validado: `CMDO PABM APODI -> PAD-PDF`.
 

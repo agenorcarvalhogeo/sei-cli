@@ -130,6 +130,8 @@ def _tree_document(doc: TreeDocument) -> dict[str, Any]:
         "tipo": doc.tipo,
         "parent_folder": doc.parent_folder,
         "sei_number": doc.sei_number,
+        "origin_unit": doc.origin_unit,
+        "origin_description": doc.origin_description,
         "assinado": doc.assinado,
         "autenticado": doc.autenticado,
     }
@@ -250,6 +252,51 @@ def _find_process_metadata(client: Any, id_procedimento: str, numero_processo: s
     return None
 
 
+def _process_ref_matches(process: Process, ref: str) -> bool:
+    normalized = str(ref or "").strip()
+    if not normalized:
+        return False
+    return normalized in {
+        str(process.id_procedimento or "").strip(),
+        str(process.numero or "").strip(),
+    }
+
+
+def _resolve_visible_process_for_marker(client: Any, numero_ou_id: str) -> tuple[str, str | None, Process]:
+    """Resolve marker target from the current unit process list.
+
+    Markers are scoped to the current unit/environment. A process is markable
+    when it is visible in the current unit box, even if reading its tree or
+    documents later fails or points to another origin unit.
+    """
+    try:
+        processes = client.list_processes()
+    except Exception as exc:
+        raise ProcessNotFoundError(
+            "Não foi possível listar a caixa da unidade atual para validar marcação.",
+            details={"numero_ou_id": numero_ou_id},
+        ) from exc
+
+    visible = list(processes.recebidos) + list(processes.gerados)
+    process = next((item for item in visible if _process_ref_matches(item, numero_ou_id)), None)
+    if not process:
+        raise ProcessNotFoundError(
+            f"Processo {numero_ou_id} não aparece na caixa da unidade atual.",
+            details={
+                "numero_ou_id": numero_ou_id,
+                "rule": "Marcador é por unidade: só processos visíveis em recebidos/gerados da unidade atual podem ser marcados.",
+                "recebidos_total": len(processes.recebidos),
+                "gerados_total": len(processes.gerados),
+            },
+        )
+    if not process.id_procedimento:
+        raise ProcessNotFoundError(
+            f"Processo {numero_ou_id} está visível, mas sem id_procedimento resolvido.",
+            details={"numero_processo": process.numero, "caixa": process.caixa},
+        )
+    return process.id_procedimento, process.numero, process
+
+
 def _process_unit_preflight(client: Any, id_procedimento: str) -> tuple[dict[str, Any], contextlib.AbstractContextManager[Any]]:
     status_before = client.status()
     navigate = getattr(client, "_navigate_to_arvore", None)
@@ -362,6 +409,40 @@ def _block_document_needs_current_user_signature(doc: dict[str, Any], current_us
         if overlap and signer_normalized.split()[-1:] == current_user_normalized.split()[-1:]:
             return False
     return True
+
+
+def _block_document_current_user_signed(doc: dict[str, Any], current_user: str) -> bool:
+    current_user_normalized = _normalize_person_text(current_user)
+    if not current_user_normalized:
+        return False
+    current_tokens = {token for token in current_user_normalized.split() if len(token) > 2}
+    for signer in doc.get("assinantes", []) or []:
+        signer_normalized = _normalize_person_text(str(signer))
+        signer_tokens = {token for token in signer_normalized.split() if len(token) > 2}
+        overlap = signer_tokens & current_tokens
+        if len(overlap) >= 2:
+            return True
+        if overlap and signer_normalized.split()[-1:] == current_user_normalized.split()[-1:]:
+            return True
+    return False
+
+
+def _block_documents_for_current_user(
+    documents: list[dict[str, Any]],
+    current_user: str,
+) -> list[dict[str, Any]]:
+    normalized_documents: list[dict[str, Any]] = []
+    for doc in documents:
+        normalized = dict(doc)
+        raw_can_sign = bool(doc.get("can_sign"))
+        current_user_signed = _block_document_current_user_signed(doc, current_user)
+        can_sign_for_current_user = raw_can_sign and not current_user_signed
+        normalized["raw_can_sign"] = raw_can_sign
+        normalized["current_user_already_signed"] = current_user_signed
+        normalized["can_sign_for_current_user"] = can_sign_for_current_user
+        normalized["can_sign"] = can_sign_for_current_user
+        normalized_documents.append(normalized)
+    return normalized_documents
 
 
 def _action_context(process_actions: dict[str, str], document_actions: dict[str, str]) -> dict[str, Any]:
@@ -688,6 +769,38 @@ def _dedupe_documents(docs: list[TreeDocument]) -> list[TreeDocument]:
     return result
 
 
+def _document_unit_haystack(doc: TreeDocument) -> str:
+    signature_units = " ".join(signature.unit for signature in doc.assinaturas if signature.unit)
+    return " ".join(
+        part
+        for part in (
+            doc.origin_unit or "",
+            doc.origin_description or "",
+            signature_units,
+            doc.nome,
+            doc.parent_folder or "",
+        )
+        if part
+    )
+
+
+def _is_cbm_document(doc: TreeDocument) -> bool:
+    return bool(re.search(r"\bCBM\b|BOMBEIRO|BOMBEIROS", _document_unit_haystack(doc), re.IGNORECASE))
+
+
+def _select_contextual_documents(filtered_docs: list[TreeDocument], sample_size: int) -> tuple[list[TreeDocument], str]:
+    target_total = sample_size * 2
+    leading = filtered_docs[:sample_size]
+    remaining = filtered_docs[sample_size:]
+    cbm_recent = [doc for doc in reversed(remaining) if _is_cbm_document(doc)]
+    fallback_recent = list(reversed(remaining))
+
+    selected = _dedupe_documents(leading + cbm_recent + fallback_recent)[:target_total]
+    if any(_is_cbm_document(doc) for doc in selected[sample_size:]):
+        return selected, "contextual-first-cbm-sample"
+    return selected, "contextual-first-last-sample"
+
+
 def _select_process_documents(
     docs: list[TreeDocument],
     *,
@@ -696,10 +809,15 @@ def _select_process_documents(
     date_from: str | None,
     date_to: str | None,
 ) -> tuple[list[TreeDocument], dict[str, Any], list[str]]:
-    normalized_mode = mode.lower()
+    requested_mode = mode.lower()
+    normalized_mode = requested_mode
+    if normalized_mode in {"contextual", "fast"}:
+        normalized_mode = "summary"
+    elif normalized_mode == "deep":
+        normalized_mode = "all"
     if normalized_mode not in {"summary", "all"}:
         raise ParseError(
-            "mode deve ser 'summary' ou 'all'.",
+            "mode deve ser 'summary', 'contextual', 'fast', 'all' ou 'deep'.",
             details={"mode": mode},
         )
     if sample_size < 1:
@@ -732,12 +850,18 @@ def _select_process_documents(
     elif len(filtered_docs) <= sample_size * 2:
         selected_docs = filtered_docs
         strategy = "summary-all-documents" if not (date_from or date_to) else "summary-date-filter"
+    elif requested_mode in {"contextual", "summary"}:
+        selected_docs, strategy = _select_contextual_documents(filtered_docs, sample_size)
+        if date_from or date_to:
+            strategy = f"{strategy}-date-filter"
     else:
         selected_docs = _dedupe_documents(filtered_docs[:sample_size] + filtered_docs[-sample_size:])
         strategy = "summary-first-last-sample"
 
     selection = {
         "mode_requested": normalized_mode,
+        "mode_label": "contextual" if requested_mode in {"contextual", "summary"} else requested_mode,
+        "mode_input": mode,
         "strategy": strategy,
         "sample_size": sample_size,
         "date_from": date_from,
@@ -755,6 +879,10 @@ def _selection_scope_label(selection: dict[str, Any], total_docs: int) -> str:
     strategy = selection.get("strategy")
     if strategy == "summary-first-last-sample":
         return f"Leitura amostral de {selected_total} documento(s) entre os primeiros e os ultimos de um total de {total_docs}."
+    if strategy in {"contextual-first-cbm-sample", "contextual-first-cbm-sample-date-filter"}:
+        return f"Leitura contextual de {selected_total} documento(s), priorizando os primeiros documentos e documentos CBM em um total de {total_docs}."
+    if strategy in {"contextual-first-last-sample", "contextual-first-last-sample-date-filter"}:
+        return f"Leitura contextual de {selected_total} documento(s), priorizando os primeiros e ultimos documentos de um total de {total_docs}."
     if selection.get("date_filter_applied"):
         return f"Leitura do recorte filtrado de {selected_total} documento(s) a partir das datas do titulo."
     return f"Leitura integral de {selected_total} documento(s) do processo."
@@ -1299,7 +1427,7 @@ def process_read(
     client: Any,
     numero_ou_id: str,
     *,
-    mode: str = "summary",
+    mode: str = "contextual",
     date_from: str | None = None,
     date_to: str | None = None,
     sample_size: int = 3,
@@ -1597,7 +1725,7 @@ def process_summary(
     client: Any,
     numero_ou_id: str,
     *,
-    mode: str = "summary",
+    mode: str = "contextual",
     date_from: str | None = None,
     date_to: str | None = None,
     sample_size: int = 3,
@@ -1675,6 +1803,56 @@ def _normalize_marker_name(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value or "")
     normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     return normalized.strip().casefold().replace("/", " ").replace("-", " ")
+
+
+def _normalize_tracking_group_item(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        group_id = item.get("id") or item.get("grupo_id")
+        return {
+            "id": str(group_id or ""),
+            "grupo_id": str(group_id or ""),
+            "nome": item.get("nome") or item.get("name") or "",
+        }
+    if isinstance(item, tuple) and len(item) >= 2:
+        return {"id": str(item[0] or ""), "grupo_id": str(item[0] or ""), "nome": str(item[1] or "")}
+    group_id = getattr(item, "id", None) or getattr(item, "grupo_id", None)
+    return {
+        "id": str(group_id or ""),
+        "grupo_id": str(group_id or ""),
+        "nome": getattr(item, "nome", "") or getattr(item, "name", "") or "",
+    }
+
+
+def _resolve_tracking_group_reference(groups: list[dict[str, Any]], group_ref: str | None) -> dict[str, Any] | None:
+    if not group_ref:
+        return None
+    ref = group_ref.strip()
+    if not ref:
+        return None
+    for group in groups:
+        if str(group.get("id") or group.get("grupo_id") or "") == ref:
+            return group
+    normalized_ref = _normalize_marker_name(ref)
+    for group in groups:
+        name = str(group.get("nome") or "")
+        if _normalize_marker_name(name) == normalized_ref:
+            return group
+    for group in groups:
+        name = str(group.get("nome") or "")
+        if normalized_ref and normalized_ref in _normalize_marker_name(name):
+            return group
+    return None
+
+
+def _process_in_tracking_list(client: Any, id_procedimento: str, numero_processo: str | None = None) -> dict[str, Any] | None:
+    if not hasattr(client, "list_acompanhamento_especial"):
+        return None
+    for process in client.list_acompanhamento_especial():
+        process_id = str(getattr(process, "id_procedimento", "") or "")
+        process_number = str(getattr(process, "numero", "") or "")
+        if process_id == str(id_procedimento) or (numero_processo and process_number == str(numero_processo)):
+            return _process_preview(process)
+    return None
 
 
 def _resolve_marker_reference(markers: list[dict[str, Any]], marker_ref: str | None) -> dict[str, Any] | None:
@@ -2185,81 +2363,248 @@ def marker_catalog(client: Any) -> dict[str, Any]:
         )
 
 
+def tracking_group_catalog(client: Any) -> dict[str, Any]:
+    operation = "tracking-group-catalog"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        groups = [
+            _normalize_tracking_group_item(item)
+            for item in client.listar_grupos_acompanhamento()
+        ]
+        groups = [item for item in groups if item.get("id") and item.get("nome")]
+        return _result(
+            operation=operation,
+            context=context,
+            data={
+                "tracking_scope": {
+                    "unit_specific": True,
+                    "current_unit": context.get("unidade_sigla"),
+                    "rule": "Acompanhamento especial é específico da unidade atual.",
+                },
+                "groups_total": len(groups),
+                "groups": groups,
+            },
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
+def process_watch_read(client: Any, numero_ou_id: str) -> dict[str, Any]:
+    operation = "process-watch-read"
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        id_procedimento, numero_processo, visible_process = _resolve_visible_process_for_marker(
+            client,
+            numero_ou_id,
+        )
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id,
+        }
+        tracked_process = _process_in_tracking_list(client, id_procedimento, numero_processo)
+        groups = [
+            _normalize_tracking_group_item(item)
+            for item in client.listar_grupos_acompanhamento()
+        ]
+        groups = [item for item in groups if item.get("id") and item.get("nome")]
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "processo": _process_preview(visible_process),
+                "tracking_authority": {
+                    "source": "current_unit_process_list",
+                    "visible_in_current_unit": True,
+                    "caixa": visible_process.caixa,
+                    "unit_specific": True,
+                    "rule": "Processo visível em recebidos/gerados da unidade atual pode ser colocado em acompanhamento especial nesta unidade, independentemente da unidade de origem.",
+                },
+                "current_tracking": {
+                    "tracked": tracked_process is not None,
+                    "processo": tracked_process,
+                },
+                "available_groups_total": len(groups),
+                "available_groups": groups,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-watch-preview",
+                    label="Preparar acompanhamento especial do processo",
+                    params={"numero_ou_id": id_procedimento},
+                )
+            ],
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
+
+
 def process_marker_preview(
     client: Any,
     numero_ou_id: str,
     *,
     marker: str | None = None,
-    mode: str = "summary",
+    mode: str = "contextual",
     date_from: str | None = None,
     date_to: str | None = None,
     sample_size: int = 3,
     suggested_text: str | None = None,
 ) -> dict[str, Any]:
     operation = "process-marker-preview"
-    base_result = process_summary(
-        client,
-        numero_ou_id,
-        mode=mode,
-        date_from=date_from,
-        date_to=date_to,
-        sample_size=sample_size,
-    )
-    if not base_result["ok"]:
-        base_result["operation"] = operation
-        return base_result
-
-    markers = [_normalize_marker_item(item) for item in client.list_marcadores()]
-    selected_marker = _resolve_marker_reference(markers, marker)
-    warnings = list(base_result.get("warnings", []))
-    if marker and not selected_marker:
-        warnings.append(f"Marcador '{marker}' não encontrado no catálogo atual da unidade.")
-
-    summary_data = base_result["data"]
-    marker_text = (suggested_text or "").strip() or _build_marker_suggested_text(summary_data)
-    process_data = summary_data.get("processo", {})
-    current_markers = _list_process_markers(client, base_result["resolved_ids"]["id_procedimento"])
-    current_marker = process_data.get("marcador")
-
-    return _result(
-        operation=operation,
-        context=base_result["context"],
-        resolved_ids=base_result["resolved_ids"],
-        data={
+    resolved_ids: dict[str, Any] = {}
+    try:
+        context = _context(client)
+        id_procedimento, numero_processo, visible_process = _resolve_visible_process_for_marker(
+            client,
+            numero_ou_id,
+        )
+        resolved_ids = {
+            "id_procedimento": id_procedimento,
+            "numero_processo": numero_processo or numero_ou_id,
+        }
+        process_data = _process_preview(visible_process)
+        summary_data: dict[str, Any] = {
             "processo": process_data,
-            "preflight": summary_data.get("preflight", {}),
-            "current_marker": current_marker,
-            "current_markers": current_markers,
-            "summary": summary_data.get("summary"),
-            "action_items": summary_data.get("action_items", []),
-            "requires_response": summary_data.get("requires_response"),
-            "action_required": summary_data.get("action_required"),
-            "deadlines": summary_data.get("deadlines", []),
-            "involved_military": summary_data.get("involved_military", []),
-            "selected_marker": selected_marker,
-            "suggested_marker_text": marker_text,
-            "available_markers_total": len(markers),
-            "available_markers": markers,
-        },
-        next_actions=[
-            NextAction(
-                action="process-marker-set-preview",
-                label="Preparar aplicação de marcador no processo",
-                params={
-                    "numero_ou_id": base_result["resolved_ids"].get("id_procedimento") or numero_ou_id,
-                    "marker": selected_marker.get("marcador_id") if selected_marker else marker,
-                },
+            "summary": " ".join(
+                item
+                for item in [
+                    visible_process.tipo,
+                    visible_process.especificacao,
+                    visible_process.marcador or "",
+                ]
+                if item
+            ).strip(),
+            "preflight": {
+                "required": False,
+                "current_unit": context.get("unidade_sigla"),
+                "target_unit": None,
+                "switched": False,
+                "reason": "marker_target_visible_in_current_unit_box",
+            },
+            "action_items": [],
+            "requires_response": None,
+            "action_required": None,
+            "deadlines": [],
+            "involved_military": [],
+        }
+        warnings: list[str] = []
+
+        base_result = process_summary(
+            client,
+            id_procedimento,
+            mode=mode,
+            date_from=date_from,
+            date_to=date_to,
+            sample_size=sample_size,
+        )
+        if base_result.get("ok"):
+            context = base_result.get("context") or context
+            resolved_ids = {
+                **resolved_ids,
+                **(base_result.get("resolved_ids") or {}),
+                "id_procedimento": id_procedimento,
+                "numero_processo": numero_processo or (base_result.get("resolved_ids") or {}).get("numero_processo") or numero_ou_id,
+            }
+            summary_data = {
+                **summary_data,
+                **(base_result.get("data") or {}),
+                "processo": (base_result.get("data") or {}).get("processo") or process_data,
+            }
+            warnings.extend(base_result.get("warnings", []))
+        else:
+            error = base_result.get("error") or {}
+            warnings.append(
+                "process-read/process-summary falhou ou ficou parcial; marcação continua permitida porque o processo está visível na caixa da unidade atual."
             )
-        ],
-        warnings=warnings,
-    )
+            if error.get("message"):
+                warnings.append(f"Falha de leitura usada apenas como contexto: {error['message']}")
+
+        preflight = dict(summary_data.get("preflight") or {})
+        preflight["mode_policy"] = {
+            "requested": mode,
+            "effective": "contextual" if mode in {"", "summary", "contextual"} else mode,
+            "default": "contextual",
+            "fallback": "fast_metadata_when_read_fails_or_explicit_fast",
+        }
+        summary_data["preflight"] = preflight
+
+        markers = [_normalize_marker_item(item) for item in client.list_marcadores()]
+        selected_marker = _resolve_marker_reference(markers, marker)
+        if marker and not selected_marker:
+            warnings.append(f"Marcador '{marker}' não encontrado no catálogo atual da unidade.")
+
+        marker_text = (suggested_text or "").strip() or _build_marker_suggested_text(summary_data)
+        try:
+            current_markers = _list_process_markers(client, id_procedimento)
+        except Exception as exc:
+            current_markers = []
+            warnings.append(f"Não foi possível listar marcadores já aplicados; isso não bloqueia nova marcação: {exc}")
+        current_marker = process_data.get("marcador")
+
+        return _result(
+            operation=operation,
+            context=context,
+            resolved_ids=resolved_ids,
+            data={
+                "processo": summary_data.get("processo") or process_data,
+                "marker_authority": {
+                    "source": "current_unit_process_list",
+                    "visible_in_current_unit": True,
+                    "caixa": visible_process.caixa,
+                    "rule": "Processo visível em recebidos/gerados da unidade atual pode ser marcado nesta unidade, independentemente da unidade de origem.",
+                },
+                "preflight": summary_data.get("preflight", {}),
+                "current_marker": current_marker,
+                "current_markers": current_markers,
+                "summary": summary_data.get("summary"),
+                "action_items": summary_data.get("action_items", []),
+                "requires_response": summary_data.get("requires_response"),
+                "action_required": summary_data.get("action_required"),
+                "deadlines": summary_data.get("deadlines", []),
+                "involved_military": summary_data.get("involved_military", []),
+                "selected_marker": selected_marker,
+                "suggested_marker_text": marker_text,
+                "available_markers_total": len(markers),
+                "available_markers": markers,
+            },
+            next_actions=[
+                NextAction(
+                    action="process-marker-set-preview",
+                    label="Preparar aplicação de marcador no processo",
+                    params={
+                        "numero_ou_id": id_procedimento,
+                        "marker": selected_marker.get("marcador_id") if selected_marker else marker,
+                    },
+                )
+            ],
+            warnings=warnings,
+        )
+    except Exception as exc:
+        return _error_result(
+            operation=operation,
+            context=locals().get("context"),
+            resolved_ids=resolved_ids,
+            exc=exc,
+        )
 
 
 def process_marker_read(
     client: Any,
     numero_ou_id: str,
     *,
-    mode: str = "summary",
+    mode: str = "contextual",
     date_from: str | None = None,
     date_to: str | None = None,
     sample_size: int = 3,
@@ -2284,6 +2629,7 @@ def process_marker_read(
         resolved_ids=base_result["resolved_ids"],
         data={
             "processo": base_result["data"].get("processo"),
+            "marker_authority": base_result["data"].get("marker_authority"),
             "preflight": base_result["data"].get("preflight"),
             "current_marker": base_result["data"].get("current_marker"),
             "current_markers_total": len(current_markers),
@@ -2318,7 +2664,10 @@ def process_marker_history(
     resolved_ids: dict[str, Any] = {}
     try:
         context = _context(client)
-        id_procedimento, numero_processo = _resolve_process_id(client, numero_ou_id)
+        id_procedimento, numero_processo, visible_process = _resolve_visible_process_for_marker(
+            client,
+            numero_ou_id,
+        )
         resolved_ids = {
             "id_procedimento": id_procedimento,
             "numero_processo": numero_processo or numero_ou_id,
@@ -2339,6 +2688,12 @@ def process_marker_history(
             context=context,
             resolved_ids=resolved_ids,
             data={
+                "marker_authority": {
+                    "source": "current_unit_process_list",
+                    "visible_in_current_unit": True,
+                    "caixa": visible_process.caixa,
+                    "rule": "Histórico de marcador é resolvido pelo processo visível na unidade atual.",
+                },
                 "selected_marker": selected_marker,
                 "current_markers_total": len(current_markers),
                 "current_markers": current_markers,
@@ -2405,7 +2760,7 @@ def environment_triage_preview(
                 preview = process_marker_preview(
                     client,
                     process.id_procedimento or process.numero,
-                    mode="summary",
+                    mode="contextual",
                     sample_size=sample_size,
                 )
                 if not preview.get("ok"):
@@ -2690,7 +3045,7 @@ def process_report(
     client: Any,
     numero_ou_id: str,
     *,
-    mode: str = "summary",
+    mode: str = "contextual",
     date_from: str | None = None,
     date_to: str | None = None,
     sample_size: int = 3,
@@ -3080,8 +3435,8 @@ def signature_block_review(client: Any, block_numero: str) -> dict[str, Any]:
         base["operation"] = operation
         return base
 
-    documents = base["data"].get("documents", [])
     current_user = base.get("context", {}).get("usuario", "")
+    documents = _block_documents_for_current_user(base["data"].get("documents", []), current_user)
     pending_documents = [doc for doc in documents if not doc.get("assinado")]
     signable_documents = [
         doc for doc in documents
@@ -3121,6 +3476,7 @@ def signature_block_review(client: Any, block_numero: str) -> dict[str, Any]:
         resolved_ids=base["resolved_ids"],
         data={
             **base["data"],
+            "documents": documents,
             "pending_documents": pending_documents,
             "signable_documents": signable_documents,
             "signed_documents": signed_documents,

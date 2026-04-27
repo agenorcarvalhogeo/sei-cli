@@ -26,6 +26,8 @@ from sei_cli.operations import (
     environment_triage_preview,
     inbox_snapshot,
     marker_catalog,
+    process_archive_confirm,
+    process_archive_preview,
     process_finalize_confirm,
     process_finalize_preview,
     process_conclude_confirm,
@@ -45,6 +47,9 @@ from sei_cli.operations import (
     process_marker_set_preview,
     process_marker_update_confirm,
     process_marker_update_preview,
+    process_watch_confirm,
+    process_watch_preview,
+    process_watch_read,
     process_open,
     process_reopen_confirm,
     process_reopen_preview,
@@ -63,7 +68,11 @@ from sei_cli.operations import (
     signature_block_sign_confirm,
     signature_block_sign_preview,
     signature_block_review,
+    tracking_group_catalog,
+    tracking_group_create_confirm,
+    tracking_group_create_preview,
 )
+from sei_cli.operations.reading import _select_process_documents
 from sei_cli.relatorio_parser import Militar, RelatorioServico
 
 
@@ -104,6 +113,11 @@ class FakeClient:
         self.process_markers: dict[str, dict[str, str]] = {
             "47607237": {"id": "11", "nome": "Férias / Dispensas", "texto": "Sd José Junior 15/03 - 13/04"}
         }
+        self.tracking_groups: list[dict[str, str]] = [
+            {"id": "21", "nome": "Concluídos"},
+            {"id": "22", "nome": "Aguardando retorno"},
+        ]
+        self.tracked_processes: dict[str, dict[str, str]] = {}
         self.marker_history_map: dict[tuple[str, str], list[dict[str, str]]] = {
             ("47607237", "11"): [
                 {
@@ -284,6 +298,40 @@ class FakeClient:
                 }
             )
         return normalized
+
+    def listar_grupos_acompanhamento(self) -> list[dict[str, str]]:
+        return list(self.tracking_groups)
+
+    def criar_grupo_acompanhamento(self, nome: str) -> str:
+        existing = next((item for item in self.tracking_groups if item["nome"] == nome), None)
+        if existing:
+            return existing["id"]
+        group_id = str(20 + len(self.tracking_groups) + 1)
+        self.tracking_groups.append({"id": group_id, "nome": nome})
+        return group_id
+
+    def list_acompanhamento_especial(self) -> list[Process]:
+        processes = {p.id_procedimento: p for p in self.list_processes().recebidos + self.list_processes().gerados}
+        result: list[Process] = []
+        for process_id in self.tracked_processes:
+            process = processes.get(process_id)
+            if process:
+                result.append(process)
+        return result
+
+    def add_acompanhamento_especial(self, id_procedimento: str, grupo_id: str, observacao: str) -> bool:
+        if not any(item["id"] == str(grupo_id) for item in self.tracking_groups):
+            return False
+        self.tracked_processes[id_procedimento] = {
+            "grupo_id": str(grupo_id),
+            "observacao": observacao,
+        }
+        return True
+
+    def alterar_acompanhamento_especial(self, id_procedimento: str, grupo_id: str, observacao: str) -> bool:
+        if id_procedimento not in self.tracked_processes:
+            return False
+        return self.add_acompanhamento_especial(id_procedimento, grupo_id, observacao)
 
     def cancelar_disponibilizacao_block(self, block_numero: str) -> dict[str, Any]:
         self.last_block_recall = {"block_numero": block_numero, "action": "cancelar_disponibilizacao"}
@@ -1020,6 +1068,29 @@ class AmbiguousUnitClient(FakeClient):
         )
 
 
+class VisibleMarkerReadBlockedClient(FakeClient):
+    def list_processes(self, unit: str | None = None) -> ProcessList:
+        return ProcessList(
+            recebidos=[
+                Process(
+                    numero="08810254.000138/2026-88",
+                    tipo="Sindicância",
+                    especificacao="Processo visível no CMDO Apodi, mas com leitura restrita",
+                    id_procedimento="555000",
+                    link="",
+                    novo=False,
+                    caixa="recebidos",
+                )
+            ],
+            gerados=[],
+        )
+
+    def get_full_document_tree(self, id_procedimento: str) -> list[TreeDocument]:
+        if id_procedimento == "555000":
+            raise RuntimeError("process-read sem acesso à árvore da unidade de origem")
+        return super().get_full_document_tree(id_procedimento)
+
+
 class EmptyCreateDocumentClient(FakeClient):
     def create_document(
         self,
@@ -1152,6 +1223,7 @@ def test_process_read_contract() -> None:
     assert result["data"]["signed_total"] == 3
     assert result["data"]["relatorios_total"] == 2
     assert result["data"]["selection"]["mode_requested"] == "summary"
+    assert result["data"]["selection"]["mode_label"] == "contextual"
     assert result["data"]["selection"]["documents_selected_total"] == 6
     assert len(result["data"]["documents_read"]) == 6
     assert result["data"]["read_summary"]["documents_succeeded_total"] == 6
@@ -1161,6 +1233,31 @@ def test_process_read_contract() -> None:
     assert result["data"]["process_context"]["action_required"] is True
     assert any(item["extraction_method"] in {"read_document_content", "download_document_pdf"} for item in result["data"]["documents_read"])
     assert result["next_actions"][0]["action"] == "document-read"
+
+
+def test_contextual_selection_prioritizes_first_documents_then_cbm_origin() -> None:
+    docs = [
+        TreeDocument(id_documento="1", nome="Documento inicial", tipo="interno", origin_unit="SESED"),
+        TreeDocument(id_documento="2", nome="Portaria Conjunta", tipo="interno", origin_unit="SESED"),
+        TreeDocument(id_documento="3", nome="Resposta PM", tipo="interno", origin_unit="PMRN"),
+        TreeDocument(id_documento="4", nome="Resposta PC", tipo="interno", origin_unit="PCRN"),
+        TreeDocument(id_documento="5", nome="Despacho CBM antigo", tipo="interno", origin_unit="CBM - 3GBM"),
+        TreeDocument(id_documento="6", nome="Resposta ITEP", tipo="interno", origin_unit="ITEP"),
+        TreeDocument(id_documento="7", nome="Despacho CBM recente", tipo="interno", origin_unit="CBM - DAT"),
+        TreeDocument(id_documento="8", nome="Resposta final SESAP", tipo="interno", origin_unit="SESAP"),
+    ]
+
+    selected, selection, warnings = _select_process_documents(
+        docs,
+        mode="contextual",
+        sample_size=2,
+        date_from=None,
+        date_to=None,
+    )
+
+    assert warnings == []
+    assert selection["strategy"] == "contextual-first-cbm-sample"
+    assert [doc.id_documento for doc in selected] == ["1", "2", "7", "5"]
 
 
 def test_process_read_date_filter_reads_only_matching_title_dates() -> None:
@@ -1189,6 +1286,7 @@ def test_process_summary_contract() -> None:
 
     assert result["ok"] is True
     assert result["operation"] == "process-summary"
+    assert result["data"]["selection"]["mode_label"] == "contextual"
     assert result["data"]["process_kind_guess"] == "reaprazamento"
     assert result["data"]["action_required"] is True
     assert result["data"]["read_summary"]["documents_failed_total"] == 0
@@ -1340,6 +1438,8 @@ def test_process_marker_preview_contract() -> None:
 
     assert result["ok"] is True
     assert result["operation"] == "process-marker-preview"
+    assert result["data"]["preflight"]["mode_policy"]["requested"] == "contextual"
+    assert result["data"]["preflight"]["mode_policy"]["effective"] == "contextual"
     assert result["data"]["selected_marker"]["marcador_id"] == "11"
     assert result["data"]["suggested_marker_text"]
     assert "Leitura" not in result["data"]["suggested_marker_text"]
@@ -1390,6 +1490,32 @@ def test_process_marker_set_confirm_contract() -> None:
     assert result["operation"] == "process-marker-set-confirm"
     assert client.process_markers["47607237"]["id"] == "12"
     assert client.process_markers["47607237"]["texto"] == "Processo apenas informativo."
+
+
+def test_process_marker_set_confirm_allows_visible_process_even_when_process_read_fails() -> None:
+    client = VisibleMarkerReadBlockedClient()
+    result = process_marker_set_confirm(
+        client,
+        "08810254.000138/2026-88",
+        marker="12",
+        texto="Marcação pela caixa do CMDO Apodi.",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["resolved_ids"]["id_procedimento"] == "555000"
+    assert result["data"]["marker_authority"]["source"] == "current_unit_process_list"
+    assert result["data"]["marker_authority"]["caixa"] == "recebidos"
+    assert client.process_markers["555000"]["id"] == "12"
+    assert any("marcação continua permitida" in warning for warning in result["warnings"])
+
+
+def test_process_marker_preview_blocks_process_not_visible_in_current_unit_box() -> None:
+    result = process_marker_preview(VisibleMarkerReadBlockedClient(), "99999999", marker="12")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "process_not_found"
+    assert "não aparece na caixa da unidade atual" in result["error"]["message"]
 
 
 def test_process_marker_remove_preview_contract() -> None:
@@ -1446,6 +1572,149 @@ def test_process_marker_update_confirm_contract() -> None:
     assert result["ok"] is True
     assert result["operation"] == "process-marker-update-confirm"
     assert client.process_markers["47607237"]["texto"] == "Aguardando manifestação até 15/04."
+
+
+def test_tracking_group_catalog_contract() -> None:
+    result = tracking_group_catalog(FakeClient())
+
+    assert result["ok"] is True
+    assert result["operation"] == "tracking-group-catalog"
+    assert result["data"]["tracking_scope"]["unit_specific"] is True
+    assert result["data"]["groups_total"] == 2
+
+
+def test_tracking_group_create_preview_contract() -> None:
+    result = tracking_group_create_preview(FakeClient(), "Arquivados no ambiente")
+
+    assert result["ok"] is True
+    assert result["operation"] == "tracking-group-create-preview"
+    assert result["data"]["group_preview"]["nome"] == "Arquivados no ambiente"
+    assert result["data"]["confirmation_required"] is True
+
+
+def test_tracking_group_create_confirm_contract() -> None:
+    client = FakeClient()
+    result = tracking_group_create_confirm(client, "Arquivados no ambiente", confirm=True)
+
+    assert result["ok"] is True
+    assert result["operation"] == "tracking-group-create-confirm"
+    assert result["data"]["mutation"]["created"] is True
+    assert any(group["nome"] == "Arquivados no ambiente" for group in client.tracking_groups)
+
+
+def test_process_watch_read_contract() -> None:
+    client = FakeClient()
+    client.tracked_processes["47607237"] = {"grupo_id": "21", "observacao": "Concluído na unidade."}
+    result = process_watch_read(client, "47607237")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-watch-read"
+    assert result["data"]["tracking_authority"]["source"] == "current_unit_process_list"
+    assert result["data"]["current_tracking"]["tracked"] is True
+
+
+def test_process_watch_preview_contract() -> None:
+    result = process_watch_preview(FakeClient(), "47607237", group="Concluídos", observacao="Concluído na unidade.")
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-watch-preview"
+    assert result["data"]["selected_group"]["id"] == "21"
+    assert result["data"]["mutation_preview"]["action"] == "add"
+    assert result["data"]["confirmation_required"] is True
+
+
+def test_process_watch_confirm_contract() -> None:
+    client = FakeClient()
+    result = process_watch_confirm(
+        client,
+        "47607237",
+        group="21",
+        observacao="Concluído na unidade.",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-watch-confirm"
+    assert client.tracked_processes["47607237"]["grupo_id"] == "21"
+    assert result["data"]["verification"]["tracked"] is True
+
+
+def test_process_watch_confirm_updates_existing_tracking() -> None:
+    client = FakeClient()
+    client.tracked_processes["47607237"] = {"grupo_id": "22", "observacao": "Aguardando."}
+    result = process_watch_confirm(
+        client,
+        "47607237",
+        group="Concluídos",
+        observacao="Concluído.",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["mutation"]["action"] == "update"
+    assert client.tracked_processes["47607237"]["grupo_id"] == "21"
+
+
+def test_process_watch_preview_blocks_process_not_visible_in_current_unit_box() -> None:
+    result = process_watch_preview(VisibleMarkerReadBlockedClient(), "99999999", group="21")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "process_not_found"
+    assert "não aparece na caixa da unidade atual" in result["error"]["message"]
+
+
+def test_process_archive_preview_requires_group_when_not_tracked() -> None:
+    result = process_archive_preview(FakeClient(), "47607237")
+
+    assert result["ok"] is False
+    assert "informe --group" in result["error"]["message"]
+
+
+def test_process_archive_preview_contract() -> None:
+    result = process_archive_preview(
+        FakeClient(),
+        "47607237",
+        group="Concluídos",
+        observacao="Concluído na unidade.",
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-archive-preview"
+    assert result["resolved_ids"]["numero_processo"] == "08810058.000128/2026-69"
+    assert result["data"]["archive_plan"]["tracking_action"] == "add"
+    assert result["data"]["archive_plan"]["will_conclude"] is True
+    assert result["data"]["selected_group"]["id"] == "21"
+    assert result["data"]["confirmation_required"] is True
+
+
+def test_process_archive_confirm_contract() -> None:
+    client = FakeClient()
+    result = process_archive_confirm(
+        client,
+        "47607237",
+        group="Concluídos",
+        observacao="Concluído na unidade.",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["operation"] == "process-archive-confirm"
+    assert result["resolved_ids"]["numero_processo"] == "08810058.000128/2026-69"
+    assert client.tracked_processes["47607237"]["grupo_id"] == "21"
+    assert client.concluded_processes[-1]["id_procedimento"] == "47607237"
+    assert result["data"]["archive"]["tracked_before_conclude"] is True
+    assert result["data"]["archive"]["concluded"] is True
+
+
+def test_process_archive_confirm_skips_tracking_when_already_tracked() -> None:
+    client = FakeClient()
+    client.tracked_processes["47607237"] = {"grupo_id": "22", "observacao": "Já acompanhado."}
+    result = process_archive_confirm(client, "47607237", confirm=True)
+
+    assert result["ok"] is True
+    assert result["data"]["archive"]["concluded"] is True
+    assert client.tracked_processes["47607237"]["grupo_id"] == "22"
+    assert client.concluded_processes[-1]["id_procedimento"] == "47607237"
 
 
 def test_process_create_preview_contract() -> None:
@@ -2703,8 +2972,11 @@ def test_signature_block_review_excludes_documents_already_signed_by_current_use
 
     assert result["ok"] is True
     assert result["data"]["pending_documents"]
+    assert result["data"]["documents"][0]["raw_can_sign"] is True
+    assert result["data"]["documents"][0]["can_sign"] is False
+    assert result["data"]["documents"][0]["can_sign_for_current_user"] is False
+    assert result["data"]["documents"][0]["current_user_already_signed"] is True
     assert result["data"]["signable_documents"] == []
-    assert result["data"]["ready_to_sign"] is False
     assert result["data"]["ready_to_sign"] is False
     assert result["data"]["signable_document_ids"] == []
 
@@ -3099,6 +3371,22 @@ class PendingButNotSignableBlockSignClient(FakeClient):
         return {"doc_ids": [id_documento], "signed": [id_documento], "already_signed": [], "errors": []}
 
 
+class LegacyBlockPostcheckErrorClient(FakeClient):
+    def sign_block(self, block_numero: str, doc_indices: list[int] | None = None) -> dict[str, Any]:
+        for docs in self.block_documents_map.values():
+            for doc in docs:
+                if doc.seq in {str(item) for item in (doc_indices or [])}:
+                    doc.assinante = "Fulano / Cargo"
+                    doc.can_sign = False
+                    doc.assinado = False
+        return {
+            "doc_ids": ["48568466"],
+            "signed": ["48568466"],
+            "already_signed": [],
+            "errors": ["Documentos permanecem pendentes após releitura do bloco."],
+        }
+
+
 def test_signature_block_sign_confirm_detects_silent_failure() -> None:
     result = signature_block_sign_confirm(SilentBlockSignClient(), "774681", confirm=True)
 
@@ -3128,6 +3416,19 @@ def test_signature_block_sign_confirm_uses_signable_documents_for_success() -> N
     result = signature_block_sign_confirm(client, "774681", confirm=True)
 
     assert result["ok"] is True
+    assert result["data"]["verification"]["remaining_pending_total"] >= 1
+    assert result["data"]["verification"]["remaining_signable_total"] == 0
+
+
+def test_signature_block_sign_confirm_ignores_legacy_postcheck_error_when_verification_passes() -> None:
+    client = LegacyBlockPostcheckErrorClient()
+    result = signature_block_sign_confirm(client, "774681", confirm=True)
+
+    assert result["ok"] is True
+    assert result["data"]["sign_results"][0]["errors"] == []
+    assert result["data"]["sign_results"][0]["ignored_postcheck_errors"] == [
+        "Documentos permanecem pendentes após releitura do bloco."
+    ]
     assert result["data"]["verification"]["remaining_pending_total"] >= 1
     assert result["data"]["verification"]["remaining_signable_total"] == 0
 
@@ -3945,6 +4246,84 @@ def test_process_marker_update_confirm_cli_accepts_text_alias(monkeypatch) -> No
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["data"]["mutation"]["new_text"] == "Aguardando manifestação."
+
+
+def test_tracking_group_catalog_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["tracking-group-catalog", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "tracking-group-catalog"
+    assert payload["data"]["groups_total"] == 2
+
+
+def test_tracking_group_create_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["tracking-group-create-confirm", "Arquivados no ambiente", "--confirm", "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "tracking-group-create-confirm"
+
+
+def test_process_watch_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-watch-confirm",
+            "47607237",
+            "--group",
+            "Concluídos",
+            "--obs",
+            "Concluído na unidade.",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-watch-confirm"
+    assert payload["data"]["verification"]["tracked"] is True
+
+
+def test_process_archive_confirm_cli_json(monkeypatch) -> None:
+    monkeypatch.setattr("sei_cli.cli.SEIClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "process-archive-confirm",
+            "47607237",
+            "--group",
+            "Concluídos",
+            "--obs",
+            "Concluído na unidade.",
+            "--confirm",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["operation"] == "process-archive-confirm"
+    assert payload["data"]["archive"]["concluded"] is True
 
 
 def test_signature_block_list_cli_json(monkeypatch) -> None:
