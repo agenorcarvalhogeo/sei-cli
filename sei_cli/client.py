@@ -56,6 +56,78 @@ def _sanitize_for_iso_8859_1(text: str) -> str:
     for unicode_char, ascii_equiv in replacements.items():
         result = result.replace(unicode_char, ascii_equiv)
     return result
+
+
+def _normalize_error_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return normalized.casefold()
+
+
+def _extract_sei_error_message(soup: BeautifulSoup, html_text: str) -> str | None:
+    error_keywords = (
+        "erro",
+        "falha",
+        "nao foi possivel",
+        "invalido",
+        "obrigatorio",
+        "insuficient",
+        "suficient",
+        "rejeit",
+    )
+
+    def is_error_message(text: str, marker: str = "") -> bool:
+        normalized_text = _normalize_error_text(text)
+        normalized_marker = _normalize_error_text(marker)
+        if "erro" in normalized_marker or "danger" in normalized_marker:
+            return bool(text.strip())
+        return any(keyword in normalized_text for keyword in error_keywords)
+
+    candidates: list[tuple[str, str]] = []
+    for node in soup.find_all(
+        attrs={
+            "class": re.compile(r"(alert|erro|infraMsg|infraMensagem)", re.I),
+        }
+    ):
+        classes = " ".join(node.get("class", []))
+        candidates.append((node.get_text(" ", strip=True), classes))
+
+    for node in soup.find_all(id=re.compile(r"(divInfraMsg|infraMsg|erro)", re.I)):
+        candidates.append((node.get_text(" ", strip=True), str(node.get("id", ""))))
+
+    for match in re.finditer(
+        r"alert\((?P<quote>['\"])(?P<text>.*?)(?P=quote)\)",
+        html_text,
+        re.DOTALL,
+    ):
+        text = (
+            html.unescape(match.group("text"))
+            .replace("\\n", " ")
+            .replace("\\'", "'")
+            .replace('\\"', '"')
+        )
+        candidates.append((text, "script-alert"))
+
+    for text, marker in candidates:
+        compact = re.sub(r"\s+", " ", text).strip()
+        if compact and is_error_message(compact, marker):
+            return compact[:500]
+
+    return None
+
+
+def _serialize_lupa_select_hidden(select: Any) -> str:
+    """Mirror SEI's infraLupaSelect hidden field serialization."""
+    items: list[str] = []
+    for option in select.find_all("option"):
+        value = option.get("value", "")
+        if not value:
+            continue
+        label = option.get_text(" ", strip=True)
+        items.append(f"{value}±{label}")
+    return "¥".join(items)
+
+
 from sei_cli.config import load_credentials, orgao_to_value, SESSION_PATH
 from sei_cli.models import (
     Block, BlockDocument, Document, DocumentCreated, DocumentType,
@@ -1141,7 +1213,7 @@ class SEIClient:
         # SEI JS normally syncs these on form submit; we must do it manually.
 
         # hdnAssuntos: mandatory — JS validation rejects empty value.
-        # Mirror from selAssuntos options, or use first available.
+        # Mirror SEI's infraLupaSelect hidden format: value±label¥value±label.
         if not data_cad.get("hdnAssuntos"):
             sel_a = soup_cad.find("select", id="selAssuntos")
             if sel_a:
@@ -1151,7 +1223,7 @@ class SEIClient:
                     if o.get("value")
                 ]
                 if vals:
-                    data_cad["hdnAssuntos"] = vals[0]
+                    data_cad["hdnAssuntos"] = _serialize_lupa_select_hidden(sel_a)
                     data_cad["selAssuntos"] = vals[0]
 
         # hdnInteressadosProcedimento: mirror from selInteressadosProcedimento
@@ -1172,6 +1244,7 @@ class SEIClient:
         # Submit creation
         r_create = self._post(action_cad, data_cad)
         self._control_html = None
+        csoup = BeautifulSoup(r_create.text, "lxml")
 
         # Detect silent form reload (server-side validation failure).
         # When SEI rejects the form, it re-renders "Iniciar Processo" with
@@ -1183,6 +1256,10 @@ class SEIClient:
                 "rdoNivelAcesso, or interessado). Check form data."
             )
 
+        error_message = _extract_sei_error_message(csoup, r_create.text)
+        if error_message:
+            raise RuntimeError(f"SEI create_process: {error_message}")
+
         # Parse response for process number
         url_str = str(r_create.url)
         id_proc_match = re.search(r"id_procedimento=(\d+)", url_str)
@@ -1190,13 +1267,18 @@ class SEIClient:
             id_proc_match = re.search(r"id_procedimento=(\d+)", r_create.text)
 
         # Extract process number from page
-        csoup = BeautifulSoup(r_create.text, "lxml")
         title = csoup.title.get_text() if csoup.title else ""
         # Title is usually "SEI - 08810xxx.xxxxxx/2026-xx"
         num_match = re.search(r"(\d{8}\.\d+/\d{4}-\d{2})", title)
         if not num_match:
             num_match = re.search(
                 r"(\d{8}\.\d+/\d{4}-\d{2})", r_create.text
+            )
+
+        if not id_proc_match and not num_match:
+            raise RuntimeError(
+                "SEI create_process: servidor nao confirmou a criacao do processo "
+                "nem retornou id_procedimento ou numero do processo."
             )
 
         return {
@@ -1915,6 +1997,78 @@ class SEIClient:
             return True
 
         return False
+
+    def get_process_acompanhamento_especial(self, id_procedimento: str) -> dict[str, Any]:
+        """Read acompanhamento especial from the process-local management page.
+
+        ``acompanhamento_listar`` can be paginated/filtered and miss old
+        processes. The process tree toolbar links to ``acompanhamento_gerenciar``
+        for the selected process, which is the authoritative local verification.
+        """
+        arvore_html = self._navigate_to_arvore(id_procedimento)
+        if not arvore_html:
+            raise RuntimeError(f"Processo {id_procedimento} não encontrado ou sessão expirada")
+
+        start = arvore_html.find('Nos[0]')
+        end = arvore_html.find('Nos[1]', start) if start != -1 else -1
+        nos0 = arvore_html[start:end].replace('\\"', '"') if start != -1 else ""
+        acomp = re.search(
+            r'href="(controlador\.php\?acao=acompanhamento_gerenciar[^"]*)"',
+            nos0,
+        )
+        if not acomp:
+            return {
+                "tracked": False,
+                "source": "acompanhamento_gerenciar",
+                "reason": "link_acompanhamento_gerenciar_not_found",
+            }
+
+        r_ger = self._get(self._sei_url(acomp.group(1).replace("&amp;", "&")))
+        ger_html = r_ger.text
+        alterar_match = re.search(
+            r'(controlador\.php\?acao=acompanhamento_alterar[^"\']+)',
+            ger_html,
+        )
+        if not alterar_match:
+            return {
+                "tracked": False,
+                "source": "acompanhamento_gerenciar",
+                "reason": "acompanhamento_alterar_not_found",
+            }
+
+        r_alt = self._get(self._sei_url(alterar_match.group(1).replace("&amp;", "&")))
+        soup = BeautifulSoup(r_alt.text, "lxml")
+        form = soup.find("form", id="frmAcompanhamentoCadastro")
+        if not form:
+            return {
+                "tracked": True,
+                "source": "acompanhamento_gerenciar",
+                "id_procedimento": str(id_procedimento),
+            }
+
+        id_acomp_input = form.find("input", {"name": "hdnIdAcompanhamento"})
+        obs_field = form.find("textarea", {"name": "txaObservacao"})
+        group_select = form.find("select", {"name": "selGrupoAcompanhamento"})
+        selected_option = None
+        if group_select:
+            selected_option = group_select.find("option", selected=True)
+            if selected_option is None:
+                selected_value = group_select.get("value")
+                if selected_value:
+                    selected_option = group_select.find("option", value=selected_value)
+        grupo_id = str(selected_option.get("value", "")) if selected_option else ""
+        grupo_nome = selected_option.get_text(" ", strip=True) if selected_option else ""
+        observacao = obs_field.get_text("\n", strip=True) if obs_field else ""
+
+        return {
+            "tracked": True,
+            "source": "acompanhamento_gerenciar",
+            "id_procedimento": str(id_procedimento),
+            "id_acompanhamento": id_acomp_input.get("value", "") if id_acomp_input else "",
+            "grupo_id": grupo_id,
+            "grupo_nome": grupo_nome,
+            "observacao": observacao,
+        }
 
     def alterar_acompanhamento_especial(
         self, id_procedimento: str, grupo_id: str, observacao: str

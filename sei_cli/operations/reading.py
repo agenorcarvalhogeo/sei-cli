@@ -1845,14 +1845,43 @@ def _resolve_tracking_group_reference(groups: list[dict[str, Any]], group_ref: s
 
 
 def _process_in_tracking_list(client: Any, id_procedimento: str, numero_processo: str | None = None) -> dict[str, Any] | None:
-    if not hasattr(client, "list_acompanhamento_especial"):
+    if hasattr(client, "list_acompanhamento_especial"):
+        for process in client.list_acompanhamento_especial():
+            process_id = str(getattr(process, "id_procedimento", "") or "")
+            process_number = str(getattr(process, "numero", "") or "")
+            if process_id == str(id_procedimento) or (numero_processo and process_number == str(numero_processo)):
+                return {**_process_preview(process), "tracking_verification_source": "acompanhamento_listar"}
+
+    local_reader = getattr(client, "get_process_acompanhamento_especial", None)
+    if not callable(local_reader):
         return None
-    for process in client.list_acompanhamento_especial():
-        process_id = str(getattr(process, "id_procedimento", "") or "")
-        process_number = str(getattr(process, "numero", "") or "")
-        if process_id == str(id_procedimento) or (numero_processo and process_number == str(numero_processo)):
-            return _process_preview(process)
-    return None
+
+    try:
+        local_tracking = local_reader(str(id_procedimento))
+    except Exception:
+        return None
+    if not local_tracking or not local_tracking.get("tracked"):
+        return None
+
+    processo = local_tracking.get("processo") or {}
+    if not isinstance(processo, dict):
+        processo = {}
+    return {
+        "numero": processo.get("numero") or numero_processo or "",
+        "tipo": processo.get("tipo") or "Acompanhamento Especial",
+        "especificacao": processo.get("especificacao") or "",
+        "id_procedimento": str(id_procedimento),
+        "novo": processo.get("novo", False),
+        "recente": processo.get("recente", False),
+        "atribuido": processo.get("atribuido"),
+        "marcador": processo.get("marcador"),
+        "caixa": processo.get("caixa"),
+        "grupo_id": local_tracking.get("grupo_id") or local_tracking.get("id_grupo"),
+        "grupo_nome": local_tracking.get("grupo_nome") or local_tracking.get("grupo"),
+        "observacao": local_tracking.get("observacao") or "",
+        "id_acompanhamento": local_tracking.get("id_acompanhamento") or "",
+        "tracking_verification_source": local_tracking.get("source") or "acompanhamento_gerenciar",
+    }
 
 
 def _resolve_marker_reference(markers: list[dict[str, Any]], marker_ref: str | None) -> dict[str, Any] | None:

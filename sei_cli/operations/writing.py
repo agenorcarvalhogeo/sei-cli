@@ -15,7 +15,7 @@ from sei_cli.config import (
 )
 
 from .contracts import NextAction
-from .errors import UnsupportedStateError, WorkflowViolationError
+from .errors import TrackingVerificationInconclusiveError, UnsupportedStateError, WorkflowViolationError
 from .reading import (
     _context,
     _error_result,
@@ -1840,11 +1840,23 @@ def _document_quality_check(
     plain_text = _normalize_editor_text(normalized)
     editable_plain_text = ""
     editable_body_empty = False
+    external_sei_hrefs: list[str] = []
     if editable_section_contents:
         normalized_editable_sections = [
             _normalize_editor_text(content or "")
             for content in editable_section_contents
         ]
+        raw_editable_html = "\n".join(editable_section_contents)
+        external_sei_hrefs = sorted(
+            set(
+                match.group(1)
+                for match in re.finditer(
+                    r"""href=["'](https?://[^"']*sei[^"']*)["']""",
+                    raw_editable_html,
+                    re.IGNORECASE,
+                )
+            )
+        )
         editable_plain_text = " ".join(normalized_editable_sections).strip()
         editable_body_empty = all(
             _is_effectively_empty_editor_content(content or "")
@@ -1900,6 +1912,7 @@ def _document_quality_check(
         "standard_template_variables_remaining": [
             item for item in all_template_variables if item.lower() in standard_template_variables
         ],
+        "external_sei_hrefs": external_sei_hrefs,
         "empty_body_check": (
             editable_body_empty
             if editable_section_contents
@@ -2034,6 +2047,8 @@ def document_quality_check(
             warnings.append("Revisar padronizacao de postos/graduações antes de assinatura ou geração de PDF.")
         if quality["template_variables_remaining"]:
             warnings.append("Documento ainda contém variáveis de template não substituídas.")
+        if quality["external_sei_hrefs"]:
+            warnings.append("Referência SEI usa href externo; use âncora nativa ancora_sei para evitar relogin.")
         if quality["empty_body_check"]:
             warnings.append("Corpo editável parece vazio.")
         dispatch_checks = quality["document_profile"]["dispatch_checks"]
@@ -2806,9 +2821,19 @@ def process_watch_confirm(
             preview["resolved_ids"].get("numero_processo"),
         )
         if not tracked_process:
-            raise WorkflowViolationError(
-                "SEI retornou sucesso, mas o processo não apareceu em acompanhamento especial após releitura.",
-                details={"id_procedimento": process_id, "grupo_id": group_id},
+            raise TrackingVerificationInconclusiveError(
+                "SEI retornou sucesso, mas a verificação do acompanhamento especial foi inconclusiva.",
+                details={
+                    "id_procedimento": process_id,
+                    "grupo_id": group_id,
+                    "action": action,
+                    "mutation_applied": True,
+                    "verification_attempts": [
+                        "acompanhamento_listar",
+                        "acompanhamento_gerenciar",
+                    ],
+                    "hint": "A listagem geral pode estar paginada/filtrada; confira process-watch-read ou a tela local do processo.",
+                },
             )
         return _result(
             operation=operation,
@@ -3003,6 +3028,7 @@ def process_archive_confirm(
             return preview
         process_id = preview["resolved_ids"]["id_procedimento"]
         tracking_result: dict[str, Any] | None = None
+        tracking_warnings: list[str] = []
         if preview["data"]["archive_plan"]["will_apply_tracking"]:
             selected_group = preview["data"].get("selected_group") or {}
             tracking_result = process_watch_confirm(
@@ -3013,8 +3039,14 @@ def process_archive_confirm(
                 confirm=True,
             )
             if not tracking_result.get("ok"):
-                tracking_result["operation"] = operation
-                return tracking_result
+                error = tracking_result.get("error") or {}
+                details = error.get("details") or {}
+                if error.get("code") != "tracking_verification_inconclusive" or not details.get("mutation_applied"):
+                    tracking_result["operation"] = operation
+                    return tracking_result
+                tracking_warnings.append(
+                    "Acompanhamento especial: SEI aceitou a mutação, mas a verificação ficou inconclusiva; conclusão executada por autorização explícita do arquivamento."
+                )
         else:
             tracking_result = {
                 "ok": True,
@@ -3050,10 +3082,12 @@ def process_archive_confirm(
                     "order": ["ensure_tracking", "conclude_process"],
                 },
                 "tracking_result": {
+                    "ok": tracking_result.get("ok"),
                     "operation": tracking_result.get("operation"),
                     "mutation": (tracking_result.get("data") or {}).get("mutation"),
                     "verification": (tracking_result.get("data") or {}).get("verification"),
                     "current_tracking": (tracking_result.get("data") or {}).get("current_tracking"),
+                    "error": tracking_result.get("error"),
                 },
                 "conclude_result": conclude_result.get("data"),
             },
@@ -3064,7 +3098,7 @@ def process_archive_confirm(
                     params={"numero_ou_id_processo": process_id},
                 )
             ],
-            warnings=preview.get("warnings", []) + conclude_result.get("warnings", []),
+            warnings=preview.get("warnings", []) + tracking_warnings + conclude_result.get("warnings", []),
         )
     except Exception as exc:
         return _error_result(

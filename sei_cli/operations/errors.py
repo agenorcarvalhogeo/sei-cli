@@ -54,6 +54,11 @@ class WorkflowViolationError(OperationFailure):
     code = "workflow_violation"
 
 
+class TrackingVerificationInconclusiveError(OperationFailure):
+    code = "tracking_verification_inconclusive"
+    retryable = True
+
+
 class ParseError(OperationFailure):
     code = "parse_error"
 

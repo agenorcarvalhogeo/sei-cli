@@ -231,6 +231,8 @@ Regras:
 - para processo, `{id_interno}` e o `id_procedimento` resolvido
 - `{numero_visivel}` e o numero que aparece para o usuario, por exemplo
   `40715880` ou `08810105.000066/2026-82`
+- nunca use `href="https://sei...controlador.php?..."` em documento interno:
+  isso pode abrir fora da sessao/unidade atual e provocar tela de login
 - deixe o texto narrativo fora da ancora: `Portaria-SEI ... (` + link +
   `)` ou `Processo SEI nº ` + link
 - se o id interno nao estiver disponivel com seguranca, mantenha o numero em

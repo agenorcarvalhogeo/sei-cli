@@ -319,6 +319,20 @@ class FakeClient:
                 result.append(process)
         return result
 
+    def get_process_acompanhamento_especial(self, id_procedimento: str) -> dict[str, Any]:
+        tracking = self.tracked_processes.get(id_procedimento)
+        if not tracking:
+            return {"tracked": False, "source": "acompanhamento_gerenciar"}
+        group = next((item for item in self.tracking_groups if item["id"] == tracking["grupo_id"]), None)
+        return {
+            "tracked": True,
+            "source": "acompanhamento_gerenciar",
+            "id_procedimento": id_procedimento,
+            "grupo_id": tracking["grupo_id"],
+            "grupo_nome": group["nome"] if group else "",
+            "observacao": tracking.get("observacao", ""),
+        }
+
     def add_acompanhamento_especial(self, id_procedimento: str, grupo_id: str, observacao: str) -> bool:
         if not any(item["id"] == str(grupo_id) for item in self.tracking_groups):
             return False
@@ -1655,6 +1669,64 @@ def test_process_watch_confirm_updates_existing_tracking() -> None:
     assert client.tracked_processes["47607237"]["grupo_id"] == "21"
 
 
+class TrackingListFalseNegativeClient(FakeClient):
+    def list_acompanhamento_especial(self) -> list[Process]:
+        return []
+
+
+class TrackingVerificationInconclusiveClient(TrackingListFalseNegativeClient):
+    def get_process_acompanhamento_especial(self, id_procedimento: str) -> dict[str, Any]:
+        return {"tracked": False, "source": "acompanhamento_gerenciar"}
+
+
+def test_process_watch_confirm_uses_process_local_tracking_fallback() -> None:
+    client = TrackingListFalseNegativeClient()
+    result = process_watch_confirm(
+        client,
+        "47607237",
+        group="21",
+        observacao="Concluído na unidade.",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["verification"]["tracked"] is True
+    assert result["data"]["verification"]["processo"]["tracking_verification_source"] == "acompanhamento_gerenciar"
+
+
+def test_process_watch_confirm_reports_inconclusive_when_success_cannot_be_verified() -> None:
+    client = TrackingVerificationInconclusiveClient()
+    result = process_watch_confirm(
+        client,
+        "47607237",
+        group="21",
+        observacao="Concluído na unidade.",
+        confirm=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "tracking_verification_inconclusive"
+    assert result["error"]["details"]["mutation_applied"] is True
+    assert "inconclusiva" in result["error"]["message"]
+
+
+def test_process_archive_confirm_continues_after_tracking_verification_inconclusive() -> None:
+    client = TrackingVerificationInconclusiveClient()
+    result = process_archive_confirm(
+        client,
+        "47607237",
+        group="Concluídos",
+        observacao="Concluído na unidade.",
+        confirm=True,
+    )
+
+    assert result["ok"] is True
+    assert client.concluded_processes[-1]["id_procedimento"] == "47607237"
+    assert result["data"]["tracking_result"]["ok"] is False
+    assert result["data"]["tracking_result"]["error"]["code"] == "tracking_verification_inconclusive"
+    assert any("verificação ficou inconclusiva" in warning for warning in result["warnings"])
+
+
 def test_process_watch_preview_blocks_process_not_visible_in_current_unit_box() -> None:
     result = process_watch_preview(VisibleMarkerReadBlockedClient(), "99999999", group="21")
 
@@ -2618,6 +2690,37 @@ def test_document_quality_check_dispatch_profile() -> None:
     assert quality["document_profile"]["dispatch_checks"]["has_action_verb"] is True
     assert quality["document_profile"]["dispatch_checks"]["has_destination_signal"] is True
     assert "sgt" in quality["suspicious_rank_terms"]
+
+
+class ExternalSeiHrefClient(FakeClient):
+    def get_editor_sections(self, id_documento: str, id_procedimento: str) -> tuple[str, list[EditorSection]]:
+        return (
+            "https://sei.rn.gov.br/sei/editor/editor_processar.php?acao=editor_salvar&id_documento=59999999",
+            [
+                EditorSection(name="txaEditor_101", content="<p>Cabecalho</p>", section_id="101", editable=False),
+                EditorSection(
+                    name="txaEditor_422",
+                    content=(
+                        '<p>Despacho SEI nº <a href="https://sei.rn.gov.br/sei/controlador.php?'
+                        'acao=arvore_visualizar&id_documento=49663273&id_procedimento=49566411">'
+                        "41190113</a></p>"
+                    ),
+                    section_id="422",
+                    editable=True,
+                ),
+            ],
+        )
+
+
+def test_document_quality_check_warns_on_external_sei_href() -> None:
+    result = document_quality_check(ExternalSeiHrefClient(), "39999999", process_id="47607237")
+
+    assert result["ok"] is True
+    quality = result["data"]["quality_check"]
+    assert quality["external_sei_hrefs"] == [
+        "https://sei.rn.gov.br/sei/controlador.php?acao=arvore_visualizar&id_documento=49663273&id_procedimento=49566411"
+    ]
+    assert any("href externo" in warning for warning in result["warnings"])
 
 
 class BlankEditableSectionClient(FakeClient):

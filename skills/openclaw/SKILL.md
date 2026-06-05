@@ -87,6 +87,10 @@ Regra para referencias SEI no corpo HTML:
 - Formato: `<span contenteditable="false" style="text-indent:0;"><a class="ancora_sei" id="lnkSei{id_interno}" style="text-indent:0;">{numero_visivel}</a></span>`.
 - Para documento, `{id_interno}` e o `id_documento`; para processo, e o
   `id_procedimento`.
+- Nunca use `href="https://sei...controlador.php?..."` em documento interno.
+  Mesmo quando parece correto visualmente, esse link abre fora do contexto do
+  editor e pode forcar novo login. Se `document-quality-check` acusar
+  `external_sei_hrefs`, corrija antes de assinar.
 - O texto narrativo fica fora da ancora: `Portaria-SEI ... (` + link + `)` ou
   `Processo SEI nº ` + link.
 - Se o id interno nao estiver resolvido, deixe como texto simples e avise que a
