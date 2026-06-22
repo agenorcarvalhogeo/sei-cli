@@ -111,7 +111,7 @@ class SEIClient:
 
 #### Credenciais (config.py)
 - Ler de `~/.config/sei/credentials.json` (já existe, usado pela skill atual)
-- Formato: `{"usuario": "11199338702", "senha": "...", "orgao": "CBM", "login_url": "..."}`
+- Formato: `{"usuario": "07377237422", "senha": "...", "orgao": "CBM", "login_url": "..."}`
 - Campo é `usuario` (não `cpf`)
 - Orgao CBM = selOrgao value "28"
 - Senha obtida via Bitwarden: `get_secret("sei")`
