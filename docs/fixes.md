@@ -157,6 +157,7 @@ Observações:
 - `1062` é padrão do Encaminhamento testado, não padrão global.
 - Justificativa expõe `875` como tabela de referência/metadados; a seção de corpo real é `873`.
 - Famílias tipo memorando/ofício/solicitação tendem a usar `341`, mas a canônica deve continuar inferindo pelo conteúdo das seções, não por id fixo.
+- possivelmente não consiga acesso a todos os documentos, pois os documentos não estão assinados nem no mesmo ambiente de acesso, exceto o doc "Solicitação", id "49302196".
 
 ---
 
@@ -185,8 +186,8 @@ Adicionar ao `~/.config/sei/credentials.json`:
 
 ```json
 {
-  "cargo": "Tenente-Coronel QOEM BM",
-  "id_usuario": "100039182"
+  "cargo": "2º SGT BM",
+  "id_usuario": "100049268"
 }
 ```
 
