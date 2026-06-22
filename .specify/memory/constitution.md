@@ -60,19 +60,23 @@ SEI HTML changes between versions and sometimes between requests. Every parser m
 orgao: CBM
 login_url: https://sei.rn.gov.br/sip/login.php
 unidades:
-  - id: "110008367"
-    sigla: PABM APODI
+- id: "110001882"
+    sigla: CFAP DA
     default: true
-  - id: "110007087"
-    sigla: DAT CHEFIA 1ªSAT/1ºCAT
+  - id: "110007819"
+    sigla: CFAP ALMOX
+  - id: "110007858"
+    sigla: CFAP - CAS
+    - id: "110005386"
+    sigla: CFAP OPERACIONAL
 marcadores_preferidos:
   - nome: Pessoal
-    cor: verde
+    cor: vermeho
   - nome: Operacional
-    cor: azul
+    cor: vermnelho
 processos_monitorados:
-  - numero: "48122208"
-    descricao: "JPMS ativo"
+  - id: "2035126"
+    descricao: "Apuração de Responsabilidade"
     alerta: true
 ```
 
