@@ -76,7 +76,7 @@ class RelatorioServico:
     posto_fiscal: str = ""
     data_inicio: str = ""  # DD/MM/YYYY
     data_fim: str = ""
-    unidade: str = ""  # e.g. PABM - Apodi RN / 3°GBM
+    unidade: str = ""  # e.g. CBM - DEI - CFAP - DA
 
     # Personnel
     militares: list[Militar] = field(default_factory=list)
@@ -130,7 +130,7 @@ def _norm(text: str) -> str:
 def _parse_rank_name(text: str) -> tuple[str, str]:
     """Split '2° SGT BM Vilson' into (rank, name).
     
-    Handles: SD BM, CB BM, 3º SGT BM, 2° SGT BM, 1° SGT BM,
+    Handles: AL CFP BM, SD BM, CB BM, 3º SGT BM, 2° SGT BM, 1° SGT BM,
     ST BM, 2° TEN, 1° TEN, CAP, MAJ, TC, CEL
     """
     text = _norm(text)
