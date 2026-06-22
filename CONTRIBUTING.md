@@ -60,7 +60,7 @@ O core (`sei_cli/`) é **genérico**. Se algo é específico do seu órgão (IDs
 ## 🔧 Setup de Desenvolvimento
 
 ```bash
-git clone git@github.com:zeolenon/sei-cli.git
+git clone git@github.com:agenorcarvalhogeo/sei-cli.git
 cd sei-cli
 python -m venv .venv
 source .venv/bin/activate
