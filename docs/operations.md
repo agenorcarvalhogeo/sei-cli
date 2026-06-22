@@ -230,7 +230,7 @@ Regras:
 - para documento, `{id_interno}` e o `id_documento` da arvore/process-read
 - para processo, `{id_interno}` e o `id_procedimento` resolvido
 - `{numero_visivel}` e o numero que aparece para o usuario, por exemplo
-  `40715880` ou `08810105.000066/2026-82`
+  `38575202` ou `08810010.007523/2025-38`
 - nunca use `href="https://sei...controlador.php?..."` em documento interno:
   isso pode abrir fora da sessao/unidade atual e provocar tela de login
 - deixe o texto narrativo fora da ancora: `Portaria-SEI ... (` + link +
@@ -757,7 +757,7 @@ Toda operacao canonica deve expor um contrato estavel com esta estrutura:
   "ok": true,
   "operation": "document-read",
   "context": {
-    "unidade_sigla": "OP 3",
+    "unidade_sigla": "DA CFAP",
     "usuario": "Fulano"
   },
   "resolved_ids": {
