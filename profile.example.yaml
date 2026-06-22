@@ -7,28 +7,27 @@ login_url: https://sei.rn.gov.br/sip/login.php
 
 # Unidades que você tem acesso
 unidades:
-  - id: "110008367"
-    sigla: PABM APODI
-    default: true  # unidade padrão ao logar
-  - id: "110007087"
-    sigla: DAT CHEFIA 1ªSAT/1ºCAT
+  - id: "110001882"
+    sigla: CFAP DA
+    default: true
+  - id: "110007819"
+    sigla: CFAP ALMOX
+  - id: "110007858"
+    sigla: CFAP - CAS
+    - id: "110005386"
+    sigla: CFAP OPERACIONAL
 
 # Marcadores preferidos (criados automaticamente se não existirem)
 marcadores:
-  - nome: Pessoal
-    cor: verde
+ - nome: Pessoal
+    cor: vermeho
   - nome: Operacional
-    cor: azul
-  - nome: Administrativo
-    cor: amarelo
+    cor: vermnelho
 
 # Processos monitorados (alertas automáticos)
 monitorados:
-  - numero: "48122208"
-    descricao: "JPMS ativo"
-    alerta: true
-  - numero: "24356065"
-    descricao: "PAD ativo ST Pereira"
+- id: "2035126"
+    descricao: "Apuração de Responsabilidade"
     alerta: true
 
 # Grupos de acompanhamento especial
