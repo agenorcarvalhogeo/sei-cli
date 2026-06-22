@@ -16,7 +16,7 @@ pip install -e .
 ```bash
 sei login                          # Login e mostra status
 sei status                         # Status da sessão atual
-sei switch "CMDO PABM APODI"      # Trocar unidade ativa
+sei switch "CFAP - DA"             # Trocar unidade ativa
 sei units                          # Listar unidades disponíveis
 ```
 
