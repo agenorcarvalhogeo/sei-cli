@@ -1,7 +1,7 @@
-# Batch de Relatorios de Livro de Fiscal
+# Batch de Relatorios de Livro de Adjunto
 
 ## API
-- `SEIClient.batch_read_relatorios(id_procedimento, unit="OP 3") -> dict`
+- `SEIClient.batch_read_relatorios(id_procedimento, unit="DA OP") -> dict`
 - `relatorio_parser.summarize_batch(relatorios) -> str` (Markdown)
 
 ## O que o batch retorna
@@ -24,8 +24,9 @@ No processo, sao considerados relatorios documentos com nome contendo:
 - `RELAT`
 - `LIVRO`
 - `FISCAL`
+- `ADJUNTO`
 
-## Teste em processo real OP 3ºGBM
+## Teste em processo real DA OP
 Nao foi possivel executar neste ambiente devido a indisponibilidade de rede para o host do SEI.
 
 ### Script sugerido
